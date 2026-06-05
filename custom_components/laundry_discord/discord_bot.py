@@ -14,7 +14,7 @@ from discord.utils import MISSING
 
 from homeassistant.core import HomeAssistant
 
-from .const import CLAIM_CUSTOM_ID
+from .const import CLAIM_CUSTOM_ID, UNCLAIM_CUSTOM_ID
 
 if TYPE_CHECKING:
     from .coordinator import LaundryCoordinator
@@ -22,44 +22,92 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-class ClaimView(discord.ui.View):
-    """Persistent view holding the single 'Claim' button.
+async def _safe_interaction_error(interaction: discord.Interaction) -> None:
+    """Best-effort ephemeral error reply; never raises."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Something went wrong — try again in a moment.", ephemeral=True
+            )
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Could not send interaction error response", exc_info=True)
 
-    Persistent views need ``timeout=None`` and a fixed ``custom_id`` so the
-    button keeps working after an HA/bot restart (re-registered via
-    ``client.add_view`` in :meth:`LaundryDiscordClient.on_ready`).
-    """
 
+class _ClaimButton(discord.ui.Button):
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
-        super().__init__(timeout=None)
+        super().__init__(
+            label="Claim this load",
+            style=discord.ButtonStyle.primary,
+            emoji="🧺",
+            custom_id=CLAIM_CUSTOM_ID,
+        )
         self.coordinator = coordinator
 
-    @discord.ui.button(
-        label="Claim this load",
-        style=discord.ButtonStyle.primary,
-        emoji="🧺",
-        custom_id=CLAIM_CUSTOM_ID,
-    )
-    async def claim(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        """Handle a tap on the Claim button."""
+    async def callback(self, interaction: discord.Interaction) -> None:
         who = interaction.user.display_name
         try:
-            await self.coordinator.handle_claim(who)
-            embed = self.coordinator.build_embed(claimed_by=who)
-            # Editing the message removes the button (view=None) and shows the
-            # claimant. This is the interaction response, so no extra push fires.
-            await interaction.response.edit_message(embed=embed, view=None)
+            if await self.coordinator.handle_claim(who):
+                await interaction.response.edit_message(
+                    embed=self.coordinator.build_embed(),
+                    view=ClaimView(self.coordinator, show="unclaim"),
+                )
+            else:
+                await interaction.response.send_message(
+                    "This load is no longer active.", ephemeral=True
+                )
         except Exception:  # noqa: BLE001 - never let a bot callback bubble into HA
             _LOGGER.exception("Failed to handle Claim interaction")
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "Something went wrong claiming this load.", ephemeral=True
-                    )
-            except Exception:  # noqa: BLE001
-                _LOGGER.debug("Could not send claim error response", exc_info=True)
+            await _safe_interaction_error(interaction)
+
+
+class _UnclaimButton(discord.ui.Button):
+    def __init__(self, coordinator: "LaundryCoordinator") -> None:
+        super().__init__(
+            label="Unclaim",
+            style=discord.ButtonStyle.secondary,
+            emoji="↩️",
+            custom_id=UNCLAIM_CUSTOM_ID,
+        )
+        self.coordinator = coordinator
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            if await self.coordinator.handle_unclaim():
+                await interaction.response.edit_message(
+                    embed=self.coordinator.build_embed(),
+                    view=ClaimView(self.coordinator, show="claim"),
+                )
+            else:
+                await interaction.response.send_message(
+                    "This load is no longer active.", ephemeral=True
+                )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to handle Unclaim interaction")
+            await _safe_interaction_error(interaction)
+
+
+class ClaimView(discord.ui.View):
+    """Persistent view holding the Claim / Unclaim buttons.
+
+    Persistent views need ``timeout=None`` and fixed ``custom_id``s so the
+    buttons keep working after an HA/bot restart (re-registered via
+    ``client.add_view`` in :meth:`LaundryDiscordClient.on_ready`).
+
+    ``show`` controls which buttons are presented on a given message:
+      - ``"claim"``   — a finished, unclaimed load (Claim only)
+      - ``"unclaim"`` — a claimed load (Unclaim only, to undo an accident)
+      - ``"both"``    — registration template so both custom_ids stay live
+        after a restart regardless of the message's current state.
+    """
+
+    def __init__(
+        self, coordinator: "LaundryCoordinator", *, show: str = "both"
+    ) -> None:
+        super().__init__(timeout=None)
+        if show in ("claim", "both"):
+            self.add_item(_ClaimButton(coordinator))
+        if show in ("unclaim", "both"):
+            self.add_item(_UnclaimButton(coordinator))
 
 
 class LaundryDiscordClient(discord.Client):

@@ -30,11 +30,14 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_JOB_STATE_ENTITY,
+    CONF_PING_ON_COMPLETE,
     CONF_PING_ON_DRYING,
     CONF_PING_ROLE_ID,
     CONF_RUNNING_ENTITY,
     DEFAULT_ETA_INTERVAL,
+    DEFAULT_PING_ON_COMPLETE,
     INVALID_OLD_STATES,
+    PROGRESS_PHASES,
     JOB_STATE_DRYING,
     JOB_STATE_NONE,
     REAL_PHASES,
@@ -106,8 +109,18 @@ class LaundryCoordinator:
         return str(self._cfg.get(CONF_PING_ROLE_ID, "") or "")
 
     @property
+    def ping_on_complete(self) -> bool:
+        return bool(self._cfg.get(CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE))
+
+    @property
     def ping_on_drying(self) -> bool:
         return bool(self._cfg.get(CONF_PING_ON_DRYING, False))
+
+    def _ping_content(self, message: str) -> str | None:
+        """Build a role-mention ping line, or None if no role is configured."""
+        if not self.ping_role_id:
+            return None
+        return f"<@&{self.ping_role_id}> {message}"
 
     # ------------------------------------------------------------------- setup
     async def async_setup(self) -> None:
@@ -215,25 +228,22 @@ class LaundryCoordinator:
     # ------------------------------------------------------- lifecycle actions
     async def _async_start_session(self) -> None:
         async with self._lock:
-            if self.stage != STAGE_IDLE:
-                _LOGGER.debug("Start ignored; session active (stage=%s)", self.stage)
+            # A wash already in progress wins. A previous *finished* load (still
+            # showing its claim/unclaim message) is simply superseded by this one.
+            if self.stage in (STAGE_WASHING, STAGE_DRYING):
+                _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
                 return
             self.stage = STAGE_WASHING
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.message_id = None
 
-            content: str | None = None
-            silent = True
-            if self.ping_role_id:
-                # The start message is the only one allowed to ping.
-                content = f"<@&{self.ping_role_id}>"
-                silent = False
-
+            # The start post is a normal, visible message but never @mentions
+            # anyone — pings are reserved for completion.
             embed = self.build_embed()
             try:
                 self.message_id = await self.bot.async_post(
-                    embed, view=None, content=content, silent=silent
+                    embed, view=None, content=None, silent=False
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to post laundry start message")
@@ -254,11 +264,11 @@ class LaundryCoordinator:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed)
                 if self.ping_on_drying:
-                    prefix = f"<@&{self.ping_role_id}> " if self.ping_role_id else ""
-                    await self.bot.async_send_ping(
-                        f"{prefix}🌀 Wash done — drying starting. "
-                        "Pull out anything you don't want dried!"
+                    content = self._ping_content(
+                        "🌀 Drying starting — pull out anything you don't want dried!"
                     )
+                    if content:
+                        await self.bot.async_send_ping(content)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update drying state")
             await self._async_save()
@@ -266,30 +276,53 @@ class LaundryCoordinator:
 
     async def _async_handle_finished(self) -> None:
         async with self._lock:
-            if self.stage == STAGE_IDLE:
+            if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 return
             self._stop_eta_timer()
             self.stage = STAGE_DONE_WAITING
             self.waiting = True
+            self.claimed_by = UNCLAIMED
             embed = self.build_embed()
             try:
                 if self.message_id:
                     await self.bot.async_edit(
-                        self.message_id, embed, view=ClaimView(self)
+                        self.message_id, embed, view=ClaimView(self, show="claim")
                     )
+                # The completion ping is the one push notification per load.
+                if self.ping_on_complete:
+                    content = self._ping_content(
+                        "🧺 Laundry's done — don't forget the lint tray. Tap Claim to grab it!"
+                    )
+                    if content:
+                        await self.bot.async_send_ping(content)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
             await self._async_save()
             self._notify_entities()
 
-    async def handle_claim(self, who: str) -> None:
-        """Record the claimant and end the session. Called from the button."""
+    async def handle_claim(self, who: str) -> bool:
+        """Record the claimant. The done message stays live (claim is reversible).
+
+        Returns False if there's no finished load to claim (e.g. a tap on a
+        stale message after a new wash has already started).
+        """
+        if self.stage != STAGE_DONE_WAITING:
+            return False
         self.claimed_by = who
         self.waiting = False
-        self.stage = STAGE_IDLE
-        self._stop_eta_timer()
         await self._async_save()
         self._notify_entities()
+        return True
+
+    async def handle_unclaim(self) -> bool:
+        """Undo a claim — the load is up for grabs again. Called from the button."""
+        if self.stage != STAGE_DONE_WAITING:
+            return False
+        self.claimed_by = UNCLAIMED
+        self.waiting = True
+        await self._async_save()
+        self._notify_entities()
+        return True
 
     async def async_test_post(self) -> None:
         """Debug service: post a sample embed with a working Claim button."""
@@ -300,7 +333,7 @@ class LaundryCoordinator:
             embed = self.build_embed(test=True)
             try:
                 self.message_id = await self.bot.async_post(
-                    embed, view=ClaimView(self), silent=True
+                    embed, view=ClaimView(self, show="claim"), silent=True
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("test_post failed")
@@ -348,27 +381,41 @@ class LaundryCoordinator:
         rel = f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
         return f"~{clock}, about {rel} left"
 
-    def build_embed(
-        self, *, claimed_by: str | None = None, test: bool = False
-    ) -> discord.Embed:
-        """Build the embed for the current stage (or an explicit claim/test)."""
-        if claimed_by:
-            embed = discord.Embed(
-                title="🧺 Claimed",
-                description=(
-                    f"Claimed by **{claimed_by}**.\nThanks! Don't forget the lint tray."
-                ),
-                color=_COLOR_CLAIMED,
-            )
-            embed.timestamp = dt_util.utcnow()
-            return embed
+    def _progress_bar(self) -> str | None:
+        """Render a wash→dry stage bar from the live job_state, or None."""
+        state = self.hass.states.get(self.job_state_entity)
+        current = state.state if state is not None else None
 
+        # Final wash phase: everything done.
+        if current == "finish":
+            return " → ".join(f"🟩 {label}" for label, _ in PROGRESS_PHASES)
+
+        current_idx: int | None = None
+        for i, (_label, values) in enumerate(PROGRESS_PHASES):
+            if current in values:
+                current_idx = i
+                break
+
+        parts: list[str] = []
+        for i, (label, _values) in enumerate(PROGRESS_PHASES):
+            if current_idx is not None and i < current_idx:
+                marker = "🟩"  # completed
+            elif current_idx is not None and i == current_idx:
+                marker = "🟦"  # in progress
+            else:
+                marker = "⬜"  # upcoming / unknown
+            parts.append(f"{marker} {label}")
+        return " → ".join(parts)
+
+    def build_embed(self, *, test: bool = False) -> discord.Embed:
+        """Build the embed for the current stage (reads live state + claimant)."""
         if test:
             embed = discord.Embed(
                 title="🧪 Laundry Bot test post",
                 description=(
                     "This is a test. Tap **Claim this load** to verify the button "
-                    "and that `sensor.laundry_claimed_by` updates in HA."
+                    "and that `sensor.laundry_claimed_by` updates in HA. Then tap "
+                    "**Unclaim** to undo it."
                 ),
                 color=_COLOR_TEST,
             )
@@ -382,27 +429,33 @@ class LaundryCoordinator:
                 description="The washer is running.",
                 color=_COLOR_WASHING,
             )
-            embed.add_field(
-                name="Estimated finish", value=self._eta_text(), inline=False
-            )
+            self._add_progress_and_eta(embed)
         elif self.stage == STAGE_DRYING:
             embed = discord.Embed(
-                title="🌀 Wash done — drying",
+                title="🌀 Drying",
                 description="Pull out anything you don't want dried!",
                 color=_COLOR_DRYING,
             )
-            embed.add_field(
-                name="Estimated finish", value=self._eta_text(), inline=False
-            )
+            self._add_progress_and_eta(embed)
         elif self.stage == STAGE_DONE_WAITING:
-            embed = discord.Embed(
-                title="✅ Laundry done!",
-                description=(
-                    "Don't forget the **lint tray**.\n"
-                    "Tap the button below to claim this load."
-                ),
-                color=_COLOR_DONE,
-            )
+            if self.claimed_by and self.claimed_by != UNCLAIMED:
+                embed = discord.Embed(
+                    title="🧺 Claimed",
+                    description=(
+                        f"Claimed by **{self.claimed_by}**.\n"
+                        "Grabbed it by accident? Tap **Unclaim**."
+                    ),
+                    color=_COLOR_CLAIMED,
+                )
+            else:
+                embed = discord.Embed(
+                    title="✅ Laundry done!",
+                    description=(
+                        "Don't forget the **lint tray**.\n"
+                        "Tap **Claim this load** to grab it."
+                    ),
+                    color=_COLOR_DONE,
+                )
         else:
             embed = discord.Embed(
                 title="Laundry", description="Idle.", color=_COLOR_CLAIMED
@@ -411,3 +464,9 @@ class LaundryCoordinator:
         embed.set_footer(text=_FOOTER)
         embed.timestamp = dt_util.utcnow()
         return embed
+
+    def _add_progress_and_eta(self, embed: discord.Embed) -> None:
+        bar = self._progress_bar()
+        if bar:
+            embed.add_field(name="Progress", value=bar, inline=False)
+        embed.add_field(name="Estimated finish", value=self._eta_text(), inline=False)

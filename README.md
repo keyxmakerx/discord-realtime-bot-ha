@@ -1,9 +1,10 @@
 # Laundry Discord Bot — Home Assistant custom integration
 
 A self-hosted Discord bot that runs **inside** Home Assistant. It watches your
-washer and posts **one** rich Discord message per load, with a **tap-to-claim
-button** and a **live-updating ETA** that edits the same message in place — so
-there are no repeat pings.
+washer and posts **one** rich Discord message per load, with a **live-updating
+ETA** and a **wash → dry progress bar** that edit the same message in place, plus
+a **claim / unclaim button**. The only push notification is a single **@mention
+when the load is done** — everything else updates silently.
 
 - **Domain:** `laundry_discord`
 - **Install:** via [HACS](https://hacs.xyz/) as a custom repository
@@ -14,27 +15,37 @@ there are no repeat pings.
 For a single load (a "session"):
 
 1. **Start** — when the watched *running* sensor goes `off → on`, it posts a new
-   Discord embed. This is the only message that may ping (optional role mention).
-2. **ETA updates** — every N seconds it **edits the same message** with the
-   current estimated finish. Edits never push, so this is silent by design.
+   Discord embed. This is a normal, visible message but **never @mentions
+   anyone** — pings are reserved for completion.
+2. **ETA + progress** — every N seconds it **edits the same message** with the
+   current estimated finish and a `🟩 Wash → 🟦 Rinse → ⬜ Spin → ⬜ Dry` stage
+   bar. Edits never push, so this is silent by design.
 3. **Drying alert** — when the job-state sensor enters `drying`, it edits the
-   embed to "wash done, drying starting — pull out anything you don't want
-   dried." Optionally it can send **one** ping here (configurable).
+   embed to "drying starting — pull out anything you don't want dried." It can
+   optionally send one @mention here (off by default).
 4. **Finished** — when the job-state sensor returns to `none` from a real wash
-   phase, it edits the embed to "Laundry done — don't forget the lint tray" and
-   shows a **Claim** button.
-5. **Claim** — tapping the button edits the embed to "🧺 Claimed by *name*",
-   records the claimant in HA, and ends the session.
+   phase, it edits the embed to "Laundry done — don't forget the lint tray",
+   shows a **Claim** button, and (if enabled) sends the one **@mention ping** of
+   the load: "come grab it."
+5. **Claim / Unclaim** — tapping **Claim** edits the embed to "🧺 Claimed by
+   *name*" and records the claimant in HA. The message stays live with an
+   **Unclaim** button so an accidental claim can be undone. The load stops being
+   claimable only when the **next load starts**.
 
 There is only ever **one active embed per load**. Duplicate "start" transitions
-are ignored while a session is active.
+are ignored while a wash is already running.
+
+> **Why the ping is a separate little message:** editing an embed never makes a
+> phone buzz (that's what keeps the ETA/progress updates silent). So to actually
+> notify at completion, the bot posts one short "@role — laundry's done" line
+> next to the main embed. That single line is the only push per load.
 
 ### Entities it creates
 
 | Entity | Meaning |
 |--------|---------|
 | `sensor.laundry_claimed_by` | Current claimant's display name, or `Unclaimed`. |
-| `sensor.laundry_stage` | `Idle` / `Washing` / `Drying` / `Done — waiting`. |
+| `sensor.laundry_stage` | `Idle` / `Washing` / `Drying` / `Done — waiting` / `Done — claimed`. |
 | `binary_sensor.laundry_waiting` | `on` when a finished load is unclaimed. |
 
 ## Why a custom integration (not an add-on)
@@ -99,19 +110,20 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Running sensor | `binary_sensor.washer_running` | Debounced on/off; drives **start**. |
 | Job-state sensor | `sensor.washer_washer_job_state` | Drives drying/finished. |
 | Completion-time sensor | `sensor.washer_washer_completion_time` | ISO timestamp for the ETA. |
-| ETA interval | `90` s | How often to edit the ETA (min 30). |
-| Ping role ID | *(none)* | Role to mention on the **start** message only. |
-| Ping on drying | `false` | Send one ping when drying starts. |
+| ETA interval | `90` s | How often to edit the ETA/progress (min 30). |
+| Ping role ID | *(none)* | Role to @mention when the load is **done**. Leave blank for no pings at all. |
+| Ping on complete | `true` | Send the one @mention when the load finishes. |
+| Ping on drying | `false` | Also @mention when drying starts. |
 
-> **Drying ping note:** because editing an embed never triggers a push, the
-> optional drying ping is sent as a small **separate** message that mentions the
-> role. It's off by default.
+> **Ping note:** because editing an embed never triggers a push, any @mention is
+> sent as a small **separate** message next to the main embed. With no role ID
+> set, the bot never pings — the message just updates silently.
 
 ## 4. Test without doing laundry
 
 1. Developer Tools → **Actions** → call `laundry_discord.test_post`.
-   - Confirm the embed posts, the **Claim** button updates it to "Claimed by
-     *you*", and `sensor.laundry_claimed_by` updates in HA.
+   - Confirm the embed posts, **Claim** updates it to "Claimed by *you*" (and
+     `sensor.laundry_claimed_by` updates in HA), and **Unclaim** reverts it.
 2. To exercise the real path, Developer Tools → **States**: set
    `sensor.washer_washer_job_state` to `drying`, then to `none`, to trigger the
    drying and finished edits.
@@ -147,8 +159,11 @@ Home Assistant's built-in (send-only) Discord notify integration, which uses a
 different library. If HA ever reports a dependency clash, adjust the pin in
 `manifest.json` and note it.
 
-## Roadmap (not in v0.1)
+## Roadmap
 
+- **Prep-dry support** — handle the washer's "stop after wash, set up drying"
+  feature with its own "wash done, dry prep pending" alert + ping. Pending the
+  exact `job_state` (or `machine_state`) value that mode reports.
 - Per-person claim buttons instead of "whoever taps".
 - A second **Folded ✓** button to close the loop after the claimant finishes.
 - A nag edit if `binary_sensor.laundry_waiting` stays `on` for more than X hours.
