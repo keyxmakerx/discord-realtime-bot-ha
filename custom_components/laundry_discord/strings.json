@@ -11,8 +11,9 @@
           "job_state_entity": "Washer job-state sensor",
           "eta_entity": "Completion-time sensor (ISO timestamp)",
           "eta_interval": "ETA update interval",
-          "ping_role_id": "Role ID to mention on start (optional)",
-          "ping_on_drying": "Send one ping when drying starts"
+          "ping_role_id": "Role ID to @mention when done (optional)",
+          "ping_on_complete": "@mention the role when the load is done",
+          "ping_on_drying": "Also @mention when drying starts"
         }
       }
     },
@@ -30,8 +31,9 @@
         "title": "Laundry Discord Bot options",
         "data": {
           "eta_interval": "ETA update interval",
-          "ping_role_id": "Role ID to mention on start (optional)",
-          "ping_on_drying": "Send one ping when drying starts"
+          "ping_role_id": "Role ID to @mention when done (optional)",
+          "ping_on_complete": "@mention the role when the load is done",
+          "ping_on_drying": "Also @mention when drying starts"
         }
       }
     },

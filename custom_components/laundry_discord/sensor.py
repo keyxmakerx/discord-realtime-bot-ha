@@ -7,7 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, STAGE_LABELS, UNCLAIMED
+from .const import DOMAIN, STAGE_DONE_WAITING, STAGE_LABELS, UNCLAIMED
 from .entity import LaundryEntity
 
 
@@ -53,4 +53,10 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        return STAGE_LABELS.get(self.coordinator.stage, self.coordinator.stage)
+        coordinator = self.coordinator
+        if (
+            coordinator.stage == STAGE_DONE_WAITING
+            and coordinator.claimed_by != UNCLAIMED
+        ):
+            return "Done — claimed"
+        return STAGE_LABELS.get(coordinator.stage, coordinator.stage)

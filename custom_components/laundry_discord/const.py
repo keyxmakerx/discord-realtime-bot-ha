@@ -12,6 +12,7 @@ CONF_JOB_STATE_ENTITY = "job_state_entity"
 CONF_ETA_ENTITY = "eta_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_PING_ROLE_ID = "ping_role_id"
+CONF_PING_ON_COMPLETE = "ping_on_complete"
 CONF_PING_ON_DRYING = "ping_on_drying"
 
 # --- Defaults ---
@@ -22,6 +23,7 @@ DEFAULT_ETA_INTERVAL = 90
 MIN_ETA_INTERVAL = 30
 MAX_ETA_INTERVAL = 3600
 DEFAULT_PING_ROLE_ID = ""
+DEFAULT_PING_ON_COMPLETE = True
 DEFAULT_PING_ON_DRYING = False
 
 # --- Platforms ---
@@ -36,6 +38,7 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 
 # --- Discord ---
 CLAIM_CUSTOM_ID = "laundry_discord_claim"
+UNCLAIM_CUSTOM_ID = "laundry_discord_unclaim"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"
@@ -60,5 +63,13 @@ JOB_STATE_DRYING = "drying"
 REAL_PHASES = {"weight_sensing", "wash", "rinse", "spin", "drying", "finish"}
 # old_state values that indicate a flap / startup, never a real phase transition.
 INVALID_OLD_STATES = {"unavailable", "unknown", "none"}
+
+# Progress bar: ordered (label, {job_state values that map to this phase}).
+PROGRESS_PHASES = [
+    ("Wash", {"weight_sensing", "wash"}),
+    ("Rinse", {"rinse"}),
+    ("Spin", {"spin"}),
+    ("Dry", {"drying"}),
+]
 
 UNCLAIMED = "Unclaimed"

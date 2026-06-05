@@ -21,12 +21,14 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_JOB_STATE_ENTITY,
+    CONF_PING_ON_COMPLETE,
     CONF_PING_ON_DRYING,
     CONF_PING_ROLE_ID,
     CONF_RUNNING_ENTITY,
     DEFAULT_ETA_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_JOB_STATE_ENTITY,
+    DEFAULT_PING_ON_COMPLETE,
     DEFAULT_PING_ON_DRYING,
     DEFAULT_PING_ROLE_ID,
     DEFAULT_RUNNING_ENTITY,
@@ -56,6 +58,12 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_PING_ROLE_ID,
                 default=defaults.get(CONF_PING_ROLE_ID, DEFAULT_PING_ROLE_ID),
             ): selector.TextSelector(),
+            vol.Required(
+                CONF_PING_ON_COMPLETE,
+                default=defaults.get(
+                    CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE
+                ),
+            ): selector.BooleanSelector(),
             vol.Required(
                 CONF_PING_ON_DRYING,
                 default=defaults.get(CONF_PING_ON_DRYING, DEFAULT_PING_ON_DRYING),
@@ -95,6 +103,7 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                 options = {
                     CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
                     CONF_PING_ROLE_ID: role_id,
+                    CONF_PING_ON_COMPLETE: user_input[CONF_PING_ON_COMPLETE],
                     CONF_PING_ON_DRYING: user_input[CONF_PING_ON_DRYING],
                 }
                 return self.async_create_entry(
@@ -151,6 +160,12 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                     default=defaults.get(CONF_PING_ROLE_ID, DEFAULT_PING_ROLE_ID),
                 ): selector.TextSelector(),
                 vol.Required(
+                    CONF_PING_ON_COMPLETE,
+                    default=defaults.get(
+                        CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE
+                    ),
+                ): selector.BooleanSelector(),
+                vol.Required(
                     CONF_PING_ON_DRYING,
                     default=defaults.get(
                         CONF_PING_ON_DRYING, DEFAULT_PING_ON_DRYING
@@ -186,6 +201,7 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     data={
                         CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
                         CONF_PING_ROLE_ID: role_id,
+                        CONF_PING_ON_COMPLETE: user_input[CONF_PING_ON_COMPLETE],
                         CONF_PING_ON_DRYING: user_input[CONF_PING_ON_DRYING],
                     }
                 )
