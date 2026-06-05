@@ -203,13 +203,24 @@ class LaundryCoordinator:
     # ---------------------------------------------------------- state handlers
     @callback
     def _on_running(self, event: Event) -> None:
-        """Start a session on a debounced off -> on transition."""
+        """Start a session when the washer turns on.
+
+        A clean ``off -> on`` is a normal start. A transition INTO ``on`` from
+        ``unavailable``/``unknown``/``None`` means the washer "appeared" already
+        running — e.g. its cloud entity populated a few seconds after an HA
+        restart, just after the bot's one-shot startup check already ran. We
+        catch that up, but only when nothing is currently being tracked, so a
+        mid-wash cloud flap can't spawn a duplicate session.
+        """
         new = event.data.get("new_state")
-        old = event.data.get("old_state")
-        if new is None or old is None:
+        if new is None or new.state != "on":
             return
-        if old.state == "off" and new.state == "on":
+        old = event.data.get("old_state")
+        old_s = old.state if old is not None else None
+        if old_s == "off":
             self.hass.async_create_task(self._async_start_session())
+        elif old_s in (None, "unavailable", "unknown") and self.stage == STAGE_IDLE:
+            self.hass.async_create_task(self._async_start_session(catch_up=True))
 
     @callback
     def _on_job_state(self, event: Event) -> None:
