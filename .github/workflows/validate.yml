@@ -22,6 +22,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # 'brands' requires registering the domain in the home-assistant/brands
-          # repo, which isn't needed to install via a HACS custom repository.
-          ignore: brands
+          # These checks only matter for submission to the HACS *default store*,
+          # not for installing via a HACS custom repository:
+          #  - brands: requires registering the domain in home-assistant/brands
+          #  - description/topics: require GitHub repo "About" metadata
+          ignore: brands description topics
