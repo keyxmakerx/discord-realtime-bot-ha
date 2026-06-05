@@ -1,0 +1,6 @@
+test_post:
+  name: Test post
+  description: >-
+    Post a sample embed with a working Claim button to the configured Discord
+    channel, so the whole Discord path (post + claim + sensor write-back) can be
+    tested without running a real wash.
