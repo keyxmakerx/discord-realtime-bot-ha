@@ -11,9 +11,7 @@ CONF_RUNNING_ENTITY = "running_entity"
 CONF_JOB_STATE_ENTITY = "job_state_entity"
 CONF_ETA_ENTITY = "eta_entity"
 CONF_ETA_INTERVAL = "eta_interval"
-CONF_PING_ROLE_ID = "ping_role_id"
-CONF_PING_ON_COMPLETE = "ping_on_complete"
-CONF_PING_ON_DRYING = "ping_on_drying"
+CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -22,9 +20,7 @@ DEFAULT_ETA_ENTITY = "sensor.washer_washer_completion_time"
 DEFAULT_ETA_INTERVAL = 90
 MIN_ETA_INTERVAL = 30
 MAX_ETA_INTERVAL = 3600
-DEFAULT_PING_ROLE_ID = ""
-DEFAULT_PING_ON_COMPLETE = True
-DEFAULT_PING_ON_DRYING = False
+DEFAULT_PING_CLAIMANT_ON_COMPLETE = True
 
 # --- Platforms ---
 PLATFORMS = ["sensor", "binary_sensor"]

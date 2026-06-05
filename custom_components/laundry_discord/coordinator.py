@@ -30,12 +30,10 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_JOB_STATE_ENTITY,
-    CONF_PING_ON_COMPLETE,
-    CONF_PING_ON_DRYING,
-    CONF_PING_ROLE_ID,
+    CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
     DEFAULT_ETA_INTERVAL,
-    DEFAULT_PING_ON_COMPLETE,
+    DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     INVALID_OLD_STATES,
     PROGRESS_PHASES,
     JOB_STATE_DRYING,
@@ -80,6 +78,7 @@ class LaundryCoordinator:
         self.stage: str = STAGE_IDLE
         self.waiting: bool = False
         self.claimed_by: str = UNCLAIMED
+        self.claimed_by_id: int | None = None
         self.message_id: int | None = None
 
         self._eta_unsub = None
@@ -105,22 +104,12 @@ class LaundryCoordinator:
         return int(self._cfg.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL))
 
     @property
-    def ping_role_id(self) -> str:
-        return str(self._cfg.get(CONF_PING_ROLE_ID, "") or "")
-
-    @property
-    def ping_on_complete(self) -> bool:
-        return bool(self._cfg.get(CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE))
-
-    @property
-    def ping_on_drying(self) -> bool:
-        return bool(self._cfg.get(CONF_PING_ON_DRYING, False))
-
-    def _ping_content(self, message: str) -> str | None:
-        """Build a role-mention ping line, or None if no role is configured."""
-        if not self.ping_role_id:
-            return None
-        return f"<@&{self.ping_role_id}> {message}"
+    def ping_claimant_on_complete(self) -> bool:
+        return bool(
+            self._cfg.get(
+                CONF_PING_CLAIMANT_ON_COMPLETE, DEFAULT_PING_CLAIMANT_ON_COMPLETE
+            )
+        )
 
     # ------------------------------------------------------------------- setup
     async def async_setup(self) -> None:
@@ -177,6 +166,7 @@ class LaundryCoordinator:
         self.stage = data.get("stage", STAGE_IDLE)
         self.waiting = data.get("waiting", False)
         self.claimed_by = data.get("claimed_by", UNCLAIMED)
+        self.claimed_by_id = data.get("claimed_by_id")
         self.message_id = data.get("message_id")
 
     async def _async_save(self) -> None:
@@ -185,6 +175,7 @@ class LaundryCoordinator:
                 "stage": self.stage,
                 "waiting": self.waiting,
                 "claimed_by": self.claimed_by,
+                "claimed_by_id": self.claimed_by_id,
                 "message_id": self.message_id,
             }
         )
@@ -236,14 +227,19 @@ class LaundryCoordinator:
             self.stage = STAGE_WASHING
             self.waiting = False
             self.claimed_by = UNCLAIMED
+            self.claimed_by_id = None
             self.message_id = None
 
-            # The start post is a normal, visible message but never @mentions
-            # anyone — pings are reserved for completion.
+            # The start post is a normal, visible message with the Claim button
+            # so people can call dibs early. It never @mentions anyone — the only
+            # ping is to the claimant when the load is done.
             embed = self.build_embed()
             try:
                 self.message_id = await self.bot.async_post(
-                    embed, view=None, content=None, silent=False
+                    embed,
+                    view=ClaimView(self, show="claim"),
+                    content=None,
+                    silent=False,
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to post laundry start message")
@@ -259,16 +255,11 @@ class LaundryCoordinator:
             if self.stage == STAGE_IDLE:
                 return
             self.stage = STAGE_DRYING
+            # Silent edit; the button (claim/unclaim) is preserved.
             embed = self.build_embed()
             try:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed)
-                if self.ping_on_drying:
-                    content = self._ping_content(
-                        "🌀 Drying starting — pull out anything you don't want dried!"
-                    )
-                    if content:
-                        await self.bot.async_send_ping(content)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update drying state")
             await self._async_save()
@@ -280,46 +271,51 @@ class LaundryCoordinator:
                 return
             self._stop_eta_timer()
             self.stage = STAGE_DONE_WAITING
-            self.waiting = True
-            self.claimed_by = UNCLAIMED
+            # A pre-claim made during the wash carries through to completion.
+            claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
+            self.waiting = not claimed
             embed = self.build_embed()
+            view = ClaimView(self, show="unclaim" if claimed else "claim")
             try:
                 if self.message_id:
-                    await self.bot.async_edit(
-                        self.message_id, embed, view=ClaimView(self, show="claim")
+                    await self.bot.async_edit(self.message_id, embed, view=view)
+                # The one push per load: @mention the claimant, if there is one.
+                # If nobody claimed, the done message above is plain — no ping.
+                if claimed and self.ping_claimant_on_complete:
+                    await self.bot.async_send_ping(
+                        f"<@{self.claimed_by_id}> 🧺 Your laundry's done — "
+                        "don't forget the lint tray!"
                     )
-                # The completion ping is the one push notification per load.
-                if self.ping_on_complete:
-                    content = self._ping_content(
-                        "🧺 Laundry's done — don't forget the lint tray. Tap Claim to grab it!"
-                    )
-                    if content:
-                        await self.bot.async_send_ping(content)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
             await self._async_save()
             self._notify_entities()
 
-    async def handle_claim(self, who: str) -> bool:
-        """Record the claimant. The done message stays live (claim is reversible).
+    # Stages in which a claim/unclaim tap is meaningful (an active load exists).
+    _CLAIMABLE_STAGES = (STAGE_WASHING, STAGE_DRYING, STAGE_DONE_WAITING)
 
-        Returns False if there's no finished load to claim (e.g. a tap on a
-        stale message after a new wash has already started).
+    async def handle_claim(self, who: str, user_id: int) -> bool:
+        """Record the claimant. Claims are allowed from the start of the wash and
+        are reversible. Returns False on a stale tap (no active load).
         """
-        if self.stage != STAGE_DONE_WAITING:
+        if self.stage not in self._CLAIMABLE_STAGES:
             return False
         self.claimed_by = who
-        self.waiting = False
+        self.claimed_by_id = user_id
+        if self.stage == STAGE_DONE_WAITING:
+            self.waiting = False
         await self._async_save()
         self._notify_entities()
         return True
 
     async def handle_unclaim(self) -> bool:
         """Undo a claim — the load is up for grabs again. Called from the button."""
-        if self.stage != STAGE_DONE_WAITING:
+        if self.stage not in self._CLAIMABLE_STAGES:
             return False
         self.claimed_by = UNCLAIMED
-        self.waiting = True
+        self.claimed_by_id = None
+        if self.stage == STAGE_DONE_WAITING:
+            self.waiting = True
         await self._async_save()
         self._notify_entities()
         return True
@@ -330,6 +326,7 @@ class LaundryCoordinator:
             self.stage = STAGE_DONE_WAITING
             self.waiting = True
             self.claimed_by = UNCLAIMED
+            self.claimed_by_id = None
             embed = self.build_embed(test=True)
             try:
                 self.message_id = await self.bot.async_post(
@@ -426,10 +423,11 @@ class LaundryCoordinator:
         if self.stage == STAGE_WASHING:
             embed = discord.Embed(
                 title="🫧 Laundry started",
-                description="The washer is running.",
+                description="The washer is running. Tap **Claim** to call dibs.",
                 color=_COLOR_WASHING,
             )
             self._add_progress_and_eta(embed)
+            self._add_claimant(embed)
         elif self.stage == STAGE_DRYING:
             embed = discord.Embed(
                 title="🌀 Drying",
@@ -437,6 +435,7 @@ class LaundryCoordinator:
                 color=_COLOR_DRYING,
             )
             self._add_progress_and_eta(embed)
+            self._add_claimant(embed)
         elif self.stage == STAGE_DONE_WAITING:
             if self.claimed_by and self.claimed_by != UNCLAIMED:
                 embed = discord.Embed(
@@ -470,3 +469,9 @@ class LaundryCoordinator:
         if bar:
             embed.add_field(name="Progress", value=bar, inline=False)
         embed.add_field(name="Estimated finish", value=self._eta_text(), inline=False)
+
+    def _add_claimant(self, embed: discord.Embed) -> None:
+        if self.claimed_by and self.claimed_by != UNCLAIMED:
+            embed.add_field(
+                name="Claimed by", value=f"🧺 {self.claimed_by}", inline=False
+            )

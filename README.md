@@ -3,8 +3,10 @@
 A self-hosted Discord bot that runs **inside** Home Assistant. It watches your
 washer and posts **one** rich Discord message per load, with a **live-updating
 ETA** and a **wash → dry progress bar** that edit the same message in place, plus
-a **claim / unclaim button**. The only push notification is a single **@mention
-when the load is done** — everything else updates silently.
+a **claim / unclaim button** you can tap from the moment the wash starts. The
+only push notification is a single **@mention to whoever claimed the load, sent
+when it's done** — everything else updates silently, and if nobody claimed it the
+"done" message is posted with no ping at all.
 
 - **Domain:** `laundry_discord`
 - **Install:** via [HACS](https://hacs.xyz/) as a custom repository
@@ -15,30 +17,32 @@ when the load is done** — everything else updates silently.
 For a single load (a "session"):
 
 1. **Start** — when the watched *running* sensor goes `off → on`, it posts a new
-   Discord embed. This is a normal, visible message but **never @mentions
-   anyone** — pings are reserved for completion.
+   Discord embed **with a Claim button**, so anyone can call dibs early. This is
+   a normal, visible message but **never @mentions anyone**.
 2. **ETA + progress** — every N seconds it **edits the same message** with the
    current estimated finish and a `🟩 Wash → 🟦 Rinse → ⬜ Spin → ⬜ Dry` stage
-   bar. Edits never push, so this is silent by design.
-3. **Drying alert** — when the job-state sensor enters `drying`, it edits the
-   embed to "drying starting — pull out anything you don't want dried." It can
-   optionally send one @mention here (off by default).
+   bar (and "Claimed by …" once someone grabs it). Edits never push, so this is
+   silent by design.
+3. **Drying** — when the job-state sensor enters `drying`, it silently edits the
+   embed to "drying starting — pull out anything you don't want dried."
 4. **Finished** — when the job-state sensor returns to `none` from a real wash
-   phase, it edits the embed to "Laundry done — don't forget the lint tray",
-   shows a **Claim** button, and (if enabled) sends the one **@mention ping** of
-   the load: "come grab it."
-5. **Claim / Unclaim** — tapping **Claim** edits the embed to "🧺 Claimed by
-   *name*" and records the claimant in HA. The message stays live with an
-   **Unclaim** button so an accidental claim can be undone. The load stops being
-   claimable only when the **next load starts**.
+   phase, it edits the embed to "Laundry done — don't forget the lint tray." If
+   someone **claimed** it, the bot sends the one **@mention** of the load to that
+   person ("your laundry's done"). If **nobody claimed** it, the done message is
+   posted with **no ping**, and the Claim button stays.
+5. **Claim / Unclaim** — tapping **Claim** records the claimant in HA and swaps in
+   an **Unclaim** button so an accidental claim can be undone. The load stops
+   being claimable only when the **next load starts**.
 
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
 > **Why the ping is a separate little message:** editing an embed never makes a
 > phone buzz (that's what keeps the ETA/progress updates silent). So to actually
-> notify at completion, the bot posts one short "@role — laundry's done" line
-> next to the main embed. That single line is the only push per load.
+> notify at completion, the bot posts one short "@you — laundry's done" line next
+> to the main embed. That single line is the only push per load, and it's a
+> *user* mention — which needs no special bot permission and never pings a whole
+> role or @everyone.
 
 ### Entities it creates
 
@@ -85,9 +89,9 @@ estimate**, which can drift. It is presented as approximate (`~3:40 PM, about
 2. **Bot** tab → add a bot → **Reset/Copy Token**. This is your `bot_token`.
    - No privileged intents are needed for buttons. Leave **Message Content** OFF.
 3. **OAuth2 → URL Generator** → scope **`bot`**; bot permissions:
-   **Send Messages, Embed Links, Read Message History**
-   (add **Mention @everyone/Roles** only if you'll use a role mention). Open the
-   generated URL and invite the bot to your server.
+   **View Channels, Send Messages, Embed Links, Read Message History**. That's
+   all — pinging the claimant is a *user* mention, which needs no special
+   permission. Open the generated URL and invite the bot to your server.
 4. Enable **Developer Mode** (User Settings → Advanced), then right-click your
    target channel → **Copy ID** → that's your `channel_id`.
 
@@ -111,13 +115,12 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Job-state sensor | `sensor.washer_washer_job_state` | Drives drying/finished. |
 | Completion-time sensor | `sensor.washer_washer_completion_time` | ISO timestamp for the ETA. |
 | ETA interval | `90` s | How often to edit the ETA/progress (min 30). |
-| Ping role ID | *(none)* | Role to @mention when the load is **done**. Leave blank for no pings at all. |
-| Ping on complete | `true` | Send the one @mention when the load finishes. |
-| Ping on drying | `false` | Also @mention when drying starts. |
+| Ping claimant on complete | `true` | @mention whoever claimed the load when it's done. Turn off for zero pings. |
 
-> **Ping note:** because editing an embed never triggers a push, any @mention is
-> sent as a small **separate** message next to the main embed. With no role ID
-> set, the bot never pings — the message just updates silently.
+> **Ping note:** the only push per load is a *user* mention of the claimant, sent
+> as a small separate message when the load finishes. If nobody claimed it, no
+> ping is sent. There are no role/@everyone pings, so the bot needs no special
+> mention permission.
 
 ## 4. Test without doing laundry
 

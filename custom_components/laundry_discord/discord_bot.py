@@ -45,8 +45,9 @@ class _ClaimButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         who = interaction.user.display_name
+        user_id = interaction.user.id
         try:
-            if await self.coordinator.handle_claim(who):
+            if await self.coordinator.handle_claim(who, user_id):
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),
                     view=ClaimView(self.coordinator, show="unclaim"),
@@ -219,14 +220,17 @@ class DiscordBot:
         await message.edit(embed=embed, view=view)
 
     async def async_send_ping(self, content: str) -> None:
-        """Send a small standalone message that actually notifies (role mention).
+        """Send a small standalone message that actually notifies a user.
 
-        Used only for the optional drying alert, since editing an embed never
-        triggers a push notification.
+        Used for the completion ping to whoever claimed the load, since editing
+        an embed never triggers a push notification. Only user mentions are
+        allowed (no @everyone / role pings).
         """
         await self._client.wait_until_ready()
         channel = await self._get_channel()
         await channel.send(
             content=content,
-            allowed_mentions=discord.AllowedMentions(roles=True),
+            allowed_mentions=discord.AllowedMentions(
+                users=True, roles=False, everyone=False
+            ),
         )
