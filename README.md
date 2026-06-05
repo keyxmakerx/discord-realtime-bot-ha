@@ -56,6 +56,7 @@ are ignored while a wash is already running.
 | `sensor.laundry_claimed_by` | Current claimant's display name, or `Unclaimed`. |
 | `sensor.laundry_stage` | `Idle` / `Washing` / `Drying` / `Done — waiting` / `Done — claimed`. |
 | `binary_sensor.laundry_waiting` | `on` when a finished load is unclaimed. |
+| `sensor.laundry_connection_health` | Diagnostic: number of cloud-connection drops in the last 24h (with `last_drop` + `minutes_since_last_drop`). Great for a dashboard chip and for judging a wifi/AP change. |
 
 ## Why a custom integration (not an add-on)
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -22,6 +23,7 @@ async def async_setup_entry(
         [
             LaundryClaimedBySensor(coordinator, entry),
             LaundryStageSensor(coordinator, entry),
+            LaundryConnectionHealthSensor(coordinator, entry),
         ]
     )
 
@@ -60,3 +62,34 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
         ):
             return "Done — claimed"
         return STAGE_LABELS.get(coordinator.stage, coordinator.stage)
+
+
+class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
+    """Diagnostic: how often the washer's cloud connection drops out.
+
+    State is the number of `unavailable` blips on the job-state sensor in the
+    last 24h. Useful for a dashboard chip and for judging whether a wifi/AP
+    change actually helped. It never notifies — purely visibility.
+    """
+
+    _attr_name = "Laundry Connection Health"
+    _attr_icon = "mdi:wifi-alert"
+    _attr_native_unit_of_measurement = "drops/24h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_connection_health"
+
+    @property
+    def native_value(self) -> int:
+        return self.coordinator.flap_count_24h
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        last = self.coordinator.last_flap
+        return {
+            "last_drop": last.isoformat() if last is not None else None,
+            "minutes_since_last_drop": self.coordinator.minutes_since_flap,
+        }

@@ -20,16 +20,20 @@ from .const import (
     CONF_CHANNEL_ID,
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
+    CONF_AVAILABILITY_GRACE,
     CONF_JOB_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
+    DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_ETA_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_JOB_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_RUNNING_ENTITY,
     DOMAIN,
+    MAX_AVAILABILITY_GRACE,
     MAX_ETA_INTERVAL,
+    MIN_AVAILABILITY_GRACE,
     MIN_ETA_INTERVAL,
 )
 
@@ -61,6 +65,20 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
                 ),
             ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_AVAILABILITY_GRACE,
+                default=defaults.get(
+                    CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_AVAILABILITY_GRACE,
+                    max=MAX_AVAILABILITY_GRACE,
+                    step=1,
+                    unit_of_measurement="minutes",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
         }
     )
 
@@ -170,6 +188,9 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
                         CONF_PING_CLAIMANT_ON_COMPLETE
                     ],
+                    CONF_AVAILABILITY_GRACE: int(
+                        user_input[CONF_AVAILABILITY_GRACE]
+                    ),
                 }
             )
 

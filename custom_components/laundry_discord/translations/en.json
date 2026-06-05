@@ -11,7 +11,8 @@
           "job_state_entity": "Washer job-state sensor",
           "eta_entity": "Completion-time sensor (ISO timestamp)",
           "eta_interval": "ETA update interval",
-          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done"
+          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
+          "availability_grace": "Hold last ETA through a connection blip (minutes)"
         }
       }
     },
@@ -28,7 +29,8 @@
         "title": "Laundry Discord Bot options",
         "data": {
           "eta_interval": "ETA update interval",
-          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done"
+          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
+          "availability_grace": "Hold last ETA through a connection blip (minutes)"
         }
       }
     }
