@@ -37,6 +37,11 @@ For a single load (a "session"):
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
+> **Mid-cycle startup:** if the washer is **already running** when the bot
+> connects (e.g. you installed the integration, or restarted HA, during a load),
+> it picks the load up right away and posts a "Laundry in progress" message,
+> rather than waiting for the next cycle.
+
 > **Why the ping is a separate little message:** editing an embed never makes a
 > phone buzz (that's what keeps the ETA/progress updates silent). So to actually
 > notify at completion, the bot posts one short "@you — laundry's done" line next
