@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import discord
 
@@ -29,13 +29,15 @@ from .const import (
     CONF_CHANNEL_ID,
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
+    CONF_AVAILABILITY_GRACE,
     CONF_JOB_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
+    DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
-    INVALID_OLD_STATES,
     PROGRESS_PHASES,
+    UNAVAILABLE_STATES,
     JOB_STATE_DRYING,
     JOB_STATE_NONE,
     REAL_PHASES,
@@ -83,11 +85,19 @@ class LaundryCoordinator:
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
         self.catch_up: bool = False
+        # Last confirmed real job phase, ignoring unavailable/unknown blips, so a
+        # flap landing on the finish moment can't make us miss "done".
+        self._last_real_phase: str | None = None
+        # Unix timestamps of job_state -> unavailable transitions (connection
+        # health). Pruned to a rolling 24h window.
+        self._flap_times: list[float] = []
 
         self._eta_unsub = None
         self._unsubs: list = []
         self._lock = asyncio.Lock()
         self._restored = False
+        # Cached last-good ETA (target datetime, when last seen) for flap hold.
+        self._eta_cache: tuple[datetime, float] | None = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -114,6 +124,32 @@ class LaundryCoordinator:
             )
         )
 
+    @property
+    def availability_grace(self) -> int:
+        """Seconds to hold the last-good ETA while completion is unavailable."""
+        return (
+            int(self._cfg.get(CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE))
+            * 60
+        )
+
+    # --- connection health (diagnostic) ---
+    @property
+    def flap_count_24h(self) -> int:
+        cutoff = dt_util.utcnow().timestamp() - 86400
+        return sum(1 for t in self._flap_times if t >= cutoff)
+
+    @property
+    def last_flap(self) -> datetime | None:
+        if not self._flap_times:
+            return None
+        return dt_util.utc_from_timestamp(max(self._flap_times))
+
+    @property
+    def minutes_since_flap(self) -> float | None:
+        if not self._flap_times:
+            return None
+        return round((dt_util.utcnow().timestamp() - max(self._flap_times)) / 60, 1)
+
     # ------------------------------------------------------------------- setup
     async def async_setup(self) -> None:
         """Load persisted session and subscribe to the watched entities."""
@@ -128,6 +164,17 @@ class LaundryCoordinator:
                 self.hass, [self.job_state_entity], self._on_job_state
             )
         )
+        # Keep the diagnostic connection-health sensor fresh (24h count decays,
+        # "minutes since last drop" grows) without a live event.
+        self._unsubs.append(
+            async_track_time_interval(
+                self.hass, self._async_health_tick, timedelta(minutes=5)
+            )
+        )
+
+    @callback
+    def _async_health_tick(self, now) -> None:
+        self._notify_entities()
 
     async def async_run_bot(self) -> None:
         """Background task body: run the gateway, never crash HA on failure."""
@@ -178,6 +225,8 @@ class LaundryCoordinator:
         self.claimed_by_id = data.get("claimed_by_id")
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
+        self._last_real_phase = data.get("last_real_phase")
+        self._flap_times = list(data.get("flap_times", []))
 
     async def _async_save(self) -> None:
         await self._store.async_save(
@@ -188,6 +237,8 @@ class LaundryCoordinator:
                 "claimed_by_id": self.claimed_by_id,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
+                "last_real_phase": self._last_real_phase,
+                "flap_times": self._flap_times,
             }
         )
 
@@ -241,33 +292,57 @@ class LaundryCoordinator:
 
     @callback
     def _on_job_state(self, event: Event) -> None:
-        """Drive drying/finished transitions, immune to the ~51-min flap."""
+        """Drive drying/finished transitions, immune to the ~51-min flap.
+
+        Decisions key off the *last confirmed real phase* rather than the raw
+        previous state, so a flap landing on a transition (e.g. ``spin ->
+        unavailable -> none``) can't make us miss the finish.
+        """
         new = event.data.get("new_state")
         if new is None:
             return
         new_s = new.state
-
-        if self.stage == STAGE_IDLE:
-            # Not tracking anything. A real cycle phase confirms a load is
-            # underway (e.g. the job-state sensor populated after the running
-            # sensor on startup) — catch it up.
-            if new_s in REAL_PHASES:
-                self._maybe_catch_up()
-            return
-
         old = event.data.get("old_state")
         old_s = old.state if old is not None else None
 
-        # Drying: only from a real phase (never from unavailable/unknown/none).
-        if (
-            new_s == JOB_STATE_DRYING
-            and old_s is not None
-            and old_s not in INVALID_OLD_STATES
-        ):
-            self.hass.async_create_task(self._async_handle_drying())
-        # Finished: into "none" from a real wash phase.
-        elif new_s == JOB_STATE_NONE and old_s in REAL_PHASES:
-            self.hass.async_create_task(self._async_handle_finished())
+        # Connection health: record each transition INTO unavailable.
+        if new_s == "unavailable" and old_s not in (None, "unavailable"):
+            self._record_flap()
+
+        # A flap is held: it never alters the session, and we keep the last
+        # confirmed phase so the finish below survives a blip.
+        if new_s in UNAVAILABLE_STATES:
+            return
+
+        if new_s in REAL_PHASES:
+            if self.stage == STAGE_IDLE:
+                # A real phase confirms a load is underway; catch it up. The
+                # started session seeds _last_real_phase from current state.
+                self._maybe_catch_up()
+                return
+            if (
+                new_s == JOB_STATE_DRYING
+                and self._last_real_phase not in (None, JOB_STATE_DRYING)
+            ):
+                self.hass.async_create_task(self._async_handle_drying())
+            self._last_real_phase = new_s
+        elif new_s == JOB_STATE_NONE:
+            if (
+                self.stage in (STAGE_WASHING, STAGE_DRYING)
+                and self._last_real_phase in REAL_PHASES
+            ):
+                self.hass.async_create_task(self._async_handle_finished())
+            self._last_real_phase = None
+
+    @callback
+    def _record_flap(self) -> None:
+        """Record a connection drop and refresh the health sensor."""
+        now = dt_util.utcnow().timestamp()
+        cutoff = now - 86400
+        self._flap_times = [t for t in self._flap_times if t >= cutoff]
+        self._flap_times.append(now)
+        self._notify_entities()
+        self.hass.async_create_task(self._async_save())
 
     # ------------------------------------------------------- lifecycle actions
     async def _async_start_session(self, catch_up: bool = False) -> None:
@@ -283,6 +358,12 @@ class LaundryCoordinator:
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
             self.message_id = None
+            # Seed the last confirmed phase from the current job state so a
+            # caught-up (already-drying) load still detects its finish.
+            job = self.hass.states.get(self.job_state_entity)
+            self._last_real_phase = (
+                job.state if job is not None and job.state in REAL_PHASES else None
+            )
 
             # The start post is a normal, visible message with the Claim button
             # so people can call dibs early. It never @mentions anyone — the only
@@ -413,15 +494,33 @@ class LaundryCoordinator:
             _LOGGER.exception("ETA edit failed")
 
     # ------------------------------------------------------------------ embeds
-    def _eta_text(self) -> str:
+    def _current_eta(self) -> datetime | None:
+        """Parsed ETA target, holding the last-good value through a flap.
+
+        If the completion sensor is unavailable, keep returning the last known
+        ETA for up to the availability grace window so a connection blip never
+        flickers the embed to 'updating…'.
+        """
+        now = dt_util.utcnow().timestamp()
         state = self.hass.states.get(self.eta_entity)
-        if state is None or state.state in ("", "unknown", "unavailable", None):
-            return "ETA updating…"
-        target = dt_util.parse_datetime(state.state)
+        if state is not None and state.state not in UNAVAILABLE_STATES | {"", None}:
+            target = dt_util.parse_datetime(state.state)
+            if target is not None:
+                if target.tzinfo is None:
+                    target = dt_util.as_utc(target)
+                self._eta_cache = (target, now)
+                return target
+        # Unavailable/unparseable: hold the cached ETA within the grace window.
+        if self._eta_cache is not None:
+            cached, seen = self._eta_cache
+            if now - seen <= self.availability_grace:
+                return cached
+        return None
+
+    def _eta_text(self) -> str:
+        target = self._current_eta()
         if target is None:
             return "ETA updating…"
-        if target.tzinfo is None:
-            target = dt_util.as_utc(target)
         local = dt_util.as_local(target)
         clock = local.strftime("%-I:%M %p")
         delta = (target - dt_util.utcnow()).total_seconds()

@@ -12,6 +12,7 @@ CONF_JOB_STATE_ENTITY = "job_state_entity"
 CONF_ETA_ENTITY = "eta_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
+CONF_AVAILABILITY_GRACE = "availability_grace"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -21,6 +22,14 @@ DEFAULT_ETA_INTERVAL = 90
 MIN_ETA_INTERVAL = 30
 MAX_ETA_INTERVAL = 3600
 DEFAULT_PING_CLAIMANT_ON_COMPLETE = True
+# How long (minutes) to keep showing the last-known ETA when the completion
+# sensor goes unavailable, so a connection flap never flickers the embed.
+DEFAULT_AVAILABILITY_GRACE = 5
+MIN_AVAILABILITY_GRACE = 1
+MAX_AVAILABILITY_GRACE = 120
+
+# States that mean "I don't know" rather than a real value.
+UNAVAILABLE_STATES = {"unavailable", "unknown"}
 
 # --- Platforms ---
 PLATFORMS = ["sensor", "binary_sensor"]
