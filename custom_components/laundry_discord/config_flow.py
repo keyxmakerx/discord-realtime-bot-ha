@@ -21,13 +21,17 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_AVAILABILITY_GRACE,
+    CONF_ENERGY_ENTITY,
     CONF_JOB_STATE_ENTITY,
+    CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
+    CONF_WATER_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_ETA_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_JOB_STATE_ENTITY,
+    DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_RUNNING_ENTITY,
     DOMAIN,
@@ -107,6 +111,12 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_RUNNING_ENTITY: user_input[CONF_RUNNING_ENTITY],
                     CONF_JOB_STATE_ENTITY: user_input[CONF_JOB_STATE_ENTITY],
                     CONF_ETA_ENTITY: user_input[CONF_ETA_ENTITY],
+                    CONF_MACHINE_STATE_ENTITY: user_input.get(
+                        CONF_MACHINE_STATE_ENTITY
+                    )
+                    or "",
+                    CONF_ENERGY_ENTITY: user_input.get(CONF_ENERGY_ENTITY) or "",
+                    CONF_WATER_ENTITY: user_input.get(CONF_WATER_ENTITY) or "",
                 }
                 options = {
                     CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
@@ -149,6 +159,20 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_ETA_ENTITY,
                     default=defaults.get(CONF_ETA_ENTITY, DEFAULT_ETA_ENTITY),
                 ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Optional(
+                    CONF_MACHINE_STATE_ENTITY,
+                    default=defaults.get(
+                        CONF_MACHINE_STATE_ENTITY, DEFAULT_MACHINE_STATE_ENTITY
+                    ),
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Optional(CONF_ENERGY_ENTITY): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Optional(CONF_WATER_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
                 vol.Required(

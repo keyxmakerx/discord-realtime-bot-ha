@@ -10,6 +10,9 @@ CONF_CHANNEL_ID = "channel_id"
 CONF_RUNNING_ENTITY = "running_entity"
 CONF_JOB_STATE_ENTITY = "job_state_entity"
 CONF_ETA_ENTITY = "eta_entity"
+CONF_MACHINE_STATE_ENTITY = "machine_state_entity"
+CONF_ENERGY_ENTITY = "energy_entity"
+CONF_WATER_ENTITY = "water_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
@@ -18,6 +21,18 @@ CONF_AVAILABILITY_GRACE = "availability_grace"
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
 DEFAULT_JOB_STATE_ENTITY = "sensor.washer_washer_job_state"
 DEFAULT_ETA_ENTITY = "sensor.washer_washer_completion_time"
+DEFAULT_MACHINE_STATE_ENTITY = "sensor.washer_washer_machine_state"
+DEFAULT_ENERGY_ENTITY = "sensor.washer_energy"
+DEFAULT_WATER_ENTITY = "sensor.washer_water_consumption"
+
+# machine_state vocabulary (run / pause / stop / unavailable).
+MACHINE_RUN = "run"
+MACHINE_PAUSE = "pause"
+MACHINE_STOP = "stop"
+
+# Phases that indicate a load is already well underway (=> "in progress" wording
+# / treated as a mid-cycle catch-up rather than a fresh start).
+MIDCYCLE_PHASES = {"rinse", "spin", "drying", "finish"}
 DEFAULT_ETA_INTERVAL = 90
 MIN_ETA_INTERVAL = 30
 MAX_ETA_INTERVAL = 3600

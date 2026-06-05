@@ -10,6 +10,9 @@
           "running_entity": "Washer running sensor (debounced on/off)",
           "job_state_entity": "Washer job-state sensor",
           "eta_entity": "Completion-time sensor (ISO timestamp)",
+          "machine_state_entity": "Machine-state sensor (run/pause/stop — for pause display + start consensus)",
+          "energy_entity": "Energy sensor (optional — shows kWh used on the done message)",
+          "water_entity": "Water-usage sensor (optional — shows usage on the done message)",
           "eta_interval": "ETA update interval",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)"
