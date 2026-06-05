@@ -1,0 +1,64 @@
+"""Constants for the Laundry Discord Bot integration."""
+
+from __future__ import annotations
+
+DOMAIN = "laundry_discord"
+
+# --- Config / option keys ---
+CONF_BOT_TOKEN = "bot_token"
+CONF_CHANNEL_ID = "channel_id"
+CONF_RUNNING_ENTITY = "running_entity"
+CONF_JOB_STATE_ENTITY = "job_state_entity"
+CONF_ETA_ENTITY = "eta_entity"
+CONF_ETA_INTERVAL = "eta_interval"
+CONF_PING_ROLE_ID = "ping_role_id"
+CONF_PING_ON_DRYING = "ping_on_drying"
+
+# --- Defaults ---
+DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
+DEFAULT_JOB_STATE_ENTITY = "sensor.washer_washer_job_state"
+DEFAULT_ETA_ENTITY = "sensor.washer_washer_completion_time"
+DEFAULT_ETA_INTERVAL = 90
+MIN_ETA_INTERVAL = 30
+MAX_ETA_INTERVAL = 3600
+DEFAULT_PING_ROLE_ID = ""
+DEFAULT_PING_ON_DRYING = False
+
+# --- Platforms ---
+PLATFORMS = ["sensor", "binary_sensor"]
+
+# --- Storage ---
+STORAGE_VERSION = 1
+STORAGE_KEY = f"{DOMAIN}.session"
+
+# --- Dispatcher signal ---
+SIGNAL_UPDATE = f"{DOMAIN}_update"
+
+# --- Discord ---
+CLAIM_CUSTOM_ID = "laundry_discord_claim"
+
+# --- Services ---
+SERVICE_TEST_POST = "test_post"
+
+# --- Session stages ---
+STAGE_IDLE = "idle"
+STAGE_WASHING = "washing"
+STAGE_DRYING = "drying"
+STAGE_DONE_WAITING = "done_waiting"
+
+STAGE_LABELS = {
+    STAGE_IDLE: "Idle",
+    STAGE_WASHING: "Washing",
+    STAGE_DRYING: "Drying",
+    STAGE_DONE_WAITING: "Done — waiting",
+}
+
+# --- Washer job_state vocabulary (observed on this machine) ---
+JOB_STATE_NONE = "none"
+JOB_STATE_DRYING = "drying"
+# Real wash phases. A transition INTO "none" from one of these means "finished".
+REAL_PHASES = {"weight_sensing", "wash", "rinse", "spin", "drying", "finish"}
+# old_state values that indicate a flap / startup, never a real phase transition.
+INVALID_OLD_STATES = {"unavailable", "unknown", "none"}
+
+UNCLAIMED = "Unclaimed"

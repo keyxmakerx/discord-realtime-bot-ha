@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Laundry Discord Bot",
+        "description": "Connect a self-hosted Discord bot that watches your washer and posts a single, self-updating message per load. See the README for how to create the bot token and find the channel ID.",
+        "data": {
+          "bot_token": "Discord bot token",
+          "channel_id": "Channel ID (numeric)",
+          "running_entity": "Washer running sensor (debounced on/off)",
+          "job_state_entity": "Washer job-state sensor",
+          "eta_entity": "Completion-time sensor (ISO timestamp)",
+          "eta_interval": "ETA update interval",
+          "ping_role_id": "Role ID to mention on start (optional)",
+          "ping_on_drying": "Send one ping when drying starts"
+        }
+      }
+    },
+    "error": {
+      "invalid_channel": "Channel ID must be all digits.",
+      "invalid_role": "Role ID must be all digits (or left blank)."
+    },
+    "abort": {
+      "already_configured": "This Discord channel is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Laundry Discord Bot options",
+        "data": {
+          "eta_interval": "ETA update interval",
+          "ping_role_id": "Role ID to mention on start (optional)",
+          "ping_on_drying": "Send one ping when drying starts"
+        }
+      }
+    },
+    "error": {
+      "invalid_role": "Role ID must be all digits (or left blank)."
+    }
+  },
+  "services": {
+    "test_post": {
+      "name": "Test post",
+      "description": "Post a sample embed with a working Claim button to test the Discord path without a real wash."
+    }
+  }
+}
