@@ -37,6 +37,12 @@ For a single load (a "session"):
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
+> **Start consensus (no false positives):** a load only counts as "running" when
+> the signals *agree* — `job_state` shows a real cycle phase **and**
+> `washer_running` is `on` **and** `machine_state` isn't `stop`. It's evaluated
+> on every relevant sensor change, so it can't fire on a lone flaky signal nor
+> miss a real load. Pausing mid-cycle shows **"⏸ Paused"** and never ends the load.
+
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),
 > it picks the load up right away and posts a "Laundry in progress" message,
@@ -120,6 +126,9 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Running sensor | `binary_sensor.washer_running` | Debounced on/off; drives **start**. |
 | Job-state sensor | `sensor.washer_washer_job_state` | Drives drying/finished. |
 | Completion-time sensor | `sensor.washer_washer_completion_time` | ISO timestamp for the ETA. |
+| Machine-state sensor | `sensor.washer_washer_machine_state` | `run`/`pause`/`stop` — adds a **"⏸ Paused"** display and a `stop` veto to the start consensus. |
+| Energy sensor *(optional)* | `sensor.washer_energy` | Shows **kWh used** on the done message. |
+| Water-usage sensor *(optional)* | `sensor.washer_water_consumption` | Shows **water used** on the done message. |
 | ETA interval | `90` s | How often to edit the ETA/progress (min 30). |
 | Ping claimant on complete | `true` | @mention whoever claimed the load when it's done. Turn off for zero pings. |
 

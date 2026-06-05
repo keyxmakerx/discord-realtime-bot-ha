@@ -30,12 +30,22 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_AVAILABILITY_GRACE,
+    CONF_ENERGY_ENTITY,
     CONF_JOB_STATE_ENTITY,
+    CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
+    CONF_WATER_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
+    DEFAULT_ENERGY_ENTITY,
     DEFAULT_ETA_INTERVAL,
+    DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
+    DEFAULT_WATER_ENTITY,
+    MACHINE_PAUSE,
+    MACHINE_RUN,
+    MACHINE_STOP,
+    MIDCYCLE_PHASES,
     PROGRESS_PHASES,
     UNAVAILABLE_STATES,
     JOB_STATE_DRYING,
@@ -85,9 +95,15 @@ class LaundryCoordinator:
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
         self.catch_up: bool = False
+        # True while machine_state reports the load is paused mid-cycle.
+        self.paused: bool = False
         # Last confirmed real job phase, ignoring unavailable/unknown blips, so a
         # flap landing on the finish moment can't make us miss "done".
         self._last_real_phase: str | None = None
+        # Energy/water meter baselines captured at session start (None when not
+        # measurable, e.g. a mid-cycle catch-up where there's no true baseline).
+        self._energy_start: float | None = None
+        self._water_start: float | None = None
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
         self._flap_times: list[float] = []
@@ -111,6 +127,20 @@ class LaundryCoordinator:
     @property
     def eta_entity(self) -> str:
         return self._cfg[CONF_ETA_ENTITY]
+
+    @property
+    def machine_state_entity(self) -> str:
+        return self._cfg.get(
+            CONF_MACHINE_STATE_ENTITY, DEFAULT_MACHINE_STATE_ENTITY
+        )
+
+    @property
+    def energy_entity(self) -> str:
+        return str(self._cfg.get(CONF_ENERGY_ENTITY) or DEFAULT_ENERGY_ENTITY)
+
+    @property
+    def water_entity(self) -> str:
+        return str(self._cfg.get(CONF_WATER_ENTITY) or DEFAULT_WATER_ENTITY)
 
     @property
     def eta_interval(self) -> int:
@@ -164,6 +194,12 @@ class LaundryCoordinator:
                 self.hass, [self.job_state_entity], self._on_job_state
             )
         )
+        if self.machine_state_entity:
+            self._unsubs.append(
+                async_track_state_change_event(
+                    self.hass, [self.machine_state_entity], self._on_machine_state
+                )
+            )
         # Keep the diagnostic connection-health sensor fresh (24h count decays,
         # "minutes since last drop" grows) without a live event.
         self._unsubs.append(
@@ -206,10 +242,9 @@ class LaundryCoordinator:
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage == STAGE_IDLE:
             # Nothing was in progress when we last saved, but the washer may
-            # already be mid-cycle (installed or restarted during a load). Only
-            # acts once the running + job-state signals confirm it (and the
-            # sensor changes themselves re-check, covering the startup race).
-            self._maybe_catch_up()
+            # already be mid-cycle (installed or restarted during a load). The
+            # consensus check (and later sensor changes) confirm it.
+            self._evaluate_start()
         # DONE_WAITING sessions keep their button working via the persistent
         # ClaimView re-registered in on_ready; nothing else to do here.
         self._notify_entities()
@@ -225,7 +260,10 @@ class LaundryCoordinator:
         self.claimed_by_id = data.get("claimed_by_id")
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
+        self.paused = data.get("paused", False)
         self._last_real_phase = data.get("last_real_phase")
+        self._energy_start = data.get("energy_start")
+        self._water_start = data.get("water_start")
         self._flap_times = list(data.get("flap_times", []))
 
     async def _async_save(self) -> None:
@@ -237,7 +275,10 @@ class LaundryCoordinator:
                 "claimed_by_id": self.claimed_by_id,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
+                "paused": self.paused,
                 "last_real_phase": self._last_real_phase,
+                "energy_start": self._energy_start,
+                "water_start": self._water_start,
                 "flap_times": self._flap_times,
             }
         )
@@ -247,48 +288,67 @@ class LaundryCoordinator:
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     # ---------------------------------------------------------- state handlers
-    @callback
-    def _on_running(self, event: Event) -> None:
-        """Start a session when the washer turns on.
+    def _machine_state(self) -> str | None:
+        """Current machine_state, or None if not configured / not readable."""
+        if not self.machine_state_entity:
+            return None
+        st = self.hass.states.get(self.machine_state_entity)
+        if st is None or st.state in UNAVAILABLE_STATES:
+            return None
+        return st.state
 
-        A clean ``off -> on`` is a normal start (the debounced sensor is the
-        designed, timely trigger). Any other transition INTO ``on`` (from
-        ``unavailable``/``unknown``/``None`` — e.g. the cloud entity populating
-        after an HA restart) is treated as a *possible* mid-cycle load and only
-        acted on once corroborated by :meth:`_maybe_catch_up`.
+    def _load_active(self) -> bool:
+        """Multi-sensor consensus that a load is genuinely running.
+
+        Requires a real job phase AND the running sensor on, and lets an
+        explicit machine_state ``stop`` veto a contradictory ``on``. This is what
+        prevents a single flaky signal from starting a phantom session.
         """
-        new = event.data.get("new_state")
-        if new is None or new.state != "on":
-            return
-        old = event.data.get("old_state")
-        old_s = old.state if old is not None else None
-        if old_s == "off":
-            self.hass.async_create_task(self._async_start_session())
-        else:
-            self._maybe_catch_up()
+        job = self.hass.states.get(self.job_state_entity)
+        running = self.hass.states.get(self.running_entity)
+        if job is None or job.state not in REAL_PHASES:
+            return False
+        if running is None or running.state != "on":
+            return False
+        if self._machine_state() == MACHINE_STOP:
+            return False
+        return True
 
     @callback
-    def _maybe_catch_up(self) -> None:
-        """Start a catch-up session only if a load is *confirmed* in progress.
+    def _evaluate_start(self) -> None:
+        """Start tracking once the signals agree a load is running.
 
-        Corroborates two signals so a single flaky/stale ``on`` can't create a
-        phantom session: the running sensor must read ``on`` AND the job-state
-        sensor must report a real cycle phase. Only fires when nothing is being
-        tracked. Safe to call repeatedly (from bot-ready and either sensor's
-        change) — the session lock and the idle guard prevent duplicates.
+        Called from every relevant sensor change and on bot-ready, so the start
+        can't be missed (event-driven) nor fired on a lone signal (consensus).
         """
         if self.stage != STAGE_IDLE:
             return
-        running = self.hass.states.get(self.running_entity)
-        if running is None or running.state != "on":
+        if self._load_active():
+            self.hass.async_create_task(self._async_start_session())
+
+    @callback
+    def _on_running(self, event: Event) -> None:
+        new = event.data.get("new_state")
+        if new is None:
             return
-        job = self.hass.states.get(self.job_state_entity)
-        if job is None or job.state not in REAL_PHASES:
+        self._evaluate_start()
+
+    @callback
+    def _on_machine_state(self, event: Event) -> None:
+        """Show/clear the paused state, and re-check the start consensus."""
+        new = event.data.get("new_state")
+        if new is None:
             return
-        _LOGGER.debug(
-            "Catch-up: washer confirmed running (running=on, job=%s)", job.state
-        )
-        self.hass.async_create_task(self._async_start_session(catch_up=True))
+        new_s = new.state
+        if self.stage in (STAGE_WASHING, STAGE_DRYING):
+            if new_s == MACHINE_PAUSE and not self.paused:
+                self.paused = True
+                self.hass.async_create_task(self._async_render_active("paused"))
+            elif new_s == MACHINE_RUN and self.paused:
+                self.paused = False
+                self.hass.async_create_task(self._async_render_active("resumed"))
+        elif self.stage == STAGE_IDLE:
+            self._evaluate_start()
 
     @callback
     def _on_job_state(self, event: Event) -> None:
@@ -316,9 +376,9 @@ class LaundryCoordinator:
 
         if new_s in REAL_PHASES:
             if self.stage == STAGE_IDLE:
-                # A real phase confirms a load is underway; catch it up. The
-                # started session seeds _last_real_phase from current state.
-                self._maybe_catch_up()
+                # A real phase is part of the start consensus; the started
+                # session seeds _last_real_phase from current state.
+                self._evaluate_start()
                 return
             if (
                 new_s == JOB_STATE_DRYING
@@ -344,8 +404,35 @@ class LaundryCoordinator:
         self._notify_entities()
         self.hass.async_create_task(self._async_save())
 
+    def _entity_float(self, entity_id: str | None) -> float | None:
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
+            return None
+        try:
+            return float(st.state)
+        except (ValueError, TypeError):
+            return None
+
+    def _entity_unit(self, entity_id: str | None) -> str | None:
+        st = self.hass.states.get(entity_id) if entity_id else None
+        return st.attributes.get("unit_of_measurement") if st is not None else None
+
+    async def _async_render_active(self, reason: str) -> None:
+        """Re-render the live washing/drying message (e.g. on pause/resume)."""
+        async with self._lock:
+            if self.stage not in (STAGE_WASHING, STAGE_DRYING) or not self.message_id:
+                return
+            try:
+                await self.bot.async_edit(self.message_id, self.build_embed())
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to re-render active message (%s)", reason)
+            await self._async_save()
+            self._notify_entities()
+
     # ------------------------------------------------------- lifecycle actions
-    async def _async_start_session(self, catch_up: bool = False) -> None:
+    async def _async_start_session(self) -> None:
         async with self._lock:
             # A wash already in progress wins. A previous *finished* load (still
             # showing its claim/unclaim message) is simply superseded by this one.
@@ -353,17 +440,25 @@ class LaundryCoordinator:
                 _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
                 return
             self.stage = STAGE_WASHING
-            self.catch_up = catch_up
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
             self.message_id = None
+            self.paused = self._machine_state() == MACHINE_PAUSE
             # Seed the last confirmed phase from the current job state so a
             # caught-up (already-drying) load still detects its finish.
             job = self.hass.states.get(self.job_state_entity)
-            self._last_real_phase = (
-                job.state if job is not None and job.state in REAL_PHASES else None
-            )
+            phase = job.state if job is not None else None
+            self._last_real_phase = phase if phase in REAL_PHASES else None
+            # Already well into the cycle => a mid-cycle pickup ("in progress").
+            self.catch_up = phase in MIDCYCLE_PHASES
+            # Capture meter baselines for the usage stat — only meaningful for a
+            # load we see from the start (a catch-up has no true baseline).
+            if self.catch_up:
+                self._energy_start = self._water_start = None
+            else:
+                self._energy_start = self._entity_float(self.energy_entity)
+                self._water_start = self._entity_float(self.water_entity)
 
             # The start post is a normal, visible message with the Claim button
             # so people can call dibs early. It never @mentions anyone — the only
@@ -406,6 +501,7 @@ class LaundryCoordinator:
                 return
             self._stop_eta_timer()
             self.stage = STAGE_DONE_WAITING
+            self.paused = False
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
@@ -574,19 +670,29 @@ class LaundryCoordinator:
             return embed
 
         if self.stage == STAGE_WASHING:
+            desc = "The washer is running. Tap **Claim** to call dibs."
+            if self.paused:
+                desc = "⏸ **Paused** — the cycle is on hold.\n" + desc
             embed = discord.Embed(
                 title=(
-                    "🫧 Laundry in progress" if self.catch_up else "🫧 Laundry started"
+                    "⏸ Laundry paused"
+                    if self.paused
+                    else "🫧 Laundry in progress"
+                    if self.catch_up
+                    else "🫧 Laundry started"
                 ),
-                description="The washer is running. Tap **Claim** to call dibs.",
+                description=desc,
                 color=_COLOR_WASHING,
             )
             self._add_progress_and_eta(embed)
             self._add_claimant(embed)
         elif self.stage == STAGE_DRYING:
+            desc = "Pull out anything you don't want dried!"
+            if self.paused:
+                desc = "⏸ **Paused** — the cycle is on hold.\n" + desc
             embed = discord.Embed(
-                title="🌀 Drying",
-                description="Pull out anything you don't want dried!",
+                title="⏸ Drying paused" if self.paused else "🌀 Drying",
+                description=desc,
                 color=_COLOR_DRYING,
             )
             self._add_progress_and_eta(embed)
@@ -610,6 +716,9 @@ class LaundryCoordinator:
                     ),
                     color=_COLOR_DONE,
                 )
+            usage = self._usage_text()
+            if usage:
+                embed.add_field(name="This load used", value=usage, inline=False)
         else:
             embed = discord.Embed(
                 title="Laundry", description="Idle.", color=_COLOR_CLAIMED
@@ -630,3 +739,23 @@ class LaundryCoordinator:
             embed.add_field(
                 name="Claimed by", value=f"🧺 {self.claimed_by}", inline=False
             )
+
+    def _usage_text(self) -> str | None:
+        """Energy/water used this load (meter delta since start), or None."""
+        parts: list[str] = []
+        if self._energy_start is not None:
+            end = self._entity_float(self.energy_entity)
+            if end is not None:
+                used = end - self._energy_start
+                if used < 0:  # meter reset during the cycle
+                    used = end
+                parts.append(f"⚡ {used:.2f} kWh")
+        if self._water_start is not None:
+            end = self._entity_float(self.water_entity)
+            if end is not None:
+                used = end - self._water_start
+                if used < 0:
+                    used = end
+                unit = self._entity_unit(self.water_entity) or "L"
+                parts.append(f"💧 {used:.0f} {unit}")
+        return " · ".join(parts) if parts else None
