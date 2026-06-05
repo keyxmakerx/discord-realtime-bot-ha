@@ -11,15 +11,12 @@
           "job_state_entity": "Washer job-state sensor",
           "eta_entity": "Completion-time sensor (ISO timestamp)",
           "eta_interval": "ETA update interval",
-          "ping_role_id": "Role ID to @mention when done (optional)",
-          "ping_on_complete": "@mention the role when the load is done",
-          "ping_on_drying": "Also @mention when drying starts"
+          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done"
         }
       }
     },
     "error": {
-      "invalid_channel": "Channel ID must be all digits.",
-      "invalid_role": "Role ID must be all digits (or left blank)."
+      "invalid_channel": "Channel ID must be all digits."
     },
     "abort": {
       "already_configured": "This Discord channel is already configured."
@@ -31,14 +28,9 @@
         "title": "Laundry Discord Bot options",
         "data": {
           "eta_interval": "ETA update interval",
-          "ping_role_id": "Role ID to @mention when done (optional)",
-          "ping_on_complete": "@mention the role when the load is done",
-          "ping_on_drying": "Also @mention when drying starts"
+          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done"
         }
       }
-    },
-    "error": {
-      "invalid_role": "Role ID must be all digits (or left blank)."
     }
   },
   "services": {

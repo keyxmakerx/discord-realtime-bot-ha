@@ -21,21 +21,29 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_JOB_STATE_ENTITY,
-    CONF_PING_ON_COMPLETE,
-    CONF_PING_ON_DRYING,
-    CONF_PING_ROLE_ID,
+    CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
     DEFAULT_ETA_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_JOB_STATE_ENTITY,
-    DEFAULT_PING_ON_COMPLETE,
-    DEFAULT_PING_ON_DRYING,
-    DEFAULT_PING_ROLE_ID,
+    DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_RUNNING_ENTITY,
     DOMAIN,
     MAX_ETA_INTERVAL,
     MIN_ETA_INTERVAL,
 )
+
+
+def _eta_interval_selector() -> selector.NumberSelector:
+    return selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=MIN_ETA_INTERVAL,
+            max=MAX_ETA_INTERVAL,
+            step=5,
+            unit_of_measurement="seconds",
+            mode=selector.NumberSelectorMode.BOX,
+        )
+    )
 
 
 def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
@@ -45,28 +53,13 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(
                 CONF_ETA_INTERVAL,
                 default=defaults.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_ETA_INTERVAL,
-                    max=MAX_ETA_INTERVAL,
-                    step=5,
-                    unit_of_measurement="seconds",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            ),
-            vol.Optional(
-                CONF_PING_ROLE_ID,
-                default=defaults.get(CONF_PING_ROLE_ID, DEFAULT_PING_ROLE_ID),
-            ): selector.TextSelector(),
+            ): _eta_interval_selector(),
             vol.Required(
-                CONF_PING_ON_COMPLETE,
+                CONF_PING_CLAIMANT_ON_COMPLETE,
                 default=defaults.get(
-                    CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE
+                    CONF_PING_CLAIMANT_ON_COMPLETE,
+                    DEFAULT_PING_CLAIMANT_ON_COMPLETE,
                 ),
-            ): selector.BooleanSelector(),
-            vol.Required(
-                CONF_PING_ON_DRYING,
-                default=defaults.get(CONF_PING_ON_DRYING, DEFAULT_PING_ON_DRYING),
             ): selector.BooleanSelector(),
         }
     )
@@ -85,11 +78,8 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             channel_id = str(user_input[CONF_CHANNEL_ID]).strip()
-            role_id = str(user_input.get(CONF_PING_ROLE_ID, "")).strip()
             if not channel_id.isdigit():
                 errors[CONF_CHANNEL_ID] = "invalid_channel"
-            elif role_id and not role_id.isdigit():
-                errors[CONF_PING_ROLE_ID] = "invalid_role"
             else:
                 await self.async_set_unique_id(channel_id)
                 self._abort_if_unique_id_configured()
@@ -102,9 +92,9 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
                 options = {
                     CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
-                    CONF_PING_ROLE_ID: role_id,
-                    CONF_PING_ON_COMPLETE: user_input[CONF_PING_ON_COMPLETE],
-                    CONF_PING_ON_DRYING: user_input[CONF_PING_ON_DRYING],
+                    CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
+                        CONF_PING_CLAIMANT_ON_COMPLETE
+                    ],
                 }
                 return self.async_create_entry(
                     title="Laundry Discord Bot", data=data, options=options
@@ -146,29 +136,12 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_ETA_INTERVAL,
                     default=defaults.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_ETA_INTERVAL,
-                        max=MAX_ETA_INTERVAL,
-                        step=5,
-                        unit_of_measurement="seconds",
-                        mode=selector.NumberSelectorMode.BOX,
-                    )
-                ),
-                vol.Optional(
-                    CONF_PING_ROLE_ID,
-                    default=defaults.get(CONF_PING_ROLE_ID, DEFAULT_PING_ROLE_ID),
-                ): selector.TextSelector(),
+                ): _eta_interval_selector(),
                 vol.Required(
-                    CONF_PING_ON_COMPLETE,
+                    CONF_PING_CLAIMANT_ON_COMPLETE,
                     default=defaults.get(
-                        CONF_PING_ON_COMPLETE, DEFAULT_PING_ON_COMPLETE
-                    ),
-                ): selector.BooleanSelector(),
-                vol.Required(
-                    CONF_PING_ON_DRYING,
-                    default=defaults.get(
-                        CONF_PING_ON_DRYING, DEFAULT_PING_ON_DRYING
+                        CONF_PING_CLAIMANT_ON_COMPLETE,
+                        DEFAULT_PING_CLAIMANT_ON_COMPLETE,
                     ),
                 ): selector.BooleanSelector(),
             }
@@ -185,30 +158,22 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class LaundryDiscordOptionsFlow(OptionsFlow):
-    """Handle the options flow (interval, role mention, drying ping)."""
+    """Handle the options flow (ETA interval, completion ping)."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-
         if user_input is not None:
-            role_id = str(user_input.get(CONF_PING_ROLE_ID, "")).strip()
-            if role_id and not role_id.isdigit():
-                errors[CONF_PING_ROLE_ID] = "invalid_role"
-            else:
-                return self.async_create_entry(
-                    data={
-                        CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
-                        CONF_PING_ROLE_ID: role_id,
-                        CONF_PING_ON_COMPLETE: user_input[CONF_PING_ON_COMPLETE],
-                        CONF_PING_ON_DRYING: user_input[CONF_PING_ON_DRYING],
-                    }
-                )
+            return self.async_create_entry(
+                data={
+                    CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
+                    CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
+                        CONF_PING_CLAIMANT_ON_COMPLETE
+                    ],
+                }
+            )
 
         current = {**self.config_entry.data, **self.config_entry.options}
         return self.async_show_form(
-            step_id="init",
-            data_schema=_options_schema(current),
-            errors=errors,
+            step_id="init", data_schema=_options_schema(current)
         )
