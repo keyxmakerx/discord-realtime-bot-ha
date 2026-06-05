@@ -159,15 +159,10 @@ class LaundryCoordinator:
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage == STAGE_IDLE:
             # Nothing was in progress when we last saved, but the washer may
-            # already be mid-cycle (e.g. installed or restarted during a load).
-            # A normal off->on is caught by the state listener; this catches a
-            # load that was *already* running before the bot connected.
-            running = self.hass.states.get(self.running_entity)
-            if running is not None and running.state == "on":
-                _LOGGER.debug("Catching an already-running laundry load on startup")
-                self.hass.async_create_task(
-                    self._async_start_session(catch_up=True)
-                )
+            # already be mid-cycle (installed or restarted during a load). Only
+            # acts once the running + job-state signals confirm it (and the
+            # sensor changes themselves re-check, covering the startup race).
+            self._maybe_catch_up()
         # DONE_WAITING sessions keep their button working via the persistent
         # ClaimView re-registered in on_ready; nothing else to do here.
         self._notify_entities()
@@ -205,12 +200,11 @@ class LaundryCoordinator:
     def _on_running(self, event: Event) -> None:
         """Start a session when the washer turns on.
 
-        A clean ``off -> on`` is a normal start. A transition INTO ``on`` from
-        ``unavailable``/``unknown``/``None`` means the washer "appeared" already
-        running — e.g. its cloud entity populated a few seconds after an HA
-        restart, just after the bot's one-shot startup check already ran. We
-        catch that up, but only when nothing is currently being tracked, so a
-        mid-wash cloud flap can't spawn a duplicate session.
+        A clean ``off -> on`` is a normal start (the debounced sensor is the
+        designed, timely trigger). Any other transition INTO ``on`` (from
+        ``unavailable``/``unknown``/``None`` — e.g. the cloud entity populating
+        after an HA restart) is treated as a *possible* mid-cycle load and only
+        acted on once corroborated by :meth:`_maybe_catch_up`.
         """
         new = event.data.get("new_state")
         if new is None or new.state != "on":
@@ -219,8 +213,31 @@ class LaundryCoordinator:
         old_s = old.state if old is not None else None
         if old_s == "off":
             self.hass.async_create_task(self._async_start_session())
-        elif old_s in (None, "unavailable", "unknown") and self.stage == STAGE_IDLE:
-            self.hass.async_create_task(self._async_start_session(catch_up=True))
+        else:
+            self._maybe_catch_up()
+
+    @callback
+    def _maybe_catch_up(self) -> None:
+        """Start a catch-up session only if a load is *confirmed* in progress.
+
+        Corroborates two signals so a single flaky/stale ``on`` can't create a
+        phantom session: the running sensor must read ``on`` AND the job-state
+        sensor must report a real cycle phase. Only fires when nothing is being
+        tracked. Safe to call repeatedly (from bot-ready and either sensor's
+        change) — the session lock and the idle guard prevent duplicates.
+        """
+        if self.stage != STAGE_IDLE:
+            return
+        running = self.hass.states.get(self.running_entity)
+        if running is None or running.state != "on":
+            return
+        job = self.hass.states.get(self.job_state_entity)
+        if job is None or job.state not in REAL_PHASES:
+            return
+        _LOGGER.debug(
+            "Catch-up: washer confirmed running (running=on, job=%s)", job.state
+        )
+        self.hass.async_create_task(self._async_start_session(catch_up=True))
 
     @callback
     def _on_job_state(self, event: Event) -> None:
@@ -228,8 +245,17 @@ class LaundryCoordinator:
         new = event.data.get("new_state")
         if new is None:
             return
-        old = event.data.get("old_state")
         new_s = new.state
+
+        if self.stage == STAGE_IDLE:
+            # Not tracking anything. A real cycle phase confirms a load is
+            # underway (e.g. the job-state sensor populated after the running
+            # sensor on startup) — catch it up.
+            if new_s in REAL_PHASES:
+                self._maybe_catch_up()
+            return
+
+        old = event.data.get("old_state")
         old_s = old.state if old is not None else None
 
         # Drying: only from a real phase (never from unavailable/unknown/none).
