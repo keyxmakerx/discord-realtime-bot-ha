@@ -80,6 +80,9 @@ class LaundryCoordinator:
         self.claimed_by: str = UNCLAIMED
         self.claimed_by_id: int | None = None
         self.message_id: int | None = None
+        # True when the session was picked up mid-cycle (washer already running
+        # at startup) rather than caught at its off->on start.
+        self.catch_up: bool = False
 
         self._eta_unsub = None
         self._unsubs: list = []
@@ -154,6 +157,17 @@ class LaundryCoordinator:
         if self.stage in (STAGE_WASHING, STAGE_DRYING) and self.message_id:
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
+        elif self.stage == STAGE_IDLE:
+            # Nothing was in progress when we last saved, but the washer may
+            # already be mid-cycle (e.g. installed or restarted during a load).
+            # A normal off->on is caught by the state listener; this catches a
+            # load that was *already* running before the bot connected.
+            running = self.hass.states.get(self.running_entity)
+            if running is not None and running.state == "on":
+                _LOGGER.debug("Catching an already-running laundry load on startup")
+                self.hass.async_create_task(
+                    self._async_start_session(catch_up=True)
+                )
         # DONE_WAITING sessions keep their button working via the persistent
         # ClaimView re-registered in on_ready; nothing else to do here.
         self._notify_entities()
@@ -168,6 +182,7 @@ class LaundryCoordinator:
         self.claimed_by = data.get("claimed_by", UNCLAIMED)
         self.claimed_by_id = data.get("claimed_by_id")
         self.message_id = data.get("message_id")
+        self.catch_up = data.get("catch_up", False)
 
     async def _async_save(self) -> None:
         await self._store.async_save(
@@ -177,6 +192,7 @@ class LaundryCoordinator:
                 "claimed_by": self.claimed_by,
                 "claimed_by_id": self.claimed_by_id,
                 "message_id": self.message_id,
+                "catch_up": self.catch_up,
             }
         )
 
@@ -217,7 +233,7 @@ class LaundryCoordinator:
             self.hass.async_create_task(self._async_handle_finished())
 
     # ------------------------------------------------------- lifecycle actions
-    async def _async_start_session(self) -> None:
+    async def _async_start_session(self, catch_up: bool = False) -> None:
         async with self._lock:
             # A wash already in progress wins. A previous *finished* load (still
             # showing its claim/unclaim message) is simply superseded by this one.
@@ -225,6 +241,7 @@ class LaundryCoordinator:
                 _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
                 return
             self.stage = STAGE_WASHING
+            self.catch_up = catch_up
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
@@ -422,7 +439,9 @@ class LaundryCoordinator:
 
         if self.stage == STAGE_WASHING:
             embed = discord.Embed(
-                title="🫧 Laundry started",
+                title=(
+                    "🫧 Laundry in progress" if self.catch_up else "🫧 Laundry started"
+                ),
                 description="The washer is running. Tap **Claim** to call dibs.",
                 color=_COLOR_WASHING,
             )
