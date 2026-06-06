@@ -298,30 +298,27 @@ class LaundryCoordinator:
         return st.state
 
     def _load_active(self) -> bool:
-        """Multi-sensor consensus that a load is genuinely running.
+        """Authoritative 'a load is running' check: a real job_state phase.
 
-        Requires a real job phase AND the running sensor on, and lets an
-        explicit machine_state ``stop`` veto a contradictory ``on``. This is what
-        prevents a single flaky signal from starting a phantom session.
+        This is the same clean signal the reliable legacy automations keyed off.
+        The running and machine_state sensors flap badly on this washer, so they
+        are deliberately NOT required for detection (machine_state is still used
+        for the pause display). A flap shows as 'unavailable', never as a fake
+        phase, so this stays false-positive safe.
         """
         job = self.hass.states.get(self.job_state_entity)
-        running = self.hass.states.get(self.running_entity)
-        if job is None or job.state not in REAL_PHASES:
-            return False
-        if running is None or running.state != "on":
-            return False
-        if self._machine_state() == MACHINE_STOP:
-            return False
-        return True
+        return job is not None and job.state in REAL_PHASES
 
     @callback
     def _evaluate_start(self) -> None:
-        """Start tracking once the signals agree a load is running.
+        """Start tracking when job_state shows a real phase and we're not
+        already tracking an active wash.
 
-        Called from every relevant sensor change and on bot-ready, so the start
-        can't be missed (event-driven) nor fired on a lone signal (consensus).
+        Fires from job_state (primary), and harmlessly from running/machine and
+        bot-ready. Allowed from idle *or* a finished-but-unclaimed load, so a
+        new cycle supersedes a lingering done message.
         """
-        if self.stage != STAGE_IDLE:
+        if self.stage in (STAGE_WASHING, STAGE_DRYING):
             return
         if self._load_active():
             self.hass.async_create_task(self._async_start_session())
@@ -375,9 +372,10 @@ class LaundryCoordinator:
             return
 
         if new_s in REAL_PHASES:
-            if self.stage == STAGE_IDLE:
-                # A real phase is part of the start consensus; the started
-                # session seeds _last_real_phase from current state.
+            if self.stage not in (STAGE_WASHING, STAGE_DRYING):
+                # Idle, or a previous finished-but-unclaimed load: a real phase
+                # means a (new) load is running — start it (superseding any
+                # lingering done message). The session seeds _last_real_phase.
                 self._evaluate_start()
                 return
             if (
