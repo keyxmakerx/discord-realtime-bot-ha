@@ -52,6 +52,7 @@ from .const import (
     PROGRESS_PHASES,
     UNAVAILABLE_STATES,
     JOB_STATE_DRYING,
+    JOB_STATE_FINISH,
     JOB_STATE_NONE,
     REAL_PHASES,
     SIGNAL_UPDATE,
@@ -320,7 +321,10 @@ class LaundryCoordinator:
         phase, so this stays false-positive safe.
         """
         job = self.hass.states.get(self.job_state_entity)
-        return job is not None and job.state in REAL_PHASES
+        if job is None or job.state not in REAL_PHASES:
+            return False
+        # 'finish' is the *end* of a cycle, not a start — never begin on it.
+        return job.state != JOB_STATE_FINISH
 
     @callback
     def _evaluate_start(self) -> None:
@@ -414,6 +418,15 @@ class LaundryCoordinator:
         if job in UNAVAILABLE_STATES:
             return  # not settled to a real value yet
 
+        # 'finish' is the real completion. Act on it now — do NOT wait for
+        # 'none', which can lag by hours while the drum sits idle after the
+        # cycle is actually done.
+        if job == JOB_STATE_FINISH:
+            self._last_real_phase = JOB_STATE_FINISH
+            if self.stage in (STAGE_WASHING, STAGE_DRYING):
+                self.hass.async_create_task(self._async_handle_finished())
+            return
+
         if job in REAL_PHASES:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 # Idle, or a previous finished-but-unclaimed load: a confirmed
@@ -429,6 +442,7 @@ class LaundryCoordinator:
                 self.hass.async_create_task(self._async_handle_drying())
             self._last_real_phase = job
         elif job == JOB_STATE_NONE:
+            # Backup: a cycle that dropped straight to 'none' without 'finish'.
             if (
                 self.stage in (STAGE_WASHING, STAGE_DRYING)
                 and self._last_real_phase in REAL_PHASES
