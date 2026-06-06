@@ -25,11 +25,14 @@ For a single load (a "session"):
    silent by design.
 3. **Drying** — when the job-state sensor enters `drying`, it silently edits the
    embed to "drying starting — pull out anything you don't want dried."
-4. **Finished** — when the job-state sensor returns to `none` from a real wash
-   phase, it edits the embed to "Laundry done — don't forget the lint tray." If
-   someone **claimed** it, the bot sends the one **@mention** of the load to that
-   person ("your laundry's done"). If **nobody claimed** it, the done message is
-   posted with **no ping**, and the Claim button stays.
+4. **Finished** — when the job-state sensor reaches **`finish`** (the real
+   completion), it edits the embed to "Laundry done — don't forget the lint
+   tray." It does **not** wait for `none`, which on this washer can lag by hours
+   while the drum sits idle after the cycle is actually done (`none` straight
+   from a phase is kept as a backup). If someone **claimed** it, the bot sends
+   the one **@mention** to that person ("your laundry's done"). If **nobody
+   claimed** it, the done message is posted with **no ping**, and the Claim
+   button stays.
 5. **Claim / Unclaim** — tapping **Claim** records the claimant in HA and swaps in
    an **Unclaim** button so an accidental claim can be undone. The load stops
    being claimable only when the **next load starts**.

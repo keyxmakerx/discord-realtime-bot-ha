@@ -85,6 +85,7 @@ STAGE_LABELS = {
 # --- Washer job_state vocabulary (observed on this machine) ---
 JOB_STATE_NONE = "none"
 JOB_STATE_DRYING = "drying"
+JOB_STATE_FINISH = "finish"
 # Real wash phases. A transition INTO "none" from one of these means "finished".
 REAL_PHASES = {"weight_sensing", "wash", "rinse", "spin", "drying", "finish"}
 # old_state values that indicate a flap / startup, never a real phase transition.
