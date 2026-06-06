@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_state_change_event,
     async_track_time_interval,
 )
@@ -30,6 +31,7 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_AVAILABILITY_GRACE,
+    CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
@@ -37,6 +39,7 @@ from .const import (
     CONF_RUNNING_ENTITY,
     CONF_WATER_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
+    DEFAULT_CONFIRM_DELAY,
     DEFAULT_ENERGY_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
@@ -114,6 +117,8 @@ class LaundryCoordinator:
         self._restored = False
         # Cached last-good ETA (target datetime, when last seen) for flap hold.
         self._eta_cache: tuple[datetime, float] | None = None
+        # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
+        self._job_confirm_unsub = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -145,6 +150,11 @@ class LaundryCoordinator:
     @property
     def eta_interval(self) -> int:
         return int(self._cfg.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL))
+
+    @property
+    def confirm_delay(self) -> int:
+        """Seconds a job_state value must persist before we act on it."""
+        return int(self._cfg.get(CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY))
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -227,6 +237,9 @@ class LaundryCoordinator:
             unsub()
         self._unsubs.clear()
         self._stop_eta_timer()
+        if self._job_confirm_unsub is not None:
+            self._job_confirm_unsub()
+            self._job_confirm_unsub = None
         try:
             await self.bot.async_close()
         except Exception:  # noqa: BLE001
@@ -298,44 +311,41 @@ class LaundryCoordinator:
         return st.state
 
     def _load_active(self) -> bool:
-        """Multi-sensor consensus that a load is genuinely running.
+        """Authoritative 'a load is running' check: a real job_state phase.
 
-        Requires a real job phase AND the running sensor on, and lets an
-        explicit machine_state ``stop`` veto a contradictory ``on``. This is what
-        prevents a single flaky signal from starting a phantom session.
+        This is the same clean signal the reliable legacy automations keyed off.
+        The running and machine_state sensors flap badly on this washer, so they
+        are deliberately NOT required for detection (machine_state is still used
+        for the pause display). A flap shows as 'unavailable', never as a fake
+        phase, so this stays false-positive safe.
         """
         job = self.hass.states.get(self.job_state_entity)
-        running = self.hass.states.get(self.running_entity)
-        if job is None or job.state not in REAL_PHASES:
-            return False
-        if running is None or running.state != "on":
-            return False
-        if self._machine_state() == MACHINE_STOP:
-            return False
-        return True
+        return job is not None and job.state in REAL_PHASES
 
     @callback
     def _evaluate_start(self) -> None:
-        """Start tracking once the signals agree a load is running.
+        """Start tracking when job_state shows a real phase and we're not
+        already tracking an active wash.
 
-        Called from every relevant sensor change and on bot-ready, so the start
-        can't be missed (event-driven) nor fired on a lone signal (consensus).
+        Fires from job_state (primary), and harmlessly from running/machine and
+        bot-ready. Allowed from idle *or* a finished-but-unclaimed load, so a
+        new cycle supersedes a lingering done message.
         """
-        if self.stage != STAGE_IDLE:
+        if self.stage in (STAGE_WASHING, STAGE_DRYING):
             return
         if self._load_active():
             self.hass.async_create_task(self._async_start_session())
 
     @callback
     def _on_running(self, event: Event) -> None:
-        new = event.data.get("new_state")
-        if new is None:
+        # running flaps, so it's only a backup nudge to re-check (debounced).
+        if event.data.get("new_state") is None:
             return
-        self._evaluate_start()
+        self._schedule_job_confirm()
 
     @callback
     def _on_machine_state(self, event: Event) -> None:
-        """Show/clear the paused state, and re-check the start consensus."""
+        """Show/clear the paused state (immediate); nudge a start re-check."""
         new = event.data.get("new_state")
         if new is None:
             return
@@ -347,16 +357,17 @@ class LaundryCoordinator:
             elif new_s == MACHINE_RUN and self.paused:
                 self.paused = False
                 self.hass.async_create_task(self._async_render_active("resumed"))
-        elif self.stage == STAGE_IDLE:
-            self._evaluate_start()
+        else:
+            self._schedule_job_confirm()
 
     @callback
     def _on_job_state(self, event: Event) -> None:
-        """Drive drying/finished transitions, immune to the ~51-min flap.
+        """Record flaps, then (re)arm the confirm-debounce.
 
-        Decisions key off the *last confirmed real phase* rather than the raw
-        previous state, so a flap landing on a transition (e.g. ``spin ->
-        unavailable -> none``) can't make us miss the finish.
+        We never act on a raw job_state change directly — a transient could be a
+        flap. Instead we wait for the value to *persist* (``confirm_delay``,
+        mirroring the proven automations' ``for: 30s``) and act on the settled
+        value in :meth:`_async_job_confirmed`.
         """
         new = event.data.get("new_state")
         if new is None:
@@ -369,30 +380,71 @@ class LaundryCoordinator:
         if new_s == "unavailable" and old_s not in (None, "unavailable"):
             self._record_flap()
 
-        # A flap is held: it never alters the session, and we keep the last
-        # confirmed phase so the finish below survives a blip.
+        # Ignore flap values outright (the `not_from: unavailable/unknown`).
         if new_s in UNAVAILABLE_STATES:
             return
 
-        if new_s in REAL_PHASES:
-            if self.stage == STAGE_IDLE:
-                # A real phase is part of the start consensus; the started
-                # session seeds _last_real_phase from current state.
+        self._schedule_job_confirm()
+
+    @callback
+    def _schedule_job_confirm(self) -> None:
+        """(Re)arm the confirm-debounce timer; collapses rapid changes."""
+        if self._job_confirm_unsub is not None:
+            self._job_confirm_unsub()
+        delay = self.confirm_delay
+        if delay <= 0:
+            self._async_job_confirmed()
+            return
+        self._job_confirm_unsub = async_call_later(
+            self.hass, delay, self._async_job_confirmed
+        )
+
+    @callback
+    def _async_job_confirmed(self, _now=None) -> None:
+        """Act on the *settled* job_state once it has persisted confirm_delay.
+
+        Decisions key off the last confirmed real phase, so a flap landing on a
+        transition (e.g. ``spin -> unavailable -> none``) can't miss the finish.
+        """
+        self._job_confirm_unsub = None
+        st = self.hass.states.get(self.job_state_entity)
+        if st is None:
+            return
+        job = st.state
+        if job in UNAVAILABLE_STATES:
+            return  # not settled to a real value yet
+
+        if job in REAL_PHASES:
+            if self.stage not in (STAGE_WASHING, STAGE_DRYING):
+                # Idle, or a previous finished-but-unclaimed load: a confirmed
+                # real phase means a (new) load — start it (superseding any
+                # lingering done message).
+                self._log_corroboration(job)
                 self._evaluate_start()
                 return
             if (
-                new_s == JOB_STATE_DRYING
+                job == JOB_STATE_DRYING
                 and self._last_real_phase not in (None, JOB_STATE_DRYING)
             ):
                 self.hass.async_create_task(self._async_handle_drying())
-            self._last_real_phase = new_s
-        elif new_s == JOB_STATE_NONE:
+            self._last_real_phase = job
+        elif job == JOB_STATE_NONE:
             if (
                 self.stage in (STAGE_WASHING, STAGE_DRYING)
                 and self._last_real_phase in REAL_PHASES
             ):
                 self.hass.async_create_task(self._async_handle_finished())
             self._last_real_phase = None
+
+    def _log_corroboration(self, job: str) -> None:
+        """Diagnostic: note whether the other sensors agree at start time."""
+        running = self.hass.states.get(self.running_entity)
+        _LOGGER.debug(
+            "Confirmed load (job=%s); corroboration running=%s machine=%s",
+            job,
+            running.state if running is not None else "n/a",
+            self._machine_state() or "n/a",
+        )
 
     @callback
     def _record_flap(self) -> None:

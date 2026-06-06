@@ -14,6 +14,7 @@ CONF_MACHINE_STATE_ENTITY = "machine_state_entity"
 CONF_ENERGY_ENTITY = "energy_entity"
 CONF_WATER_ENTITY = "water_entity"
 CONF_ETA_INTERVAL = "eta_interval"
+CONF_CONFIRM_DELAY = "confirm_delay"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 
@@ -37,6 +38,11 @@ DEFAULT_ETA_INTERVAL = 90
 MIN_ETA_INTERVAL = 30
 MAX_ETA_INTERVAL = 3600
 DEFAULT_PING_CLAIMANT_ON_COMPLETE = True
+# Seconds a job_state transition must persist before we act on it (mirrors the
+# `for: 30s` in the proven HA automations — confirms it isn't a transient).
+DEFAULT_CONFIRM_DELAY = 30
+MIN_CONFIRM_DELAY = 0
+MAX_CONFIRM_DELAY = 300
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5

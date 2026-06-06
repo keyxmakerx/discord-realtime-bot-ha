@@ -21,6 +21,7 @@ from .const import (
     CONF_ETA_ENTITY,
     CONF_ETA_INTERVAL,
     CONF_AVAILABILITY_GRACE,
+    CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
@@ -28,6 +29,7 @@ from .const import (
     CONF_RUNNING_ENTITY,
     CONF_WATER_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
+    DEFAULT_CONFIRM_DELAY,
     DEFAULT_ETA_ENTITY,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_JOB_STATE_ENTITY,
@@ -36,8 +38,10 @@ from .const import (
     DEFAULT_RUNNING_ENTITY,
     DOMAIN,
     MAX_AVAILABILITY_GRACE,
+    MAX_CONFIRM_DELAY,
     MAX_ETA_INTERVAL,
     MIN_AVAILABILITY_GRACE,
+    MIN_CONFIRM_DELAY,
     MIN_ETA_INTERVAL,
 )
 
@@ -62,6 +66,18 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_ETA_INTERVAL,
                 default=defaults.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL),
             ): _eta_interval_selector(),
+            vol.Required(
+                CONF_CONFIRM_DELAY,
+                default=defaults.get(CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_CONFIRM_DELAY,
+                    max=MAX_CONFIRM_DELAY,
+                    step=5,
+                    unit_of_measurement="seconds",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
             vol.Required(
                 CONF_PING_CLAIMANT_ON_COMPLETE,
                 default=defaults.get(
@@ -209,6 +225,7 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
             return self.async_create_entry(
                 data={
                     CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
+                    CONF_CONFIRM_DELAY: int(user_input[CONF_CONFIRM_DELAY]),
                     CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
                         CONF_PING_CLAIMANT_ON_COMPLETE
                     ],

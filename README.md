@@ -37,11 +37,17 @@ For a single load (a "session"):
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
-> **Start consensus (no false positives):** a load only counts as "running" when
-> the signals *agree* — `job_state` shows a real cycle phase **and**
-> `washer_running` is `on` **and** `machine_state` isn't `stop`. It's evaluated
-> on every relevant sensor change, so it can't fire on a lone flaky signal nor
-> miss a real load. Pausing mid-cycle shows **"⏸ Paused"** and never ends the load.
+> **Detection keys off `job_state`** — the washer's clean, authoritative signal
+> (the same one reliable HA automations use). A real cycle phase = a real load.
+> The `running`/`machine_state` sensors flap on this washer, so they're **not**
+> required to detect a load (they'd cause missed starts); `machine_state` is used
+> only for the **"⏸ Paused"** display. Flaps show as `unavailable` and are
+> ignored, so detection is both reliable and false-positive safe. A new cycle
+> supersedes a finished-but-unclaimed message.
+>
+> **Confirm debounce:** a job_state change must *persist* for a configurable
+> `confirm_delay` (default **30s**) before the bot acts — mirroring the proven
+> automations' `for: 30s`, so a transient can't trigger start/drying/finish.
 
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),
