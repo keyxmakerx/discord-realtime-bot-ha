@@ -44,6 +44,10 @@ are ignored while a wash is already running.
 > only for the **"⏸ Paused"** display. Flaps show as `unavailable` and are
 > ignored, so detection is both reliable and false-positive safe. A new cycle
 > supersedes a finished-but-unclaimed message.
+>
+> **Confirm debounce:** a job_state change must *persist* for a configurable
+> `confirm_delay` (default **30s**) before the bot acts — mirroring the proven
+> automations' `for: 30s`, so a transient can't trigger start/drying/finish.
 
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),
