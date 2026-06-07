@@ -15,6 +15,7 @@ CONF_ENERGY_ENTITY = "energy_entity"
 CONF_WATER_ENTITY = "water_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_CONFIRM_DELAY = "confirm_delay"
+CONF_SELFCLEAN_DELAY = "selfclean_delay"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 
@@ -43,6 +44,11 @@ DEFAULT_PING_CLAIMANT_ON_COMPLETE = True
 DEFAULT_CONFIRM_DELAY = 30
 MIN_CONFIRM_DELAY = 0
 MAX_CONFIRM_DELAY = 300
+# Seconds the washer must be running with job_state stuck at 'none' before we
+# treat it as a self-clean (longer than a normal load's run->weight_sensing gap).
+DEFAULT_SELFCLEAN_DELAY = 180
+MIN_SELFCLEAN_DELAY = 60
+MAX_SELFCLEAN_DELAY = 900
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5
@@ -74,12 +80,14 @@ STAGE_IDLE = "idle"
 STAGE_WASHING = "washing"
 STAGE_DRYING = "drying"
 STAGE_DONE_WAITING = "done_waiting"
+STAGE_SELF_CLEAN = "self_clean"
 
 STAGE_LABELS = {
     STAGE_IDLE: "Idle",
     STAGE_WASHING: "Washing",
     STAGE_DRYING: "Drying",
     STAGE_DONE_WAITING: "Done — waiting",
+    STAGE_SELF_CLEAN: "Self-clean",
 }
 
 # --- Washer job_state vocabulary (observed on this machine) ---
