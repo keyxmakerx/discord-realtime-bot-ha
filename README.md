@@ -52,6 +52,12 @@ are ignored while a wash is already running.
 > `confirm_delay` (default **30s**) before the bot acts — mirroring the proven
 > automations' `for: 30s`, so a transient can't trigger start/drying/finish.
 
+> **Self-clean cycles:** a drum self-clean runs *without* reporting any
+> `job_state` phase (it stays `none` while `machine_state` is `run`). The bot
+> detects that (running with no wash phase for a few minutes) and posts a
+> separate **"🧼 Self-clean running / finished"** message with the ETA and
+> energy/water used — **no claim button and no ping**.
+
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),
 > it picks the load up right away and posts a "Laundry in progress" message,

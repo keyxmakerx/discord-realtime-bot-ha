@@ -15,6 +15,7 @@
           "water_entity": "Water-usage sensor (optional — shows usage on the done message)",
           "eta_interval": "ETA update interval",
           "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
+          "selfclean_delay": "Self-clean detect delay — running with no wash phase for this long = self-clean (seconds)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)"
         }
@@ -34,6 +35,7 @@
         "data": {
           "eta_interval": "ETA update interval",
           "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
+          "selfclean_delay": "Self-clean detect delay — running with no wash phase for this long = self-clean (seconds)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)"
         }

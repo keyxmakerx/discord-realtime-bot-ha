@@ -37,6 +37,7 @@ from .const import (
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_RUNNING_ENTITY,
+    CONF_SELFCLEAN_DELAY,
     CONF_WATER_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_CONFIRM_DELAY,
@@ -44,6 +45,7 @@ from .const import (
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
+    DEFAULT_SELFCLEAN_DELAY,
     DEFAULT_WATER_ENTITY,
     MACHINE_PAUSE,
     MACHINE_RUN,
@@ -59,6 +61,7 @@ from .const import (
     STAGE_DONE_WAITING,
     STAGE_DRYING,
     STAGE_IDLE,
+    STAGE_SELF_CLEAN,
     STAGE_WASHING,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -74,6 +77,7 @@ _COLOR_DRYING = 0xE67E22
 _COLOR_DONE = 0x2ECC71
 _COLOR_CLAIMED = 0x95A5A6
 _COLOR_TEST = 0x9B59B6
+_COLOR_SELFCLEAN = 0x1ABC9C
 
 _FOOTER = "ETA is the washer's own estimate and may drift — treat it as approximate."
 
@@ -120,6 +124,8 @@ class LaundryCoordinator:
         self._eta_cache: tuple[datetime, float] | None = None
         # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
         self._job_confirm_unsub = None
+        # Pending self-clean detect/end timer (running + job_state stuck none).
+        self._selfclean_unsub = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -156,6 +162,11 @@ class LaundryCoordinator:
     def confirm_delay(self) -> int:
         """Seconds a job_state value must persist before we act on it."""
         return int(self._cfg.get(CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY))
+
+    @property
+    def selfclean_delay(self) -> int:
+        """Seconds 'running + job_state none' must persist to mean self-clean."""
+        return int(self._cfg.get(CONF_SELFCLEAN_DELAY, DEFAULT_SELFCLEAN_DELAY))
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -241,6 +252,9 @@ class LaundryCoordinator:
         if self._job_confirm_unsub is not None:
             self._job_confirm_unsub()
             self._job_confirm_unsub = None
+        if self._selfclean_unsub is not None:
+            self._selfclean_unsub()
+            self._selfclean_unsub = None
         try:
             await self.bot.async_close()
         except Exception:  # noqa: BLE001
@@ -251,7 +265,10 @@ class LaundryCoordinator:
         if self._restored:
             return
         self._restored = True
-        if self.stage in (STAGE_WASHING, STAGE_DRYING) and self.message_id:
+        if (
+            self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN)
+            and self.message_id
+        ):
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage == STAGE_IDLE:
@@ -259,6 +276,7 @@ class LaundryCoordinator:
             # already be mid-cycle (installed or restarted during a load). The
             # consensus check (and later sensor changes) confirm it.
             self._evaluate_start()
+            self._maybe_schedule_selfclean()
         # DONE_WAITING sessions keep their button working via the persistent
         # ClaimView re-registered in on_ready; nothing else to do here.
         self._notify_entities()
@@ -335,21 +353,27 @@ class LaundryCoordinator:
         bot-ready. Allowed from idle *or* a finished-but-unclaimed load, so a
         new cycle supersedes a lingering done message.
         """
-        if self.stage in (STAGE_WASHING, STAGE_DRYING):
+        if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             return
         if self._load_active():
             self.hass.async_create_task(self._async_start_session())
 
     @callback
     def _on_running(self, event: Event) -> None:
-        # running flaps, so it's only a backup nudge to re-check (debounced).
-        if event.data.get("new_state") is None:
+        new = event.data.get("new_state")
+        if new is None:
+            return
+        if self.stage == STAGE_SELF_CLEAN:
+            # Self-clean ends when the washer stops running.
+            if new.state == "off":
+                self._schedule_selfclean_end()
             return
         self._schedule_job_confirm()
+        self._maybe_schedule_selfclean()
 
     @callback
     def _on_machine_state(self, event: Event) -> None:
-        """Show/clear the paused state (immediate); nudge a start re-check."""
+        """Pause display (active load), self-clean lifecycle, start re-check."""
         new = event.data.get("new_state")
         if new is None:
             return
@@ -361,8 +385,12 @@ class LaundryCoordinator:
             elif new_s == MACHINE_RUN and self.paused:
                 self.paused = False
                 self.hass.async_create_task(self._async_render_active("resumed"))
+        elif self.stage == STAGE_SELF_CLEAN:
+            if new_s == MACHINE_STOP:
+                self._schedule_selfclean_end()
         else:
             self._schedule_job_confirm()
+            self._maybe_schedule_selfclean()
 
     @callback
     def _on_job_state(self, event: Event) -> None:
@@ -459,6 +487,53 @@ class LaundryCoordinator:
             running.state if running is not None else "n/a",
             self._machine_state() or "n/a",
         )
+
+    # ---------------------------------------------------------- self-clean
+    def _looks_like_selfclean(self) -> bool:
+        """Washer is running but job_state never left 'none' (a self-clean)."""
+        job = self.hass.states.get(self.job_state_entity)
+        if job is None or job.state != JOB_STATE_NONE:
+            return False
+        running = self.hass.states.get(self.running_entity)
+        running_on = running is not None and running.state == "on"
+        return running_on or self._machine_state() == MACHINE_RUN
+
+    @callback
+    def _maybe_schedule_selfclean(self) -> None:
+        """Arm a one-shot self-clean check while idle (no reschedule churn)."""
+        if self.stage != STAGE_IDLE or self._selfclean_unsub is not None:
+            return
+        if self._looks_like_selfclean():
+            self._selfclean_unsub = async_call_later(
+                self.hass, self.selfclean_delay, self._async_selfclean_confirm
+            )
+
+    @callback
+    def _async_selfclean_confirm(self, _now=None) -> None:
+        self._selfclean_unsub = None
+        # Only a self-clean if still idle (a normal load would have started a
+        # session via the job path) and still running with job stuck at 'none'.
+        if self.stage == STAGE_IDLE and self._looks_like_selfclean():
+            self.hass.async_create_task(self._async_start_selfclean())
+
+    @callback
+    def _schedule_selfclean_end(self) -> None:
+        if self._selfclean_unsub is not None:
+            self._selfclean_unsub()
+        self._selfclean_unsub = async_call_later(
+            self.hass, self.confirm_delay, self._async_selfclean_end_confirm
+        )
+
+    @callback
+    def _async_selfclean_end_confirm(self, _now=None) -> None:
+        self._selfclean_unsub = None
+        if self.stage != STAGE_SELF_CLEAN:
+            return
+        # Confirm it really stopped (not a flap): not running and not 'run'.
+        running = self.hass.states.get(self.running_entity)
+        running_on = running is not None and running.state == "on"
+        if not running_on and self._machine_state() != MACHINE_RUN:
+            self.hass.async_create_task(self._async_finish_selfclean())
 
     @callback
     def _record_flap(self) -> None:
@@ -588,6 +663,51 @@ class LaundryCoordinator:
             await self._async_save()
             self._notify_entities()
 
+    async def _async_start_selfclean(self) -> None:
+        async with self._lock:
+            if self.stage != STAGE_IDLE:
+                return
+            self.stage = STAGE_SELF_CLEAN
+            self.paused = False
+            self.waiting = False
+            self.claimed_by = UNCLAIMED
+            self.claimed_by_id = None
+            self.message_id = None
+            self._last_real_phase = None
+            self._energy_start = self._entity_float(self.energy_entity)
+            self._water_start = self._entity_float(self.water_entity)
+            # Visible, but never a claim button and never a ping.
+            try:
+                self.message_id = await self.bot.async_post(
+                    self._selfclean_embed(done=False),
+                    view=None,
+                    content=None,
+                    silent=False,
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to post self-clean start message")
+                self.stage = STAGE_IDLE
+                return
+            self._start_eta_timer()
+            await self._async_save()
+            self._notify_entities()
+
+    async def _async_finish_selfclean(self) -> None:
+        async with self._lock:
+            if self.stage != STAGE_SELF_CLEAN:
+                return
+            self._stop_eta_timer()
+            embed = self._selfclean_embed(done=True)
+            try:
+                if self.message_id:
+                    await self.bot.async_edit(self.message_id, embed, view=None)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to update self-clean finished state")
+            self.stage = STAGE_IDLE
+            self.message_id = None
+            await self._async_save()
+            self._notify_entities()
+
     # Stages in which a claim/unclaim tap is meaningful (an active load exists).
     _CLAIMABLE_STAGES = (STAGE_WASHING, STAGE_DRYING, STAGE_DONE_WAITING)
 
@@ -648,12 +768,42 @@ class LaundryCoordinator:
             self._eta_unsub = None
 
     async def _async_eta_tick(self, now) -> None:
-        if self.stage not in (STAGE_WASHING, STAGE_DRYING) or not self.message_id:
+        if not self.message_id:
+            return
+        if self.stage in (STAGE_WASHING, STAGE_DRYING):
+            embed = self.build_embed()
+        elif self.stage == STAGE_SELF_CLEAN:
+            embed = self._selfclean_embed(done=False)
+        else:
             return
         try:
-            await self.bot.async_edit(self.message_id, self.build_embed())
+            await self.bot.async_edit(self.message_id, embed)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("ETA edit failed")
+
+    def _selfclean_embed(self, *, done: bool) -> discord.Embed:
+        """Embed for a self-clean cycle — no claim button, no ping."""
+        if done:
+            embed = discord.Embed(
+                title="🧼 Self-clean finished",
+                description="The drum is clean.",
+                color=_COLOR_DONE,
+            )
+            usage = self._usage_text()
+            if usage:
+                embed.add_field(name="This cycle used", value=usage, inline=False)
+        else:
+            embed = discord.Embed(
+                title="🧼 Self-clean running",
+                description="The washer is running a self-clean (drum clean).",
+                color=_COLOR_SELFCLEAN,
+            )
+            embed.add_field(
+                name="Estimated finish", value=self._eta_text(), inline=False
+            )
+        embed.set_footer(text=_FOOTER)
+        embed.timestamp = dt_util.utcnow()
+        return embed
 
     # ------------------------------------------------------------------ embeds
     def _current_eta(self) -> datetime | None:
