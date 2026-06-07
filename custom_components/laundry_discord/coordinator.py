@@ -271,14 +271,15 @@ class LaundryCoordinator:
         ):
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
-        elif self.stage == STAGE_IDLE:
-            # Nothing was in progress when we last saved, but the washer may
-            # already be mid-cycle (installed or restarted during a load). The
-            # consensus check (and later sensor changes) confirm it.
+        elif self.stage in (STAGE_IDLE, STAGE_DONE_WAITING):
+            # Not tracking an active wash, but the washer may already be
+            # mid-cycle (installed/restarted during a load or a self-clean). A
+            # new normal load supersedes a done message via the job path; a
+            # self-clean is checked here since it has no job phase.
             self._evaluate_start()
             self._maybe_schedule_selfclean()
-        # DONE_WAITING sessions keep their button working via the persistent
-        # ClaimView re-registered in on_ready; nothing else to do here.
+        # DONE_WAITING also keeps its claim/unclaim button working via the
+        # persistent ClaimView re-registered in on_ready.
         self._notify_entities()
 
     # ------------------------------------------------------------- persistence
@@ -500,8 +501,16 @@ class LaundryCoordinator:
 
     @callback
     def _maybe_schedule_selfclean(self) -> None:
-        """Arm a one-shot self-clean check while idle (no reschedule churn)."""
-        if self.stage != STAGE_IDLE or self._selfclean_unsub is not None:
+        """Arm a one-shot self-clean check (no reschedule churn).
+
+        Allowed from idle *or* a finished-but-claimed/unclaimed load, so a
+        self-clean started after a previous load still gets detected (it has no
+        job_state phase to supersede the done message the normal way).
+        """
+        if (
+            self.stage not in (STAGE_IDLE, STAGE_DONE_WAITING)
+            or self._selfclean_unsub is not None
+        ):
             return
         if self._looks_like_selfclean():
             self._selfclean_unsub = async_call_later(
@@ -511,9 +520,10 @@ class LaundryCoordinator:
     @callback
     def _async_selfclean_confirm(self, _now=None) -> None:
         self._selfclean_unsub = None
-        # Only a self-clean if still idle (a normal load would have started a
-        # session via the job path) and still running with job stuck at 'none'.
-        if self.stage == STAGE_IDLE and self._looks_like_selfclean():
+        # Only a self-clean if no active wash is being tracked (a normal load
+        # would have started a session via the job path) and still running with
+        # job stuck at 'none'.
+        if self.stage in (STAGE_IDLE, STAGE_DONE_WAITING) and self._looks_like_selfclean():
             self.hass.async_create_task(self._async_start_selfclean())
 
     @callback
@@ -665,7 +675,7 @@ class LaundryCoordinator:
 
     async def _async_start_selfclean(self) -> None:
         async with self._lock:
-            if self.stage != STAGE_IDLE:
+            if self.stage not in (STAGE_IDLE, STAGE_DONE_WAITING):
                 return
             self.stage = STAGE_SELF_CLEAN
             self.paused = False
