@@ -58,7 +58,6 @@ from .const import (
     JOB_STATE_DRYING,
     JOB_STATE_FINISH,
     JOB_STATE_NONE,
-    JOB_STATE_WEIGHT_SENSING,
     REAL_PHASES,
     SIGNAL_UPDATE,
     STAGE_DONE_WAITING,
@@ -118,6 +117,10 @@ class LaundryCoordinator:
         # Energy-idle completion: last seen kWh and when it last increased.
         self._idle_energy_value: float | None = None
         self._idle_energy_ts: float | None = None
+        # Energy reading when the last cycle completed. A new session may only
+        # (re)start once energy has moved past this — so a frozen leftover phase
+        # (energy still flat at this level) can't spawn a duplicate session.
+        self._completion_energy: float | None = None
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
         self._flap_times: list[float] = []
@@ -310,6 +313,7 @@ class LaundryCoordinator:
         self._water_start = data.get("water_start")
         self._idle_energy_value = data.get("idle_energy_value")
         self._idle_energy_ts = data.get("idle_energy_ts")
+        self._completion_energy = data.get("completion_energy")
         self._flap_times = list(data.get("flap_times", []))
 
     async def _async_save(self) -> None:
@@ -327,6 +331,7 @@ class LaundryCoordinator:
                 "water_start": self._water_start,
                 "idle_energy_value": self._idle_energy_value,
                 "idle_energy_ts": self._idle_energy_ts,
+                "completion_energy": self._completion_energy,
                 "flap_times": self._flap_times,
             }
         )
@@ -358,7 +363,18 @@ class LaundryCoordinator:
         if job is None or job.state not in REAL_PHASES:
             return False
         # 'finish' is the *end* of a cycle, not a start — never begin on it.
-        return job.state != JOB_STATE_FINISH
+        if job.state == JOB_STATE_FINISH:
+            return False
+        # Don't (re)start on a frozen leftover phase: if the energy meter hasn't
+        # moved since the last completion, no real load is running.
+        energy = self._entity_float(self.energy_entity)
+        if (
+            energy is not None
+            and self._completion_energy is not None
+            and abs(energy - self._completion_energy) < 1e-6
+        ):
+            return False
+        return True
 
     @callback
     def _evaluate_start(self) -> None:
@@ -471,20 +487,6 @@ class LaundryCoordinator:
                 self.hass.async_create_task(self._async_handle_finished())
             return
 
-        # A new cycle always begins at weight_sensing. If we're still 'in' a
-        # previous session (its end may never have been reported — this washer's
-        # job_state/machine_state can freeze for hours), that session is over:
-        # abandon it and start fresh on the new load.
-        if job == JOB_STATE_WEIGHT_SENSING and self.stage in (
-            STAGE_WASHING,
-            STAGE_DRYING,
-            STAGE_SELF_CLEAN,
-        ):
-            _LOGGER.debug("New cycle (weight_sensing) supersedes stale %s", self.stage)
-            self.stage = STAGE_IDLE
-            self._evaluate_start()
-            return
-
         if job in REAL_PHASES:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 # Idle, or a previous finished-but-unclaimed load: a confirmed
@@ -526,7 +528,17 @@ class LaundryCoordinator:
             return False
         running = self.hass.states.get(self.running_entity)
         running_on = running is not None and running.state == "on"
-        return running_on or self._machine_state() == MACHINE_RUN
+        if not (running_on or self._machine_state() == MACHINE_RUN):
+            return False
+        # Don't re-detect a self-clean on a frozen 'run' with no fresh energy use.
+        energy = self._entity_float(self.energy_entity)
+        if (
+            energy is not None
+            and self._completion_energy is not None
+            and abs(energy - self._completion_energy) < 1e-6
+        ):
+            return False
+        return True
 
     @callback
     def _maybe_schedule_selfclean(self) -> None:
@@ -684,6 +696,7 @@ class LaundryCoordinator:
             self._stop_eta_timer()
             self.stage = STAGE_DONE_WAITING
             self.paused = False
+            self._completion_energy = self._entity_float(self.energy_entity)
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
@@ -739,6 +752,7 @@ class LaundryCoordinator:
             if self.stage != STAGE_SELF_CLEAN:
                 return
             self._stop_eta_timer()
+            self._completion_energy = self._entity_float(self.energy_entity)
             embed = self._selfclean_embed(done=True)
             try:
                 if self.message_id:
