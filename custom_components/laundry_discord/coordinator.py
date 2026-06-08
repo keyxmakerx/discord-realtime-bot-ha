@@ -33,6 +33,7 @@ from .const import (
     CONF_AVAILABILITY_GRACE,
     CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
+    CONF_ENERGY_IDLE,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_CONFIRM_DELAY,
     DEFAULT_ENERGY_ENTITY,
+    DEFAULT_ENERGY_IDLE,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
@@ -56,6 +58,7 @@ from .const import (
     JOB_STATE_DRYING,
     JOB_STATE_FINISH,
     JOB_STATE_NONE,
+    JOB_STATE_WEIGHT_SENSING,
     REAL_PHASES,
     SIGNAL_UPDATE,
     STAGE_DONE_WAITING,
@@ -112,6 +115,9 @@ class LaundryCoordinator:
         # measurable, e.g. a mid-cycle catch-up where there's no true baseline).
         self._energy_start: float | None = None
         self._water_start: float | None = None
+        # Energy-idle completion: last seen kWh and when it last increased.
+        self._idle_energy_value: float | None = None
+        self._idle_energy_ts: float | None = None
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
         self._flap_times: list[float] = []
@@ -167,6 +173,11 @@ class LaundryCoordinator:
     def selfclean_delay(self) -> int:
         """Seconds 'running + job_state none' must persist to mean self-clean."""
         return int(self._cfg.get(CONF_SELFCLEAN_DELAY, DEFAULT_SELFCLEAN_DELAY))
+
+    @property
+    def energy_idle_timeout(self) -> int:
+        """Seconds the energy meter may be flat before a cycle counts as done."""
+        return int(self._cfg.get(CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE)) * 60
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -271,14 +282,15 @@ class LaundryCoordinator:
         ):
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
-        elif self.stage == STAGE_IDLE:
-            # Nothing was in progress when we last saved, but the washer may
-            # already be mid-cycle (installed or restarted during a load). The
-            # consensus check (and later sensor changes) confirm it.
+        elif self.stage in (STAGE_IDLE, STAGE_DONE_WAITING):
+            # Not tracking an active wash, but the washer may already be
+            # mid-cycle (installed/restarted during a load or a self-clean). A
+            # new normal load supersedes a done message via the job path; a
+            # self-clean is checked here since it has no job phase.
             self._evaluate_start()
             self._maybe_schedule_selfclean()
-        # DONE_WAITING sessions keep their button working via the persistent
-        # ClaimView re-registered in on_ready; nothing else to do here.
+        # DONE_WAITING also keeps its claim/unclaim button working via the
+        # persistent ClaimView re-registered in on_ready.
         self._notify_entities()
 
     # ------------------------------------------------------------- persistence
@@ -296,6 +308,8 @@ class LaundryCoordinator:
         self._last_real_phase = data.get("last_real_phase")
         self._energy_start = data.get("energy_start")
         self._water_start = data.get("water_start")
+        self._idle_energy_value = data.get("idle_energy_value")
+        self._idle_energy_ts = data.get("idle_energy_ts")
         self._flap_times = list(data.get("flap_times", []))
 
     async def _async_save(self) -> None:
@@ -311,6 +325,8 @@ class LaundryCoordinator:
                 "last_real_phase": self._last_real_phase,
                 "energy_start": self._energy_start,
                 "water_start": self._water_start,
+                "idle_energy_value": self._idle_energy_value,
+                "idle_energy_ts": self._idle_energy_ts,
                 "flap_times": self._flap_times,
             }
         )
@@ -455,6 +471,20 @@ class LaundryCoordinator:
                 self.hass.async_create_task(self._async_handle_finished())
             return
 
+        # A new cycle always begins at weight_sensing. If we're still 'in' a
+        # previous session (its end may never have been reported — this washer's
+        # job_state/machine_state can freeze for hours), that session is over:
+        # abandon it and start fresh on the new load.
+        if job == JOB_STATE_WEIGHT_SENSING and self.stage in (
+            STAGE_WASHING,
+            STAGE_DRYING,
+            STAGE_SELF_CLEAN,
+        ):
+            _LOGGER.debug("New cycle (weight_sensing) supersedes stale %s", self.stage)
+            self.stage = STAGE_IDLE
+            self._evaluate_start()
+            return
+
         if job in REAL_PHASES:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 # Idle, or a previous finished-but-unclaimed load: a confirmed
@@ -500,8 +530,16 @@ class LaundryCoordinator:
 
     @callback
     def _maybe_schedule_selfclean(self) -> None:
-        """Arm a one-shot self-clean check while idle (no reschedule churn)."""
-        if self.stage != STAGE_IDLE or self._selfclean_unsub is not None:
+        """Arm a one-shot self-clean check (no reschedule churn).
+
+        Allowed from idle *or* a finished-but-claimed/unclaimed load, so a
+        self-clean started after a previous load still gets detected (it has no
+        job_state phase to supersede the done message the normal way).
+        """
+        if (
+            self.stage not in (STAGE_IDLE, STAGE_DONE_WAITING)
+            or self._selfclean_unsub is not None
+        ):
             return
         if self._looks_like_selfclean():
             self._selfclean_unsub = async_call_later(
@@ -511,9 +549,10 @@ class LaundryCoordinator:
     @callback
     def _async_selfclean_confirm(self, _now=None) -> None:
         self._selfclean_unsub = None
-        # Only a self-clean if still idle (a normal load would have started a
-        # session via the job path) and still running with job stuck at 'none'.
-        if self.stage == STAGE_IDLE and self._looks_like_selfclean():
+        # Only a self-clean if no active wash is being tracked (a normal load
+        # would have started a session via the job path) and still running with
+        # job stuck at 'none'.
+        if self.stage in (STAGE_IDLE, STAGE_DONE_WAITING) and self._looks_like_selfclean():
             self.hass.async_create_task(self._async_start_selfclean())
 
     @callback
@@ -580,7 +619,6 @@ class LaundryCoordinator:
             if self.stage in (STAGE_WASHING, STAGE_DRYING):
                 _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
                 return
-            self.stage = STAGE_WASHING
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
@@ -591,8 +629,11 @@ class LaundryCoordinator:
             job = self.hass.states.get(self.job_state_entity)
             phase = job.state if job is not None else None
             self._last_real_phase = phase if phase in REAL_PHASES else None
+            # Start directly in the Drying stage if caught already drying.
+            self.stage = STAGE_DRYING if phase == JOB_STATE_DRYING else STAGE_WASHING
             # Already well into the cycle => a mid-cycle pickup ("in progress").
             self.catch_up = phase in MIDCYCLE_PHASES
+            self._reset_energy_idle()
             # Capture meter baselines for the usage stat — only meaningful for a
             # load we see from the start (a catch-up has no true baseline).
             if self.catch_up:
@@ -665,7 +706,7 @@ class LaundryCoordinator:
 
     async def _async_start_selfclean(self) -> None:
         async with self._lock:
-            if self.stage != STAGE_IDLE:
+            if self.stage not in (STAGE_IDLE, STAGE_DONE_WAITING):
                 return
             self.stage = STAGE_SELF_CLEAN
             self.paused = False
@@ -676,6 +717,7 @@ class LaundryCoordinator:
             self._last_real_phase = None
             self._energy_start = self._entity_float(self.energy_entity)
             self._water_start = self._entity_float(self.water_entity)
+            self._reset_energy_idle()
             # Visible, but never a claim button and never a ping.
             try:
                 self.message_id = await self.bot.async_post(
@@ -768,6 +810,16 @@ class LaundryCoordinator:
             self._eta_unsub = None
 
     async def _async_eta_tick(self, now) -> None:
+        # Energy-idle completion: a cycle whose kWh has gone flat is done, even
+        # if job_state/machine_state are frozen on this washer.
+        if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
+            if self._energy_idle_done():
+                _LOGGER.debug("Energy flat past timeout — completing %s", self.stage)
+                if self.stage == STAGE_SELF_CLEAN:
+                    await self._async_finish_selfclean()
+                else:
+                    await self._async_handle_finished()
+                return
         if not self.message_id:
             return
         if self.stage in (STAGE_WASHING, STAGE_DRYING):
@@ -780,6 +832,25 @@ class LaundryCoordinator:
             await self.bot.async_edit(self.message_id, embed)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("ETA edit failed")
+
+    def _reset_energy_idle(self) -> None:
+        self._idle_energy_value = self._entity_float(self.energy_entity)
+        self._idle_energy_ts = dt_util.utcnow().timestamp()
+
+    def _energy_idle_done(self) -> bool:
+        """True once the energy meter has been flat past the idle timeout."""
+        energy = self._entity_float(self.energy_entity)
+        if energy is None:
+            return False
+        now = dt_util.utcnow().timestamp()
+        if self._idle_energy_value is None or energy > self._idle_energy_value + 1e-6:
+            self._idle_energy_value = energy
+            self._idle_energy_ts = now
+            return False
+        if self._idle_energy_ts is None:
+            self._idle_energy_ts = now
+            return False
+        return (now - self._idle_energy_ts) >= self.energy_idle_timeout
 
     def _selfclean_embed(self, *, done: bool) -> discord.Embed:
         """Embed for a self-clean cycle — no claim button, no ping."""

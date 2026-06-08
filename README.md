@@ -51,6 +51,13 @@ are ignored while a wash is already running.
 > **Confirm debounce:** a job_state change must *persist* for a configurable
 > `confirm_delay` (default **30s**) before the bot acts — mirroring the proven
 > automations' `for: 30s`, so a transient can't trigger start/drying/finish.
+>
+> **Energy-idle completion (reliability backstop):** some washers' `job_state`
+> and `machine_state` *freeze* on the last running value for hours when the cloud
+> goes stale, so they can't be trusted to report "done." The bot also watches the
+> **energy meter** — if a tracked cycle's kWh stays flat for `energy_idle` minutes
+> (default **60**), it's done regardless of the frozen state sensors. A new cycle
+> (`weight_sensing`) also supersedes a stuck session.
 
 > **Self-clean cycles:** a drum self-clean runs *without* reporting any
 > `job_state` phase (it stays `none` while `machine_state` is `run`). The bot

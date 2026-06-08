@@ -16,6 +16,7 @@ CONF_WATER_ENTITY = "water_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_CONFIRM_DELAY = "confirm_delay"
 CONF_SELFCLEAN_DELAY = "selfclean_delay"
+CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 
@@ -49,6 +50,12 @@ MAX_CONFIRM_DELAY = 300
 DEFAULT_SELFCLEAN_DELAY = 180
 MIN_SELFCLEAN_DELAY = 60
 MAX_SELFCLEAN_DELAY = 900
+# Minutes the energy meter must be FLAT (no kWh increase) before a tracked cycle
+# is considered done — the reliable completion signal when this washer's
+# job_state/machine_state freeze. Must exceed the active low-power update gap.
+DEFAULT_ENERGY_IDLE = 60
+MIN_ENERGY_IDLE = 10
+MAX_ENERGY_IDLE = 240
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5
@@ -94,6 +101,7 @@ STAGE_LABELS = {
 JOB_STATE_NONE = "none"
 JOB_STATE_DRYING = "drying"
 JOB_STATE_FINISH = "finish"
+JOB_STATE_WEIGHT_SENSING = "weight_sensing"
 # Real wash phases. A transition INTO "none" from one of these means "finished".
 REAL_PHASES = {"weight_sensing", "wash", "rinse", "spin", "drying", "finish"}
 # old_state values that indicate a flap / startup, never a real phase transition.
