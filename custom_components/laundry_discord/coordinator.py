@@ -705,13 +705,18 @@ class LaundryCoordinator:
             try:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed, view=view)
-                # The one push per load: @mention the claimant, if there is one.
-                # If nobody claimed, the done message above is plain — no ping.
                 if claimed and self.ping_claimant_on_complete:
+                    # The one push per load: @mention the claimant.
                     await self.bot.async_send_ping(
                         f"<@{self.claimed_by_id}> 🧺 Your laundry's done — "
                         "don't forget the lint tray!"
                     )
+                elif not claimed:
+                    # Nobody claimed it: no @ping, but still post a fresh,
+                    # push-silent 'done' message so the finished load is visible
+                    # at the bottom of the channel, not just a buried in-place
+                    # edit of the original card.
+                    await self.bot.async_announce_done(embed)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
             await self._async_save()
