@@ -19,6 +19,7 @@ CONF_SELFCLEAN_DELAY = "selfclean_delay"
 CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
+CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -61,6 +62,14 @@ MAX_ENERGY_IDLE = 240
 DEFAULT_AVAILABILITY_GRACE = 5
 MIN_AVAILABILITY_GRACE = 1
 MAX_AVAILABILITY_GRACE = 120
+# kWh the energy meter must rise in a SINGLE sample (while job_state is dark) to
+# count as a load that ran entirely while the washer's cloud was offline — its
+# telemetry arrives as one batch step when the cloud reconnects. Set above any
+# standby / wrinkle-prevent creep step and below a real load's total, so neither
+# slow creep nor a meter reset can false-trigger it.
+DEFAULT_ENERGY_LOAD_JUMP = 0.3
+MIN_ENERGY_LOAD_JUMP = 0.1
+MAX_ENERGY_LOAD_JUMP = 5.0
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}

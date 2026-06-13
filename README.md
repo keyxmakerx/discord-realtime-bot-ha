@@ -59,6 +59,18 @@ are ignored while a wash is already running.
 > (default **60**), it's done regardless of the frozen state sensors. A new cycle
 > (`weight_sensing`) also supersedes a stuck session.
 
+> **Offline loads (energy backstop for *detection*):** if the washer's cloud is
+> offline for a whole cycle, `job_state` never reports a phase, so a normal load
+> is invisible to phase-based detection — the meter just jumps in one batch when
+> the cloud reconnects. The bot watches for that: a single energy jump of
+> `energy_load_jump` kWh (default **0.3**) while `job_state` is dark (and it isn't
+> a self-clean) is treated as a load that ran while offline, and a catch-up
+> message is posted. Slow standby/wrinkle-prevent creep (small per-sample steps)
+> and meter resets (a decrease) never trip it. Note: telemetry for a fully
+> offline load only reaches HA on reconnect, so that message is necessarily
+> *after the fact*, and a load smaller than the threshold with no phases can't be
+> caught — a cloud limitation, not a bug.
+
 > **Self-clean cycles:** a drum self-clean runs *without* reporting any
 > `job_state` phase (it stays `none` while `machine_state` is `run`). The bot
 > detects that (running with no wash phase for a few minutes) and posts a

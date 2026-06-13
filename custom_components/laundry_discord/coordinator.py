@@ -34,6 +34,7 @@ from .const import (
     CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
+    CONF_ENERGY_LOAD_JUMP,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
@@ -44,6 +45,7 @@ from .const import (
     DEFAULT_CONFIRM_DELAY,
     DEFAULT_ENERGY_ENTITY,
     DEFAULT_ENERGY_IDLE,
+    DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
@@ -69,6 +71,7 @@ from .const import (
     STORAGE_VERSION,
     UNCLAIMED,
 )
+from .detect import energy_jumped
 from .discord_bot import ClaimView, DiscordBot
 
 _LOGGER = logging.getLogger(__name__)
@@ -121,6 +124,11 @@ class LaundryCoordinator:
         # (re)start once energy has moved past this — so a frozen leftover phase
         # (energy still flat at this level) can't spawn a duplicate session.
         self._completion_energy: float | None = None
+        # Previous energy sample, for the offline-load backstop: a single-sample
+        # jump (telemetry batched after the cloud was offline) signals a load the
+        # job_state path never saw. Advanced every poll, so slow creep can't
+        # accumulate into a false trigger and a meter reset just rebaselines.
+        self._last_energy: float | None = None
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
         self._flap_times: list[float] = []
@@ -198,6 +206,13 @@ class LaundryCoordinator:
             * 60
         )
 
+    @property
+    def energy_load_jump(self) -> float:
+        """kWh rise in one sample that marks a load run while job_state was dark."""
+        return float(
+            self._cfg.get(CONF_ENERGY_LOAD_JUMP, DEFAULT_ENERGY_LOAD_JUMP)
+        )
+
     # --- connection health (diagnostic) ---
     @property
     def flap_count_24h(self) -> int:
@@ -246,6 +261,10 @@ class LaundryCoordinator:
 
     @callback
     def _async_health_tick(self, now) -> None:
+        # Piggyback the always-on tick to watch for an offline load (energy
+        # jump while job_state is dark). _entity_float returns None for an
+        # 'unavailable' meter, so flaps are ignored here for free.
+        self._evaluate_energy_start()
         self._notify_entities()
 
     async def async_run_bot(self) -> None:
@@ -289,9 +308,11 @@ class LaundryCoordinator:
             # Not tracking an active wash, but the washer may already be
             # mid-cycle (installed/restarted during a load or a self-clean). A
             # new normal load supersedes a done message via the job path; a
-            # self-clean is checked here since it has no job phase.
+            # self-clean is checked here since it has no job phase; and an
+            # energy jump catches a load that ran entirely while HA was down.
             self._evaluate_start()
             self._maybe_schedule_selfclean()
+            self._evaluate_energy_start()
         # DONE_WAITING also keeps its claim/unclaim button working via the
         # persistent ClaimView re-registered in on_ready.
         self._notify_entities()
@@ -314,6 +335,7 @@ class LaundryCoordinator:
         self._idle_energy_value = data.get("idle_energy_value")
         self._idle_energy_ts = data.get("idle_energy_ts")
         self._completion_energy = data.get("completion_energy")
+        self._last_energy = data.get("last_energy")
         self._flap_times = list(data.get("flap_times", []))
 
     async def _async_save(self) -> None:
@@ -332,6 +354,7 @@ class LaundryCoordinator:
                 "idle_energy_value": self._idle_energy_value,
                 "idle_energy_ts": self._idle_energy_ts,
                 "completion_energy": self._completion_energy,
+                "last_energy": self._last_energy,
                 "flap_times": self._flap_times,
             }
         )
@@ -389,6 +412,45 @@ class LaundryCoordinator:
             return
         if self._load_active():
             self.hass.async_create_task(self._async_start_session())
+
+    @callback
+    def _evaluate_energy_start(self) -> None:
+        """Offline-load backstop: catch a load that ran while job_state was dark.
+
+        The washer's cloud drops for hours at a time; a load that runs entirely
+        while it's offline never emits a job_state phase, so the normal detector
+        can't see it. Its only fingerprint is the energy meter jumping in one
+        batch when the cloud reconnects. We poll on the always-on health tick
+        (and on bot-ready), advancing a per-sample baseline so creep and resets
+        can't trigger, and start a catch-up session on a real jump — but ONLY
+        when job_state is dark and it isn't a self-clean, so the live job path
+        and the self-clean detector are never disturbed.
+        """
+        cur = self._entity_float(self.energy_entity)
+        if cur is None:
+            return  # unavailable: hold the last good sample, never poll a gap
+        prev = self._last_energy
+        if cur == prev:
+            return  # flat: nothing changed since the last poll
+        self._last_energy = cur  # advance (a decrease here rebaselines on reset)
+        self.hass.async_create_task(self._async_save())
+        if not energy_jumped(prev, cur, self.energy_load_jump):
+            return
+        # Only the offline case. A live load is owned by the job path; a
+        # self-clean by its own detector; an active session is never superseded.
+        if self.stage not in (STAGE_IDLE, STAGE_DONE_WAITING):
+            return
+        job = self.hass.states.get(self.job_state_entity)
+        if job is not None and job.state in REAL_PHASES:
+            return  # job path is handling (or about to handle) this live load
+        if self._looks_like_selfclean():
+            return
+        _LOGGER.debug(
+            "Energy jumped %.2f->%.2f kWh with job_state dark — offline load",
+            prev,
+            cur,
+        )
+        self.hass.async_create_task(self._async_start_session(offline=True))
 
     @callback
     def _on_running(self, event: Event) -> None:
@@ -624,12 +686,16 @@ class LaundryCoordinator:
             self._notify_entities()
 
     # ------------------------------------------------------- lifecycle actions
-    async def _async_start_session(self) -> None:
+    async def _async_start_session(self, *, offline: bool = False) -> None:
         async with self._lock:
             # A wash already in progress wins. A previous *finished* load (still
             # showing its claim/unclaim message) is simply superseded by this one.
             if self.stage in (STAGE_WASHING, STAGE_DRYING):
                 _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
+                return
+            # An offline detection can race the self-clean path (both fire while
+            # job_state is dark); if a self-clean took the session first, yield.
+            if offline and self.stage == STAGE_SELF_CLEAN:
                 return
             self.waiting = False
             self.claimed_by = UNCLAIMED
@@ -643,8 +709,11 @@ class LaundryCoordinator:
             self._last_real_phase = phase if phase in REAL_PHASES else None
             # Start directly in the Drying stage if caught already drying.
             self.stage = STAGE_DRYING if phase == JOB_STATE_DRYING else STAGE_WASHING
-            # Already well into the cycle => a mid-cycle pickup ("in progress").
-            self.catch_up = phase in MIDCYCLE_PHASES
+            # An offline load is detected after the fact (job_state was dark, so
+            # no phase to anchor to) — treat it as a mid-cycle pickup so it reads
+            # "in progress" and shows no false usage baseline; the energy-idle
+            # backstop closes it once the meter settles.
+            self.catch_up = offline or phase in MIDCYCLE_PHASES
             self._reset_energy_idle()
             # Capture meter baselines for the usage stat — only meaningful for a
             # load we see from the start (a catch-up has no true baseline).

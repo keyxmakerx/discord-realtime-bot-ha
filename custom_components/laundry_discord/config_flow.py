@@ -24,6 +24,7 @@ from .const import (
     CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
+    CONF_ENERGY_LOAD_JUMP,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_JOB_STATE_ENTITY,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_ENERGY_IDLE,
+    DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_RUNNING_ENTITY,
     DEFAULT_SELFCLEAN_DELAY,
@@ -44,11 +46,13 @@ from .const import (
     MAX_AVAILABILITY_GRACE,
     MAX_CONFIRM_DELAY,
     MAX_ENERGY_IDLE,
+    MAX_ENERGY_LOAD_JUMP,
     MAX_ETA_INTERVAL,
     MAX_SELFCLEAN_DELAY,
     MIN_AVAILABILITY_GRACE,
     MIN_CONFIRM_DELAY,
     MIN_ENERGY_IDLE,
+    MIN_ENERGY_LOAD_JUMP,
     MIN_ETA_INTERVAL,
     MIN_SELFCLEAN_DELAY,
 )
@@ -107,6 +111,20 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     max=MAX_ENERGY_IDLE,
                     step=5,
                     unit_of_measurement="minutes",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_ENERGY_LOAD_JUMP,
+                default=defaults.get(
+                    CONF_ENERGY_LOAD_JUMP, DEFAULT_ENERGY_LOAD_JUMP
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_ENERGY_LOAD_JUMP,
+                    max=MAX_ENERGY_LOAD_JUMP,
+                    step=0.1,
+                    unit_of_measurement="kWh",
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
@@ -260,6 +278,9 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_CONFIRM_DELAY: int(user_input[CONF_CONFIRM_DELAY]),
                     CONF_SELFCLEAN_DELAY: int(user_input[CONF_SELFCLEAN_DELAY]),
                     CONF_ENERGY_IDLE: int(user_input[CONF_ENERGY_IDLE]),
+                    CONF_ENERGY_LOAD_JUMP: float(
+                        user_input[CONF_ENERGY_LOAD_JUMP]
+                    ),
                     CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
                         CONF_PING_CLAIMANT_ON_COMPLETE
                     ],
