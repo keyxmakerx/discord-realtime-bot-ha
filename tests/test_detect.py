@@ -21,8 +21,23 @@ _spec = importlib.util.spec_from_file_location("ld_detect", _DETECT_PATH)
 _detect = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
+load_is_active = _detect.load_is_active
+
+# Load const by path too (no Home Assistant imports) so the phase sets the test
+# uses stay in lockstep with the integration.
+_CONST_PATH = os.path.join(os.path.dirname(_DETECT_PATH), "const.py")
+_cspec = importlib.util.spec_from_file_location("ld_const", _CONST_PATH)
+_const = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_const)
+REAL_PHASES = _const.REAL_PHASES
+MIDCYCLE_PHASES = _const.MIDCYCLE_PHASES
+FINISH = _const.JOB_STATE_FINISH
 
 THRESHOLD = 0.3
+
+
+def _active(phase, energy, completion):
+    return load_is_active(phase, REAL_PHASES, FINISH, MIDCYCLE_PHASES, energy, completion)
 
 
 def _feed(samples: list[float | None], threshold: float = THRESHOLD) -> list[int]:
@@ -77,6 +92,32 @@ def test_meter_reset_rebaselines_and_still_detects() -> None:
     # total_increasing meter resets mid-stream; the decrease must rebaseline (no
     # trigger) and a later real load must STILL be caught — not made invisible.
     assert _feed([12.8, 5.0, 5.0, 5.9]) == [3]
+
+
+def test_fresh_early_phase_starts_despite_flat_meter() -> None:
+    # THE REGRESSION: a new load's job goes weight_sensing/wash while the energy
+    # meter still reads the previous completion (it lags 15-45 min). Must START.
+    assert _active("weight_sensing", energy=14.8, completion=14.8) is True
+    assert _active("wash", energy=14.8, completion=14.8) is True
+    # ...and obviously when the meter has nothing to compare against.
+    assert _active("weight_sensing", energy=None, completion=None) is True
+
+
+def test_finish_and_non_phases_never_start() -> None:
+    assert _active(FINISH, energy=15.0, completion=14.8) is False
+    assert _active("none", energy=15.0, completion=14.8) is False
+    assert _active(None, energy=15.0, completion=14.8) is False
+
+
+def test_frozen_late_phase_does_not_restart() -> None:
+    # A mid/late phase stuck at exactly the completion reading = stale leftover.
+    assert _active("drying", energy=14.8, completion=14.8) is False
+    assert _active("spin", energy=14.8, completion=14.8) is False
+
+
+def test_real_midcycle_catchup_starts() -> None:
+    # Same late phase but the meter has moved past completion = a real catch-up.
+    assert _active("drying", energy=15.2, completion=14.8) is True
 
 
 def _run() -> None:

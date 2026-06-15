@@ -71,7 +71,7 @@ from .const import (
     STORAGE_VERSION,
     UNCLAIMED,
 )
-from .detect import energy_jumped
+from .detect import energy_jumped, load_is_active
 from .discord_bot import ClaimView, DiscordBot
 
 _LOGGER = logging.getLogger(__name__)
@@ -383,21 +383,15 @@ class LaundryCoordinator:
         phase, so this stays false-positive safe.
         """
         job = self.hass.states.get(self.job_state_entity)
-        if job is None or job.state not in REAL_PHASES:
-            return False
-        # 'finish' is the *end* of a cycle, not a start — never begin on it.
-        if job.state == JOB_STATE_FINISH:
-            return False
-        # Don't (re)start on a frozen leftover phase: if the energy meter hasn't
-        # moved since the last completion, no real load is running.
-        energy = self._entity_float(self.energy_entity)
-        if (
-            energy is not None
-            and self._completion_energy is not None
-            and abs(energy - self._completion_energy) < 1e-6
-        ):
-            return False
-        return True
+        phase = job.state if job is not None else None
+        return load_is_active(
+            phase,
+            REAL_PHASES,
+            JOB_STATE_FINISH,
+            MIDCYCLE_PHASES,
+            self._entity_float(self.energy_entity),
+            self._completion_energy,
+        )
 
     @callback
     def _evaluate_start(self) -> None:
