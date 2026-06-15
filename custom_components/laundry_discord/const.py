@@ -13,9 +13,9 @@ CONF_ETA_ENTITY = "eta_entity"
 CONF_MACHINE_STATE_ENTITY = "machine_state_entity"
 CONF_ENERGY_ENTITY = "energy_entity"
 CONF_WATER_ENTITY = "water_entity"
+CONF_WRINKLE_ENTITY = "wrinkle_entity"
 CONF_ETA_INTERVAL = "eta_interval"
 CONF_CONFIRM_DELAY = "confirm_delay"
-CONF_SELFCLEAN_DELAY = "selfclean_delay"
 CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
@@ -28,6 +28,7 @@ DEFAULT_ETA_ENTITY = "sensor.washer_washer_completion_time"
 DEFAULT_MACHINE_STATE_ENTITY = "sensor.washer_washer_machine_state"
 DEFAULT_ENERGY_ENTITY = "sensor.washer_energy"
 DEFAULT_WATER_ENTITY = "sensor.washer_water_consumption"
+DEFAULT_WRINKLE_ENTITY = "binary_sensor.washer_wrinkle_prevent_active"
 
 # machine_state vocabulary (run / pause / stop / unavailable).
 MACHINE_RUN = "run"
@@ -46,11 +47,6 @@ DEFAULT_PING_CLAIMANT_ON_COMPLETE = True
 DEFAULT_CONFIRM_DELAY = 30
 MIN_CONFIRM_DELAY = 0
 MAX_CONFIRM_DELAY = 300
-# Seconds the washer must be running with job_state stuck at 'none' before we
-# treat it as a self-clean (longer than a normal load's run->weight_sensing gap).
-DEFAULT_SELFCLEAN_DELAY = 180
-MIN_SELFCLEAN_DELAY = 60
-MAX_SELFCLEAN_DELAY = 900
 # Minutes the energy meter must be FLAT (no kWh increase) before a tracked cycle
 # is considered done — the reliable completion signal when this washer's
 # job_state/machine_state freeze. Must exceed the active low-power update gap.

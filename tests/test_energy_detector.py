@@ -163,6 +163,28 @@ def test_meter_reset_is_safe() -> None:
     assert det2.phase == RUN_IDLE
 
 
+def test_midcycle_catchup_when_energy_moved() -> None:
+    # Only a late phase ever appears (early phases were dark). It counts as a
+    # catch-up because the meter has risen since we went idle.
+    det = EnergyDetector(idle_timeout=IDLE)
+    det.observe(0, 18.0)  # baseline
+    det.reset()  # idle_energy = 18.0
+    assert det.observe(M, 18.5, job_is_real=True) == EV_STARTED
+
+
+def test_frozen_late_phase_after_finish_does_not_restart() -> None:
+    # job_state stuck at a late phase after completion, meter flat at the
+    # completion reading => stale leftover, must NOT restart.
+    det = EnergyDetector(idle_timeout=IDLE)
+    det.observe(0, 20.0, job_is_early=True)  # a load
+    det.observe(M, 20.9)
+    det.observe(M, 20.9, job_is_finish=True)  # finished; idle_energy = 20.9
+    assert det.phase == RUN_IDLE
+    # Now job is frozen at 'spin' (real) but energy is unchanged.
+    assert det.observe(2 * M, 20.9, job_is_real=True) is None
+    assert det.phase == RUN_IDLE
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -13,9 +13,9 @@
           "machine_state_entity": "Machine-state sensor (run/pause/stop — for pause display + start consensus)",
           "energy_entity": "Energy sensor (optional — shows kWh used on the done message)",
           "water_entity": "Water-usage sensor (optional — shows usage on the done message)",
+          "wrinkle_entity": "Wrinkle-prevent 'active' sensor (optional — stops post-cycle tumbling from delaying 'done')",
           "eta_interval": "ETA update interval",
           "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
-          "selfclean_delay": "Self-clean detect delay — running with no wash phase for this long = self-clean (seconds)",
           "energy_idle": "Energy-idle completion — flat kWh for this long = cycle done (minutes)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)"
@@ -36,7 +36,6 @@
         "data": {
           "eta_interval": "ETA update interval",
           "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
-          "selfclean_delay": "Self-clean detect delay — running with no wash phase for this long = self-clean (seconds)",
           "energy_idle": "Energy-idle completion — flat kWh for this long = cycle done (minutes)",
           "energy_load_jump": "Offline-load detection — energy jump this big (with no wash phase) = a load ran while offline (kWh)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",

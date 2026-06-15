@@ -1,8 +1,9 @@
 """Pure, dependency-free detection helpers.
 
 Kept free of Home Assistant / discord imports so the tricky energy-sample math
-can be unit-tested without the HA test harness. The coordinator delegates to
-these; see :meth:`coordinator.LaundryCoordinator._evaluate_energy_start`.
+can be unit-tested without the HA test harness. The coordinator delegates load
+liveness to :class:`EnergyDetector`; see
+:meth:`coordinator.LaundryCoordinator._feed_detector`.
 """
 
 from __future__ import annotations
@@ -117,6 +118,7 @@ class EnergyDetector:
     phase: str = RUN_IDLE
     last_energy: float | None = None
     last_rise_ts: float | None = None
+    idle_energy: float | None = None  # meter reading when we last went idle
 
     def observe(
         self,
@@ -124,6 +126,7 @@ class EnergyDetector:
         energy: float | None,
         *,
         job_is_early: bool = False,
+        job_is_real: bool = False,
         job_is_finish: bool = False,
         wrinkle_active: bool = False,
     ) -> str | None:
@@ -131,9 +134,10 @@ class EnergyDetector:
 
         ``energy`` is ``None`` when the meter is unavailable (held, never a
         sample). ``job_is_early`` marks a fresh early phase (weight_sensing /
-        wash); ``job_is_finish`` marks job_state == 'finish'. ``wrinkle_active``
-        is the optional wrinkle-prevent sensor — when true, a rise is attributed
-        to tumbling, not the load.
+        wash); ``job_is_real`` marks any real wash phase (for a mid-cycle
+        catch-up); ``job_is_finish`` marks job_state == 'finish'.
+        ``wrinkle_active`` is the optional wrinkle-prevent sensor — when true, a
+        rise is attributed to tumbling, not the load.
         """
         rose = False
         jumped = False
@@ -147,9 +151,18 @@ class EnergyDetector:
             self.last_energy = energy  # advance (a decrease rebaselines on reset)
 
         if self.phase != RUN_ACTIVE:
-            # Start on a real energy jump (offline batch) or the job accelerant
-            # (online, even while the meter still lags the phases).
-            if jumped or job_is_early:
+            # A mid/late phase counts as a catch-up only if the meter has moved
+            # since we went idle — a phase frozen at the completion reading is a
+            # stale leftover, not a running load.
+            catchup = (
+                job_is_real
+                and energy is not None
+                and self.idle_energy is not None
+                and energy > self.idle_energy + _EPS
+            )
+            # Start on: an energy jump (offline batch), the early-phase accelerant
+            # (online, even while the meter lags), or a corroborated catch-up.
+            if jumped or job_is_early or catchup:
                 self.phase = RUN_ACTIVE
                 self.last_rise_ts = ts
                 return EV_STARTED
@@ -157,7 +170,7 @@ class EnergyDetector:
 
         # ACTIVE -------------------------------------------------------------
         if job_is_finish:  # fast-path completion when the cloud reports it
-            self._reset()
+            self.reset()
             return EV_FINISHED
         if rose and not wrinkle_active:
             self.last_rise_ts = ts  # load is still drawing => re-arm the timer
@@ -165,11 +178,12 @@ class EnergyDetector:
             self.last_rise_ts is not None
             and (ts - self.last_rise_ts) >= self.idle_timeout
         ):
-            self._reset()
+            self.reset()
             return EV_FINISHED
         return None
 
-    def _reset(self) -> None:
-        """Return to idle after a finish; keep last_energy as the next baseline."""
+    def reset(self) -> None:
+        """Return to idle after a finish; record the meter baseline for catch-up."""
         self.phase = RUN_IDLE
         self.last_rise_ts = None
+        self.idle_energy = self.last_energy
