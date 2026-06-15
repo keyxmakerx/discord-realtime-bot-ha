@@ -40,30 +40,47 @@ For a single load (a "session"):
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
-> **Detection keys off `job_state`** — the washer's clean, authoritative signal
-> (the same one reliable HA automations use). A real cycle phase = a real load.
-> The `running`/`machine_state` sensors flap on this washer, so they're **not**
-> required to detect a load (they'd cause missed starts); `machine_state` is used
-> only for the **"⏸ Paused"** display. Flaps show as `unavailable` and are
-> ignored, so detection is both reliable and false-positive safe. A new cycle
-> supersedes a finished-but-unclaimed message.
+> **Detection is energy-primary.** The **energy meter** is the single source of
+> truth for whether a load is running: it never lies about whether a cycle
+> happened (a load always burns power), it only lags. A cycle is **running** when
+> kWh is climbing and **done** when kWh stays flat for `energy_idle` minutes
+> (default **60**). `job_state` is treated only as an **accelerant + enrichment**
+> — it can speed things up but can never block detection:
+> - **Fast start (online):** a confirmed early phase (`weight_sensing`/`wash`)
+>   starts the load immediately, before the meter (which lags 15–45 min) has even
+>   moved. A change must persist `confirm_delay` (default **30s**) first, so a
+>   transient flap can't start anything.
+> - **Fast finish:** a confirmed `job_state = finish` completes immediately
+>   instead of waiting out the flat-energy timeout.
+> - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
+>   phase + a meter that has moved since idle starts it (a phase *frozen* at the
+>   last completion reading is ignored as a stale leftover).
 >
-> **Confirm debounce:** a job_state change must *persist* for a configurable
-> `confirm_delay` (default **30s**) before the bot acts — mirroring the proven
-> automations' `for: 30s`, so a transient can't trigger start/drying/finish.
->
-> **Energy-idle completion (reliability backstop):** some washers' `job_state`
-> and `machine_state` *freeze* on the last running value for hours when the cloud
-> goes stale, so they can't be trusted to report "done." The bot also watches the
-> **energy meter** — if a tracked cycle's kWh stays flat for `energy_idle` minutes
-> (default **60**), it's done regardless of the frozen state sensors. A new cycle
-> (`weight_sensing`) also supersedes a stuck session.
+> Because the meter — not the flappy `job_state`/`machine_state` — decides
+> liveness, the failure modes that plagued earlier versions are gone:
+> back-to-back loads, loads whose phases never report, and frozen state sensors
+> all resolve correctly. The `running`/`machine_state` sensors are used only for
+> the **"⏸ Paused"** display and prompt self-clean end. A new cycle supersedes a
+> finished-but-unclaimed message.
+
+> **Offline loads:** if the washer's cloud is offline for a whole cycle,
+> `job_state` never reports a phase — but the meter jumps in one batch when the
+> cloud reconnects. A single energy jump of `energy_load_jump` kWh (default
+> **0.3**) is treated as a load that ran while offline, and a catch-up message is
+> posted. Slow standby/wrinkle-prevent creep (small per-sample steps) and meter
+> resets (a decrease) never trip it. Telemetry for a fully offline load only
+> reaches HA on reconnect, so that message is necessarily *after the fact*, and a
+> load smaller than the threshold with no phases can't be caught — a cloud limit.
+
+> **Wrinkle-prevent:** after a cycle the drum tumbles for hours, nudging the
+> meter. Point the optional **wrinkle-prevent sensor** at the bot and those
+> nudges won't keep a finished load "alive" or spawn a phantom one.
 
 > **Self-clean cycles:** a drum self-clean runs *without* reporting any
-> `job_state` phase (it stays `none` while `machine_state` is `run`). The bot
-> detects that (running with no wash phase for a few minutes) and posts a
-> separate **"🧼 Self-clean running / finished"** message with the ETA and
-> energy/water used — **no claim button and no ping**.
+> `job_state` phase (it stays `none` while `machine_state` is `run`). When the
+> meter starts a cycle with no wash phase but the washer reports running, it's
+> posted as a separate **"🧼 Self-clean running / finished"** message with the ETA
+> and energy/water used — **no claim button and no ping**.
 
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),

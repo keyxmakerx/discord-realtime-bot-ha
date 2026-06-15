@@ -234,3 +234,20 @@ class DiscordBot:
                 users=True, roles=False, everyone=False
             ),
         )
+
+    async def async_announce_done(self, embed: discord.Embed) -> None:
+        """Post a fresh, push-silent 'done' message with no @mentions.
+
+        Used when an unclaimed load finishes: an in-place edit of the original
+        card stays buried in the channel history, so we also drop a new message
+        at the bottom where people will actually see it. ``silent=True`` keeps it
+        visible without firing a push notification, and mentions are disabled so
+        nobody is pinged.
+        """
+        await self._client.wait_until_ready()
+        channel = await self._get_channel()
+        await channel.send(
+            embed=embed,
+            silent=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
