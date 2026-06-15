@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 
 _DETECT_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -19,6 +20,7 @@ _DETECT_PATH = os.path.join(
 )
 _spec = importlib.util.spec_from_file_location("ld_detect", _DETECT_PATH)
 _detect = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _detect  # dataclass needs the module registered
 _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
 load_is_active = _detect.load_is_active
