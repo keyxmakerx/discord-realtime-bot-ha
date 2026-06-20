@@ -99,6 +99,14 @@ class EnergyDetector:
       * **Back-to-back loads** — after a finish it returns to idle, so the next
         load re-fires ``EV_STARTED`` (the caller supersedes the lingering done
         message). This is the case the old completion-energy guard broke.
+      * **Drying never "finishes"** — on this washer the dry phase is barely
+        metered and job_state/machine_state freeze on 'drying' forever, so a
+        flat-energy timeout alone is either premature (fires mid-dry) or never
+        clean. When the caller passes ``eta_passed`` (the appliance's own
+        completion time has elapsed), a much shorter ``eta_grace`` of flat
+        energy closes the load near its true end. The caller only sets it for a
+        fresh ETA (not one frozen from the previous load), so it can't finish
+        the next load early.
       * **Removed early / abandoned mid-cycle** — energy simply goes flat, so
         the load finishes after ``idle_timeout`` like any other.
       * **Pause to add a sock, then resume** — a gap shorter than
@@ -114,6 +122,7 @@ class EnergyDetector:
 
     start_jump: float = 0.3   # kWh rise in one sample => a load (offline/batch)
     idle_timeout: float = 3600.0  # s of no load-energy rise => finished
+    eta_grace: float = 1800.0  # s of flat energy *after* the ETA => finished
 
     phase: str = RUN_IDLE
     last_energy: float | None = None
@@ -129,6 +138,7 @@ class EnergyDetector:
         job_is_real: bool = False,
         job_is_finish: bool = False,
         wrinkle_active: bool = False,
+        eta_passed: bool = False,
     ) -> str | None:
         """Process one sample; return an event or ``None``.
 
@@ -137,7 +147,11 @@ class EnergyDetector:
         wash); ``job_is_real`` marks any real wash phase (for a mid-cycle
         catch-up); ``job_is_finish`` marks job_state == 'finish'.
         ``wrinkle_active`` is the optional wrinkle-prevent sensor — when true, a
-        rise is attributed to tumbling, not the load.
+        rise is attributed to tumbling, not the load. ``eta_passed`` is true when
+        the appliance's own (current-cycle) completion time has elapsed; it lets
+        a settled meter finish on the shorter ``eta_grace`` instead of waiting
+        out the full ``idle_timeout`` — the only way to cleanly close a load
+        whose state sensors freeze on 'drying'.
         """
         rose = False
         jumped = False
@@ -174,12 +188,19 @@ class EnergyDetector:
             return EV_FINISHED
         if rose and not wrinkle_active:
             self.last_rise_ts = ts  # load is still drawing => re-arm the timer
-        if (
-            self.last_rise_ts is not None
-            and (ts - self.last_rise_ts) >= self.idle_timeout
-        ):
-            self.reset()
-            return EV_FINISHED
+        if self.last_rise_ts is not None:
+            flat_for = ts - self.last_rise_ts
+            # The appliance says the cycle is over and the meter has settled:
+            # finish on the shorter ETA grace. This is what closes a load whose
+            # dry isn't metered and whose job/machine_state freeze on 'drying'.
+            # A still-drawing load keeps re-arming above, so a live cycle (even
+            # one whose ETA estimate was too short) can't be cut off here.
+            if eta_passed and flat_for >= self.eta_grace:
+                self.reset()
+                return EV_FINISHED
+            if flat_for >= self.idle_timeout:
+                self.reset()
+                return EV_FINISHED
         return None
 
     def reset(self) -> None:

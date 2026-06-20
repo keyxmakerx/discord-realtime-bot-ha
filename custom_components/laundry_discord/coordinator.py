@@ -35,6 +35,7 @@ from .const import (
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
+    CONF_ETA_IDLE_GRACE,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
@@ -46,6 +47,7 @@ from .const import (
     DEFAULT_ENERGY_ENTITY,
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
+    DEFAULT_ETA_IDLE_GRACE,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
@@ -117,12 +119,18 @@ class LaundryCoordinator:
         # measurable, e.g. a mid-cycle catch-up where there's no true baseline).
         self._energy_start: float | None = None
         self._water_start: float | None = None
+        # Wall-clock (unix) time the current session started. Used to tell a
+        # fresh completion-time (published during this cycle) from one frozen at
+        # the previous load's value, so the ETA-grace finish can't close the
+        # next load early. None whenever no load is being tracked.
+        self._session_started_ts: float | None = None
         # The energy-primary liveness core: the single source of truth for load
         # start/finish. job_state/machine_state are only accelerants + enrichment
         # feeding it; they can never override the meter. See detect.EnergyDetector.
         self._detector = EnergyDetector(
             start_jump=self.energy_load_jump,
             idle_timeout=float(self.energy_idle_timeout),
+            eta_grace=float(self.eta_idle_grace),
         )
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
@@ -184,6 +192,16 @@ class LaundryCoordinator:
     def energy_idle_timeout(self) -> int:
         """Seconds the energy meter may be flat before a cycle counts as done."""
         return int(self._cfg.get(CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE)) * 60
+
+    @property
+    def eta_idle_grace(self) -> int:
+        """Seconds of flat energy, once the washer's ETA has passed, to finish.
+
+        Shorter than ``energy_idle_timeout``: the appliance's completion time is
+        the only signal that spans the dry, so once it elapses a brief settle is
+        enough to close the load instead of waiting out the full backstop.
+        """
+        return int(self._cfg.get(CONF_ETA_IDLE_GRACE, DEFAULT_ETA_IDLE_GRACE)) * 60
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -331,6 +349,7 @@ class LaundryCoordinator:
         self._last_real_phase = data.get("last_real_phase")
         self._energy_start = data.get("energy_start")
         self._water_start = data.get("water_start")
+        self._session_started_ts = data.get("session_started_ts")
         # Restore the liveness detector so a load in progress (or its baseline)
         # survives a restart and a load that ran during downtime is caught.
         det = data.get("detector") or {}
@@ -359,6 +378,7 @@ class LaundryCoordinator:
                 "last_real_phase": self._last_real_phase,
                 "energy_start": self._energy_start,
                 "water_start": self._water_start,
+                "session_started_ts": self._session_started_ts,
                 "detector": {
                     "phase": self._detector.phase,
                     "last_energy": self._detector.last_energy,
@@ -399,6 +419,31 @@ class LaundryCoordinator:
         st = self.hass.states.get(self.wrinkle_entity) if self.wrinkle_entity else None
         return st is not None and st.state == "on"
 
+    def _eta_passed(self) -> bool:
+        """Has the washer's own completion time for *this* cycle already passed?
+
+        The completion-time sensor is the one signal that covers the dry phase,
+        but it freezes at the previous load's value when the cloud goes stale.
+        So we only trust it when it was (re)published during the current session
+        (``last_changed`` at/after the session start) — a frozen, stale ETA from
+        an earlier load is ignored, which keeps it from finishing the next load
+        early. Returns False whenever no load is tracked or the ETA is missing.
+        """
+        if self._session_started_ts is None:
+            return False
+        st = self.hass.states.get(self.eta_entity)
+        if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
+            return False
+        target = dt_util.parse_datetime(st.state)
+        if target is None:
+            return False
+        if target.tzinfo is None:
+            target = dt_util.as_utc(target)
+        # Reject an ETA frozen from a previous load (stale-stuck integration).
+        if st.last_changed.timestamp() < self._session_started_ts:
+            return False
+        return dt_util.utcnow() >= target
+
     @callback
     def _feed_detector(self, _now=None, *, job_accel: bool = False) -> None:
         """Drive the energy-primary liveness core from current sensor readings.
@@ -424,6 +469,7 @@ class LaundryCoordinator:
             job_is_real=is_real,
             job_is_finish=is_finish,
             wrinkle_active=self._wrinkle_active(),
+            eta_passed=self._eta_passed(),
         )
         if ev == EV_STARTED:
             self._on_detector_started(phase)
@@ -676,6 +722,8 @@ class LaundryCoordinator:
             else:
                 self._energy_start = self._entity_float(self.energy_entity)
                 self._water_start = self._entity_float(self.water_entity)
+            # Anchor "is the ETA fresh?" to this load's start (see _eta_passed).
+            self._session_started_ts = dt_util.utcnow().timestamp()
 
             # The start post is a normal, visible message with the Claim button
             # so people can call dibs early. It never @mentions anyone — the only
@@ -761,6 +809,7 @@ class LaundryCoordinator:
             self._last_real_phase = None
             self._energy_start = self._entity_float(self.energy_entity)
             self._water_start = self._entity_float(self.water_entity)
+            self._session_started_ts = dt_util.utcnow().timestamp()
             # Visible, but never a claim button and never a ping.
             try:
                 self.message_id = await self.bot.async_post(

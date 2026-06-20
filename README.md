@@ -52,6 +52,14 @@ are ignored while a wash is already running.
 >   transient flap can't start anything.
 > - **Fast finish:** a confirmed `job_state = finish` completes immediately
 >   instead of waiting out the flat-energy timeout.
+> - **ETA-grace finish:** the drying phase is barely metered and on many washers
+>   `job_state`/`machine_state` freeze on `drying` and never reach `finish`, so a
+>   flat-energy timeout alone is either premature or never clean. Once the
+>   washer's **own completion time** (the ETA sensor) has passed, a much shorter
+>   `eta_idle_grace` of flat kWh (default **30 min**) closes the load near its
+>   true end. Only a *fresh* ETA published during the current cycle is trusted —
+>   one frozen at the previous load's value is ignored, so it can't finish the
+>   next load early.
 > - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
 >   phase + a meter that has moved since idle starts it (a phase *frozen* at the
 >   last completion reading is ignored as a stale leftover).
