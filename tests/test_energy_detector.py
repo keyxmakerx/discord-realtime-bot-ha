@@ -35,6 +35,7 @@ RUN_IDLE = _detect.RUN_IDLE
 
 M = 900  # 15 minutes, in seconds
 IDLE = 3600  # default idle_timeout used in these tests
+EG = 1800  # default eta_grace used in these tests (30 min)
 
 
 def _poll_flat(det, start_ts, energy, *, until, every=300, **kw):
@@ -182,6 +183,64 @@ def test_frozen_late_phase_after_finish_does_not_restart() -> None:
     assert det.phase == RUN_IDLE
     # Now job is frozen at 'spin' (real) but energy is unchanged.
     assert det.observe(2 * M, 20.9, job_is_real=True) is None
+    assert det.phase == RUN_IDLE
+
+
+def test_eta_grace_finishes_after_grace_when_eta_passed() -> None:
+    # The 'drying never finishes' fix. job_state/machine_state freeze on
+    # 'drying', the meter goes flat after the (barely-metered) dry, and the
+    # washer's own completion time has passed. The load must close on the short
+    # ETA grace — well before the full idle backstop.
+    det = EnergyDetector(idle_timeout=IDLE)  # eta_grace defaults to EG
+    assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
+    assert det.observe(M, 20.1) is None  # last real rise (end of dry) at 1*M
+    last_rise = M
+    # A gap equal to the meter's own active update cadence must NOT finish it,
+    # even with the ETA passed — eta_grace is kept above the meter gap so an
+    # ordinary between-readings gap can't be mistaken for the end.
+    assert det.observe(last_rise + M, 20.1, eta_passed=True) is None
+    # Flat right up until just before the grace elapses: still running.
+    assert _poll_flat(
+        det, last_rise + M + 300, 20.1,
+        until=last_rise + EG - 300, eta_passed=True,
+    ) is None
+    assert det.phase == RUN_ACTIVE
+    # Grace elapsed => finish, and it lands earlier than the idle backstop would.
+    assert det.observe(last_rise + EG, 20.1, eta_passed=True) == EV_FINISHED
+    assert det.phase == RUN_IDLE
+    assert EG < IDLE
+
+
+def test_eta_grace_ignored_while_meter_still_rising() -> None:
+    # At the very start of the NEXT load the completion time can still read the
+    # previous load's (now-passed) value before the cloud refreshes it. As long
+    # as the meter is rising the load is live and must not be cut off — every
+    # rise re-arms the timer, so the grace never elapses.
+    det = EnergyDetector(idle_timeout=IDLE)
+    assert det.observe(0, 14.8, job_is_early=True) == EV_STARTED
+    e, t = 14.8, 0
+    for _ in range(6):  # ~90 min of a normal rising wash, ETA stale-passed
+        t += M
+        e = round(e + 0.2, 2)
+        assert det.observe(t, e, eta_passed=True) is None
+    assert det.phase == RUN_ACTIVE
+
+
+def test_without_eta_dry_is_not_closed_before_idle_timeout() -> None:
+    # Before the washer's completion time passes (eta_passed False), a flat
+    # meter during the dry must NOT finish early — only the full idle backstop
+    # closes it. This is exactly the premature-completion the ETA gate prevents.
+    det = EnergyDetector(idle_timeout=IDLE)
+    assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
+    assert det.observe(M, 20.1) is None
+    last_rise = M
+    # Flat well past the ETA grace, but the ETA hasn't passed: still running.
+    assert _poll_flat(
+        det, last_rise + 300, 20.1,
+        until=last_rise + IDLE - 300, eta_passed=False,
+    ) is None
+    assert det.phase == RUN_ACTIVE
+    assert det.observe(last_rise + IDLE, 20.1, eta_passed=False) == EV_FINISHED
     assert det.phase == RUN_IDLE
 
 
