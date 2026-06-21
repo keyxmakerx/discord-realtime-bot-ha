@@ -54,12 +54,12 @@ MAX_CONFIRM_DELAY = 300
 DEFAULT_ENERGY_IDLE = 60
 MIN_ENERGY_IDLE = 10
 MAX_ENERGY_IDLE = 240
-# Minutes after job_state enters 'drying' to declare the load done. This washer's
-# energy meter can freeze/reset/read flat for a whole load (so it can't time the
-# end) and its completion_time sensor badly overestimates, but job_state reliably
-# reports 'drying' at the dry's start. So we time the finish from that transition
-# instead — set this to the machine's typical dry length. A confirmed
-# job_state='finish' still completes immediately if it arrives first.
+# Fallback minutes after job_state enters 'drying' to declare the load done, used
+# ONLY when the washer's own estimated finish (completion_time, snapshotted at the
+# dry's start) isn't available. Normally that per-load estimate governs; this is
+# the fixed backstop for when it's missing. A confirmed job_state='finish' still
+# completes immediately if it arrives first. Set this to the machine's typical dry
+# length.
 DEFAULT_DRY_DURATION = 120
 MIN_DRY_DURATION = 30
 MAX_DRY_DURATION = 360

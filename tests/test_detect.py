@@ -127,10 +127,11 @@ DRY = 120 * 60      # default dry_duration (s)
 MAXS = 720 * 60     # max_session safety net (s)
 
 
-def _due(in_drying, dry_started, session_started, now):
+def _due(in_drying, dry_started, session_started, now, dry_eta=None):
     return time_completion_due(
         in_drying=in_drying,
         dry_started_ts=dry_started,
+        dry_eta_ts=dry_eta,
         session_started_ts=session_started,
         now=now,
         dry_duration=DRY,
@@ -138,26 +139,36 @@ def _due(in_drying, dry_started, session_started, now):
     )
 
 
-def test_dry_timer_finishes_after_dry_duration() -> None:
-    # Drying entered at t=0; not done until dry_duration elapses.
-    assert _due(True, 0, 0, DRY - 60) is False
-    assert _due(True, 0, 0, DRY) is True
-    assert _due(True, 0, 0, DRY + 600) is True
+def test_dry_eta_is_preferred_when_captured() -> None:
+    # The washer's own estimated finish (captured at dry-start) governs: not done
+    # before it, done at/after it — regardless of the fixed dry_duration.
+    eta = 95 * 60  # washer estimated done 95 min in (shorter than dry_duration)
+    assert _due(True, 0, 0, eta - 60, dry_eta=eta) is False
+    assert _due(True, 0, 0, eta, dry_eta=eta) is True
+    # A longer estimate than dry_duration is still honored (not cut off early).
+    long_eta = 5 * 60 * 60
+    assert _due(True, 0, 0, DRY + 600, dry_eta=long_eta) is False
+    assert _due(True, 0, 0, long_eta, dry_eta=long_eta) is True
+
+
+def test_dry_duration_used_only_when_no_eta() -> None:
+    # No captured estimate => fall back to the fixed dry_duration after dry-start.
+    assert _due(True, 0, 0, DRY - 60, dry_eta=None) is False
+    assert _due(True, 0, 0, DRY, dry_eta=None) is True
 
 
 def test_dry_timer_inert_while_still_washing() -> None:
-    # Before the dry phase, the dry timer can't fire (this is the false-done the
+    # Before the dry phase, completion can't fire (this is the false-done the
     # dead energy meter used to cause mid-wash). dry_started is None until drying.
     assert _due(False, None, 0, DRY * 5) is False
-    # Even a long wash doesn't finish until the dry phase + dry_duration...
+    # Even a long wash doesn't finish until the dry phase...
     assert _due(False, None, 0, MAXS - 60) is False
     # ...except the absolute max-session safety net.
     assert _due(False, None, 0, MAXS) is True
 
 
 def test_max_session_backstop_finishes_a_stuck_load() -> None:
-    # Stuck in drying but the dry timer somehow never tripped (e.g. dry_started
-    # unknown): the session cap still closes it.
+    # Stuck with no usable dry signal at all: the session cap still closes it.
     assert _due(True, None, 0, MAXS) is True
     assert _due(True, None, 0, MAXS - 1) is False
 

@@ -50,17 +50,20 @@ are ignored while a wash is already running.
 >   starts the load immediately, before the meter (which lags 15–45 min) has even
 >   moved. A change must persist `confirm_delay` (default **30s**) first, so a
 >   transient flap can't start anything.
-> - **Fast finish:** a confirmed `job_state = finish` completes immediately.
-> - **Dry timer (completion):** this washer's energy meter is unreliable — it can
->   freeze, reset, or read flat for an entire load — and its completion-time
->   sensor badly overestimates, so neither can time the end. But `job_state`
->   reliably reports `drying` at the dry's start, so the load is declared done a
->   configurable `dry_duration` (default **120 min**, set it to your machine's
->   typical dry time) after that transition, or on `job_state = finish`,
->   whichever comes first. While `job_state` is reporting an active phase the
->   energy idle-timeout is **suppressed** (it only ever applies to a load running
->   while the cloud is dark), so a frozen/flat meter can no longer fire a false
->   "done" mid-cycle. An absolute max-session cap is the final safety net.
+> - **Fast finish:** a confirmed `job_state = finish` completes immediately — on
+>   this washer it only ever appears at the true end, never at the wash→dry
+>   handoff, so it's safe.
+> - **Drying completion:** `job_state` reliably reports `drying` at the dry's
+>   start, so completion is timed from there. The primary target is the washer's
+>   **own estimated finish** (`completion_time`), snapshotted at that moment
+>   because the live value can get corrupted mid-dry; it adapts per load. If no
+>   estimate is available it falls back to a fixed `dry_duration` (default
+>   **120 min**, set to your machine's typical dry time). `job_state = finish`
+>   still completes earlier if it arrives. Meanwhile the (unreliable) energy
+>   idle-timeout is **suppressed** while `job_state` reports an active phase — it
+>   only applies to a load running while the cloud is dark — so a frozen/flat
+>   meter can no longer fire a false "done" mid-cycle. An absolute max-session
+>   cap is the final safety net.
 > - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
 >   phase + a meter that has moved since idle starts it (a phase *frozen* at the
 >   last completion reading is ignored as a stale leftover).

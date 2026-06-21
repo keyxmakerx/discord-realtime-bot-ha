@@ -133,6 +133,10 @@ class LaundryCoordinator:
         # the absolute max-session safety net. Both None when not tracking.
         self._session_started_ts: float | None = None
         self._dry_started_ts: float | None = None
+        # The washer's own estimated finish, snapshotted once when the dry began
+        # (the live value gets corrupted mid-dry). Primary completion target;
+        # None falls back to the fixed dry_duration.
+        self._dry_eta_ts: float | None = None
         # The energy-primary liveness core: the single source of truth for load
         # start/finish. job_state/machine_state are only accelerants + enrichment
         # feeding it; they can never override the meter. See detect.EnergyDetector.
@@ -203,13 +207,11 @@ class LaundryCoordinator:
 
     @property
     def dry_duration(self) -> int:
-        """Seconds after job_state enters 'drying' to declare the load done.
+        """Fallback seconds after 'drying' to finish when no washer ETA was caught.
 
-        The reliable, timely completion signal on this washer: its energy meter
-        can freeze/read flat for a whole load and its completion_time badly
-        overestimates, but job_state reliably reports 'drying' at the dry's
-        start. A confirmed job_state='finish' still completes earlier if it
-        arrives first.
+        Normally the washer's own estimated finish (snapshotted at the dry's
+        start) governs completion; this fixed value is the backstop for when that
+        estimate is missing. A confirmed job_state='finish' completes earlier.
         """
         return int(self._cfg.get(CONF_DRY_DURATION, DEFAULT_DRY_DURATION)) * 60
 
@@ -367,6 +369,7 @@ class LaundryCoordinator:
         self._water_start = data.get("water_start")
         self._session_started_ts = data.get("session_started_ts")
         self._dry_started_ts = data.get("dry_started_ts")
+        self._dry_eta_ts = data.get("dry_eta_ts")
         # Restore the liveness detector so a load in progress (or its baseline)
         # survives a restart and a load that ran during downtime is caught.
         det = data.get("detector") or {}
@@ -397,6 +400,7 @@ class LaundryCoordinator:
                 "water_start": self._water_start,
                 "session_started_ts": self._session_started_ts,
                 "dry_started_ts": self._dry_started_ts,
+                "dry_eta_ts": self._dry_eta_ts,
                 "detector": {
                     "phase": self._detector.phase,
                     "last_energy": self._detector.last_energy,
@@ -460,6 +464,7 @@ class LaundryCoordinator:
         if time_completion_due(
             in_drying=self.stage == STAGE_DRYING,
             dry_started_ts=self._dry_started_ts,
+            dry_eta_ts=self._dry_eta_ts,
             session_started_ts=self._session_started_ts,
             now=dt_util.utcnow().timestamp(),
             dry_duration=float(self.dry_duration),
@@ -749,9 +754,13 @@ class LaundryCoordinator:
             # Anchor the completion timers to this load's start. If caught
             # already drying, arm the dry timer now (best estimate of its start).
             self._session_started_ts = dt_util.utcnow().timestamp()
-            self._dry_started_ts = (
-                self._session_started_ts if self.stage == STAGE_DRYING else None
-            )
+            if self.stage == STAGE_DRYING:
+                self._dry_started_ts = self._session_started_ts
+                eta = self._current_eta()
+                self._dry_eta_ts = eta.timestamp() if eta is not None else None
+            else:
+                self._dry_started_ts = None
+                self._dry_eta_ts = None
 
             # The start post is a normal, visible message with the Claim button
             # so people can call dibs early. It never @mentions anyone — the only
@@ -780,9 +789,13 @@ class LaundryCoordinator:
                 return
             self.stage = STAGE_DRYING
             # Arm the dry timer from the confirmed wash->dry transition — the
-            # reliable, timely completion signal on this washer.
+            # reliable, timely completion signal on this washer. Snapshot the
+            # washer's own estimated finish now (the live value gets corrupted
+            # later in the dry); it's the primary completion target.
             if self._dry_started_ts is None:
                 self._dry_started_ts = dt_util.utcnow().timestamp()
+                eta = self._current_eta()
+                self._dry_eta_ts = eta.timestamp() if eta is not None else None
             # Silent edit; the button (claim/unclaim) is preserved.
             embed = self.build_embed()
             try:
@@ -804,6 +817,7 @@ class LaundryCoordinator:
             # path completed the load (dry timer, job 'finish', energy backstop).
             self._detector.reset()
             self._dry_started_ts = None
+            self._dry_eta_ts = None
             self._session_started_ts = None
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
@@ -845,6 +859,7 @@ class LaundryCoordinator:
             self._water_start = self._entity_float(self.water_entity)
             self._session_started_ts = dt_util.utcnow().timestamp()
             self._dry_started_ts = None
+            self._dry_eta_ts = None
             # Visible, but never a claim button and never a ping.
             try:
                 self.message_id = await self.bot.async_post(
@@ -869,6 +884,7 @@ class LaundryCoordinator:
             self._stop_eta_timer()
             self._detector.reset()  # keep the detector in lockstep
             self._dry_started_ts = None
+            self._dry_eta_ts = None
             self._session_started_ts = None
             embed = self._selfclean_embed(done=True)
             try:

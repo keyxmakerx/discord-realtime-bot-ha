@@ -72,6 +72,7 @@ def time_completion_due(
     *,
     in_drying: bool,
     dry_started_ts: float | None,
+    dry_eta_ts: float | None,
     session_started_ts: float | None,
     now: float,
     dry_duration: float,
@@ -80,18 +81,23 @@ def time_completion_due(
     """Whether a tracked load should finish on the time-based signals.
 
     The reliable completion path on washers whose energy meter can't time the
-    end: **primary** — it has been in the drying phase for ``dry_duration``;
-    **backstop** — the whole session has run ``max_session`` (a stuck cycle can
-    never live forever). Pure so the coordinator's timing is unit-tested without
-    the HA harness. A reported ``job_state == 'finish'`` completes earlier on its
-    own path; this only ever fires while a load is still tracked.
+    end. While drying: prefer the washer's **own estimated finish** captured at
+    the dry's start (``dry_eta_ts``) — it adapts per load; only when that's
+    missing fall back to a fixed ``dry_duration`` after the dry began. The
+    **backstop** is ``max_session`` (a stuck cycle can never live forever). Pure
+    so the coordinator's timing is unit-tested without the HA harness. A reported
+    ``job_state == 'finish'`` completes earlier on its own path; this only ever
+    fires while a load is still tracked.
     """
-    if (
-        in_drying
-        and dry_started_ts is not None
-        and (now - dry_started_ts) >= dry_duration
-    ):
-        return True
+    if in_drying:
+        if dry_eta_ts is not None:
+            if now >= dry_eta_ts:
+                return True
+        elif (
+            dry_started_ts is not None
+            and (now - dry_started_ts) >= dry_duration
+        ):
+            return True
     if (
         session_started_ts is not None
         and (now - session_started_ts) >= max_session
