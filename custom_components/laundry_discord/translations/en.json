@@ -37,7 +37,7 @@
           "eta_interval": "ETA update interval",
           "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
           "energy_idle": "Energy-idle completion — flat kWh for this long = cycle done (minutes)",
-          "eta_idle_grace": "ETA-grace completion — once the washer's completion time passes, flat kWh for this long = cycle done (minutes). Closes loads whose dry never reports finished.",
+          "dry_duration": "Dry duration — minutes after the washer enters 'drying' to call the load done (set to your machine's typical dry time). A reported 'finish' completes sooner if it arrives first.",
           "energy_load_jump": "Offline-load detection — energy jump this big (with no wash phase) = a load ran while offline (kWh)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)"

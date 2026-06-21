@@ -40,36 +40,37 @@ For a single load (a "session"):
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
 
-> **Detection is energy-primary.** The **energy meter** is the single source of
-> truth for whether a load is running: it never lies about whether a cycle
-> happened (a load always burns power), it only lags. A cycle is **running** when
-> kWh is climbing and **done** when kWh stays flat for `energy_idle` minutes
-> (default **60**). `job_state` is treated only as an **accelerant + enrichment**
-> — it can speed things up but can never block detection:
+> **Detection mixes signals by reliability.** `job_state` is the spine: it
+> reliably reports the wash phases, the `drying` start, and `finish`. The
+> **energy meter** is a *fallback* for loads that ran while the cloud was dark
+> (`job_state` never reported a phase) — it's monotonic so it never lies that a
+> cycle happened, but on some washers it freezes/resets/reads flat mid-load, so
+> it is **never** allowed to time completion while `job_state` is live.
 > - **Fast start (online):** a confirmed early phase (`weight_sensing`/`wash`)
 >   starts the load immediately, before the meter (which lags 15–45 min) has even
 >   moved. A change must persist `confirm_delay` (default **30s**) first, so a
 >   transient flap can't start anything.
-> - **Fast finish:** a confirmed `job_state = finish` completes immediately
->   instead of waiting out the flat-energy timeout.
-> - **ETA-grace finish:** the drying phase is barely metered and on many washers
->   `job_state`/`machine_state` freeze on `drying` and never reach `finish`, so a
->   flat-energy timeout alone is either premature or never clean. Once the
->   washer's **own completion time** (the ETA sensor) has passed, a much shorter
->   `eta_idle_grace` of flat kWh (default **30 min**) closes the load near its
->   true end. Only a *fresh* ETA published during the current cycle is trusted —
->   one frozen at the previous load's value is ignored, so it can't finish the
->   next load early.
+> - **Fast finish:** a confirmed `job_state = finish` completes immediately.
+> - **Dry timer (completion):** this washer's energy meter is unreliable — it can
+>   freeze, reset, or read flat for an entire load — and its completion-time
+>   sensor badly overestimates, so neither can time the end. But `job_state`
+>   reliably reports `drying` at the dry's start, so the load is declared done a
+>   configurable `dry_duration` (default **120 min**, set it to your machine's
+>   typical dry time) after that transition, or on `job_state = finish`,
+>   whichever comes first. While `job_state` is reporting an active phase the
+>   energy idle-timeout is **suppressed** (it only ever applies to a load running
+>   while the cloud is dark), so a frozen/flat meter can no longer fire a false
+>   "done" mid-cycle. An absolute max-session cap is the final safety net.
 > - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
 >   phase + a meter that has moved since idle starts it (a phase *frozen* at the
 >   last completion reading is ignored as a stale leftover).
 >
-> Because the meter — not the flappy `job_state`/`machine_state` — decides
-> liveness, the failure modes that plagued earlier versions are gone:
-> back-to-back loads, loads whose phases never report, and frozen state sensors
-> all resolve correctly. The `running`/`machine_state` sensors are used only for
-> the **"⏸ Paused"** display and prompt self-clean end. A new cycle supersedes a
-> finished-but-unclaimed message.
+> Because completion is timed off the reliable `drying`/`finish` transitions (not
+> the flaky meter), the failure modes that plagued earlier versions are gone:
+> back-to-back loads each get their own card, and a frozen or dead energy meter
+> can no longer fire a false "done" mid-cycle. The `running`/`machine_state`
+> sensors are used only for the **"⏸ Paused"** display and prompt self-clean end.
+> A new cycle supersedes a finished-but-unclaimed message.
 
 > **Offline loads:** if the washer's cloud is offline for a whole cycle,
 > `job_state` never reports a phase — but the meter jumps in one batch when the

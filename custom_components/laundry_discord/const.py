@@ -20,7 +20,7 @@ CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
-CONF_ETA_IDLE_GRACE = "eta_idle_grace"
+CONF_DRY_DURATION = "dry_duration"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -54,17 +54,18 @@ MAX_CONFIRM_DELAY = 300
 DEFAULT_ENERGY_IDLE = 60
 MIN_ENERGY_IDLE = 10
 MAX_ENERGY_IDLE = 240
-# Minutes the energy meter must be FLAT *after the washer's own completion time
-# has already passed* before a tracked cycle is closed. The completion-time
-# sensor is the only signal that spans the (barely-metered) dry phase, so once
-# it has elapsed a short flat-energy confirmation is enough to finish — far
-# faster than the full energy-idle backstop above, and it rescues loads whose
-# job_state/machine_state freeze on 'drying' and never reach 'finish'. Must stay
-# above the meter's active update gap (~15 min) so an ordinary between-readings
-# gap inside a live cycle can never be mistaken for the end.
-DEFAULT_ETA_IDLE_GRACE = 30
-MIN_ETA_IDLE_GRACE = 15
-MAX_ETA_IDLE_GRACE = 120
+# Minutes after job_state enters 'drying' to declare the load done. This washer's
+# energy meter can freeze/reset/read flat for a whole load (so it can't time the
+# end) and its completion_time sensor badly overestimates, but job_state reliably
+# reports 'drying' at the dry's start. So we time the finish from that transition
+# instead — set this to the machine's typical dry length. A confirmed
+# job_state='finish' still completes immediately if it arrives first.
+DEFAULT_DRY_DURATION = 120
+MIN_DRY_DURATION = 30
+MAX_DRY_DURATION = 360
+# Absolute safety net (minutes): force-finish a tracked load that has somehow
+# neither hit 'finish' nor the dry timer, so a stuck session can't live forever.
+MAX_SESSION_MINUTES = 720
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5

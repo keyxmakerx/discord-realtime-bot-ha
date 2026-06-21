@@ -24,6 +24,7 @@ sys.modules[_spec.name] = _detect  # dataclass needs the module registered
 _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
 load_is_active = _detect.load_is_active
+time_completion_due = _detect.time_completion_due
 
 # Load const by path too (no Home Assistant imports) so the phase sets the test
 # uses stay in lockstep with the integration.
@@ -120,6 +121,45 @@ def test_frozen_late_phase_does_not_restart() -> None:
 def test_real_midcycle_catchup_starts() -> None:
     # Same late phase but the meter has moved past completion = a real catch-up.
     assert _active("drying", energy=15.2, completion=14.8) is True
+
+
+DRY = 120 * 60      # default dry_duration (s)
+MAXS = 720 * 60     # max_session safety net (s)
+
+
+def _due(in_drying, dry_started, session_started, now):
+    return time_completion_due(
+        in_drying=in_drying,
+        dry_started_ts=dry_started,
+        session_started_ts=session_started,
+        now=now,
+        dry_duration=DRY,
+        max_session=MAXS,
+    )
+
+
+def test_dry_timer_finishes_after_dry_duration() -> None:
+    # Drying entered at t=0; not done until dry_duration elapses.
+    assert _due(True, 0, 0, DRY - 60) is False
+    assert _due(True, 0, 0, DRY) is True
+    assert _due(True, 0, 0, DRY + 600) is True
+
+
+def test_dry_timer_inert_while_still_washing() -> None:
+    # Before the dry phase, the dry timer can't fire (this is the false-done the
+    # dead energy meter used to cause mid-wash). dry_started is None until drying.
+    assert _due(False, None, 0, DRY * 5) is False
+    # Even a long wash doesn't finish until the dry phase + dry_duration...
+    assert _due(False, None, 0, MAXS - 60) is False
+    # ...except the absolute max-session safety net.
+    assert _due(False, None, 0, MAXS) is True
+
+
+def test_max_session_backstop_finishes_a_stuck_load() -> None:
+    # Stuck in drying but the dry timer somehow never tripped (e.g. dry_started
+    # unknown): the session cap still closes it.
+    assert _due(True, None, 0, MAXS) is True
+    assert _due(True, None, 0, MAXS - 1) is False
 
 
 def _run() -> None:
