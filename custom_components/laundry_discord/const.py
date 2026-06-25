@@ -91,6 +91,9 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 # --- Discord ---
 CLAIM_CUSTOM_ID = "laundry_discord_claim"
 UNCLAIM_CUSTOM_ID = "laundry_discord_unclaim"
+# Toggle: when on, the claimant is named in plain text at completion instead of
+# being @mentioned — a visible "done" with no push (for when they're asleep).
+QUIET_CUSTOM_ID = "laundry_discord_quiet"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"

@@ -14,7 +14,7 @@ from discord.utils import MISSING
 
 from homeassistant.core import HomeAssistant
 
-from .const import CLAIM_CUSTOM_ID, UNCLAIM_CUSTOM_ID
+from .const import CLAIM_CUSTOM_ID, QUIET_CUSTOM_ID, UNCLAIM_CUSTOM_ID
 
 if TYPE_CHECKING:
     from .coordinator import LaundryCoordinator
@@ -87,6 +87,40 @@ class _UnclaimButton(discord.ui.Button):
             await _safe_interaction_error(interaction)
 
 
+class _QuietButton(discord.ui.Button):
+    """Toggle 'quiet' for the claimed load.
+
+    When quiet is on, completion names the claimant in plain text instead of
+    @mentioning them — visible, but no push (for when they're asleep). The label
+    /emoji reflect the current state so one tap flips it back.
+    """
+
+    def __init__(self, coordinator: "LaundryCoordinator") -> None:
+        quiet = coordinator.quiet
+        super().__init__(
+            label="Unmute" if quiet else "Quiet",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔔" if quiet else "🌙",
+            custom_id=QUIET_CUSTOM_ID,
+        )
+        self.coordinator = coordinator
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            if await self.coordinator.handle_toggle_quiet():
+                await interaction.response.edit_message(
+                    embed=self.coordinator.build_embed(),
+                    view=ClaimView(self.coordinator, show="unclaim"),
+                )
+            else:
+                await interaction.response.send_message(
+                    "This load is no longer active.", ephemeral=True
+                )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to handle Quiet interaction")
+            await _safe_interaction_error(interaction)
+
+
 class ClaimView(discord.ui.View):
     """Persistent view holding the Claim / Unclaim buttons.
 
@@ -96,8 +130,8 @@ class ClaimView(discord.ui.View):
 
     ``show`` controls which buttons are presented on a given message:
       - ``"claim"``   — a finished, unclaimed load (Claim only)
-      - ``"unclaim"`` — a claimed load (Unclaim only, to undo an accident)
-      - ``"both"``    — registration template so both custom_ids stay live
+      - ``"unclaim"`` — a claimed load (Unclaim + the 🌙 Quiet toggle)
+      - ``"both"``    — registration template so every custom_id stays live
         after a restart regardless of the message's current state.
     """
 
@@ -109,6 +143,7 @@ class ClaimView(discord.ui.View):
             self.add_item(_ClaimButton(coordinator))
         if show in ("unclaim", "both"):
             self.add_item(_UnclaimButton(coordinator))
+            self.add_item(_QuietButton(coordinator))
 
 
 class LaundryDiscordClient(discord.Client):
