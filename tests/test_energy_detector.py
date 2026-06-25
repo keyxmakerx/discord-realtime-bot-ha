@@ -232,6 +232,22 @@ def test_offline_load_uses_idle_timeout_when_no_estimate() -> None:
     assert det.phase == RUN_IDLE
 
 
+def test_energy_jump_while_idle_does_not_start() -> None:
+    # Reconnect after an outage: the meter catches up in one big step (18.0->19.1)
+    # while the washer reports stopped/idle. That is NOT a load — must not start.
+    det = EnergyDetector(idle_timeout=IDLE)
+    assert det.observe(0, 18.0) is None  # recovered value, baselines
+    assert det.observe(8, 19.1, machine_idle=True) is None  # +1.1 jump but idle
+    assert det.phase == RUN_IDLE
+    # A genuine offline load (machine not reported idle) still starts on the jump.
+    det2 = EnergyDetector(idle_timeout=IDLE)
+    assert det2.observe(0, 18.0) is None
+    assert det2.observe(8, 19.1) == EV_STARTED
+    # ...and a real wash phase always starts, even if the meter looks idle.
+    det3 = EnergyDetector(idle_timeout=IDLE)
+    assert det3.observe(0, 18.0, job_is_early=True, machine_idle=True) == EV_STARTED
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
