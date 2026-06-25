@@ -30,12 +30,16 @@ For a single load (a "session"):
    tray." It does **not** wait for `none`, which on this washer can lag by hours
    while the drum sits idle after the cycle is actually done (`none` straight
    from a phase is kept as a backup). If someone **claimed** it, the bot sends
-   the one **@mention** to that person ("your laundry's done"). If **nobody
-   claimed** it, the done message is posted with **no ping**, and the Claim
-   button stays.
-5. **Claim / Unclaim** — tapping **Claim** records the claimant in HA and swaps in
-   an **Unclaim** button so an accidental claim can be undone. The load stops
-   being claimable only when the **next load starts**.
+   the one **@mention** to that person ("your laundry's done") — unless they've
+   set **🌙 Quiet** (see below), in which case they're **named in plain text with
+   no ping**. If **nobody claimed** it, the done message is posted with **no
+   ping**, and the Claim button stays.
+5. **Claim / Unclaim / Quiet** — tapping **Claim** records the claimant in HA and
+   swaps in an **Unclaim** button (to undo an accidental claim) plus a **🌙 Quiet**
+   toggle. Quiet means completion *names* the claimant but does **not** @mention
+   them — a visible "done" with no push, for when they're asleep; tapping it again
+   (**🔔 Unmute**) restores the ping. The load stops being claimable only when the
+   **next load starts**.
 
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.

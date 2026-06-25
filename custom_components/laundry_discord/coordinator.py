@@ -112,6 +112,9 @@ class LaundryCoordinator:
         self.waiting: bool = False
         self.claimed_by: str = UNCLAIMED
         self.claimed_by_id: int | None = None
+        # When True, the claimant is named in plain text at completion instead of
+        # being @mentioned — a visible, push-silent "done" (e.g. they're asleep).
+        self.quiet: bool = False
         self.message_id: int | None = None
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
@@ -343,6 +346,7 @@ class LaundryCoordinator:
         self.waiting = data.get("waiting", False)
         self.claimed_by = data.get("claimed_by", UNCLAIMED)
         self.claimed_by_id = data.get("claimed_by_id")
+        self.quiet = data.get("quiet", False)
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
         self.paused = data.get("paused", False)
@@ -372,6 +376,7 @@ class LaundryCoordinator:
                 "waiting": self.waiting,
                 "claimed_by": self.claimed_by,
                 "claimed_by_id": self.claimed_by_id,
+                "quiet": self.quiet,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
                 "paused": self.paused,
@@ -723,6 +728,7 @@ class LaundryCoordinator:
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
+            self.quiet = False
             self.message_id = None
             self.paused = self._machine_state() == MACHINE_PAUSE
             # Seed the last confirmed phase from the current job state so a
@@ -802,7 +808,14 @@ class LaundryCoordinator:
             try:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed, view=view)
-                if claimed and self.ping_claimant_on_complete:
+                if claimed and self.quiet:
+                    # Quiet mode: name them, but no @mention and no push — a
+                    # visible "done" that won't wake them.
+                    await self.bot.async_announce_done(
+                        f"🌙 {self.claimed_by}, your laundry's done — "
+                        "don't forget the lint tray!"
+                    )
+                elif claimed and self.ping_claimant_on_complete:
                     # The one push per load: @mention the claimant.
                     await self.bot.async_send_ping(
                         f"<@{self.claimed_by_id}> 🧺 Your laundry's done — "
@@ -894,8 +907,22 @@ class LaundryCoordinator:
             return False
         self.claimed_by = UNCLAIMED
         self.claimed_by_id = None
+        self.quiet = False  # quiet belonged to the (now gone) claimant
         if self.stage == STAGE_DONE_WAITING:
             self.waiting = True
+        await self._async_save()
+        self._notify_entities()
+        return True
+
+    async def handle_toggle_quiet(self) -> bool:
+        """Toggle quiet mode for the claimed load (the 🌙 button).
+
+        When on, completion names the claimant in plain text instead of an
+        @mention — visible, but no push. Returns False on a stale tap.
+        """
+        if self.stage not in self._CLAIMABLE_STAGES:
+            return False
+        self.quiet = not self.quiet
         await self._async_save()
         self._notify_entities()
         return True
@@ -1119,9 +1146,10 @@ class LaundryCoordinator:
 
     def _add_claimant(self, embed: discord.Embed) -> None:
         if self.claimed_by and self.claimed_by != UNCLAIMED:
-            embed.add_field(
-                name="Claimed by", value=f"🧺 {self.claimed_by}", inline=False
-            )
+            value = f"🧺 {self.claimed_by}"
+            if self.quiet:
+                value += "  ·  🌙 quiet (named, not pinged)"
+            embed.add_field(name="Claimed by", value=value, inline=False)
 
     def _usage_text(self) -> str | None:
         """Energy/water used this load (meter delta since start), or None."""
