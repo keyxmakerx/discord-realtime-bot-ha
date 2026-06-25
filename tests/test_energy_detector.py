@@ -185,26 +185,45 @@ def test_frozen_late_phase_after_finish_does_not_restart() -> None:
     assert det.phase == RUN_IDLE
 
 
-def test_job_active_suppresses_energy_idle_timeout() -> None:
-    # The false-done fix. This washer's energy meter can read flat for an entire
-    # load (it froze/reset on a real capture), so while job_state is reporting an
-    # active phase the energy idle-timeout must NOT finish the load — even after
-    # the meter has been flat far longer than idle_timeout.
-    det = EnergyDetector(idle_timeout=IDLE)
-    assert det.observe(0, 14.8, job_is_early=True) == EV_STARTED
-    # Meter dead-flat the whole load, but the cloud is reporting phases.
+EG = 1200  # default eta_grace used in these tests (20 min settle)
+
+
+def test_eta_gate_completes_when_estimate_passed_and_meter_settled() -> None:
+    # Normal online completion: the washer's estimate has passed and the meter
+    # has been flat for eta_grace -> done.
+    det = EnergyDetector(idle_timeout=IDLE)  # eta_grace defaults to EG
+    assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
+    assert det.observe(M, 20.5) is None  # last real rise at 1*M
+    last = M
+    # Estimate passed, meter still settling: not done until eta_grace elapses.
     assert _poll_flat(
-        det, 300, 14.8, until=3 * IDLE, job_active=True
+        det, last + 300, 20.5,
+        until=last + EG - 300, has_eta=True, eta_passed=True,
     ) is None
     assert det.phase == RUN_ACTIVE
-    # The coordinator owns completion here; the explicit 'finish' still works.
-    assert det.observe(3 * IDLE + M, 14.8, job_is_finish=True) == EV_FINISHED
+    assert det.observe(last + EG, 20.5, has_eta=True, eta_passed=True) == EV_FINISHED
     assert det.phase == RUN_IDLE
 
 
-def test_offline_load_still_finishes_on_idle_timeout_when_job_dark() -> None:
-    # With the cloud dark (job_active False), energy remains the only signal, so
-    # the idle-timeout backstop must still close an offline load.
+def test_eta_gate_blocks_completion_until_estimate_passes() -> None:
+    # THE false-done fix. The meter is dead-flat from the start (it froze/read
+    # flat for a whole load on a real capture) AND job_state is stuck — but the
+    # washer's estimate is still in the future, so the load must NOT finish, even
+    # after the meter has been flat far longer than idle_timeout.
+    det = EnergyDetector(idle_timeout=IDLE)
+    assert det.observe(0, 14.8, job_is_early=True) == EV_STARTED
+    assert _poll_flat(
+        det, 300, 14.8, until=3 * IDLE, has_eta=True, eta_passed=False
+    ) is None
+    assert det.phase == RUN_ACTIVE
+    # Estimate finally passes; the meter long settled -> done.
+    assert det.observe(3 * IDLE + 1, 14.8, has_eta=True, eta_passed=True) == EV_FINISHED
+    assert det.phase == RUN_IDLE
+
+
+def test_offline_load_uses_idle_timeout_when_no_estimate() -> None:
+    # No washer estimate (has_eta False) => the flat-energy idle-timeout backstop
+    # closes a genuinely offline load.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 11.9) is None
     assert det.observe(M, 12.8) == EV_STARTED  # offline batch jump

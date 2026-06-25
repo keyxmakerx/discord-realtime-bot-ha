@@ -53,17 +53,18 @@ are ignored while a wash is already running.
 > - **Fast finish:** a confirmed `job_state = finish` completes immediately — on
 >   this washer it only ever appears at the true end, never at the wash→dry
 >   handoff, so it's safe.
-> - **Drying completion:** `job_state` reliably reports `drying` at the dry's
->   start, so completion is timed from there. The primary target is the washer's
->   **own estimated finish** (`completion_time`), snapshotted at that moment
->   because the live value can get corrupted mid-dry; it adapts per load. If no
->   estimate is available it falls back to a fixed `dry_duration` (default
->   **120 min**, set to your machine's typical dry time). `job_state = finish`
->   still completes earlier if it arrives. Meanwhile the (unreliable) energy
->   idle-timeout is **suppressed** while `job_state` reports an active phase — it
->   only applies to a load running while the cloud is dark — so a frozen/flat
->   meter can no longer fire a false "done" mid-cycle. An absolute max-session
->   cap is the final safety net.
+> - **Completion (the normal path):** the washer publishes its **own estimated
+>   finish** (`completion_time`), which lines up well with the real end. A load
+>   completes once that estimate has **passed** *and* the energy meter has been
+>   **flat for a short settle** (~20 min). This is robust to this washer's two
+>   quirks: the energy meter can freeze/read flat for a whole load — but it can't
+>   fire early because it must wait for the estimate to pass; and `job_state` can
+>   freeze mid-cycle (e.g. stuck on `wash`) — but that can't block completion
+>   because the estimate, not the phase, drives it. Only a *fresh* estimate
+>   (published during the current cycle) is trusted, so a value frozen from the
+>   previous load can't end the next one early. If `completion_time` is
+>   unavailable (a genuinely offline load) it falls back to the flat-energy
+>   `energy_idle` backstop. An absolute max-session cap is the final safety net.
 > - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
 >   phase + a meter that has moved since idle starts it (a phase *frozen* at the
 >   last completion reading is ignored as a stale leftover).

@@ -68,42 +68,17 @@ def load_is_active(
     return True
 
 
-def time_completion_due(
-    *,
-    in_drying: bool,
-    dry_started_ts: float | None,
-    dry_eta_ts: float | None,
-    session_started_ts: float | None,
-    now: float,
-    dry_duration: float,
-    max_session: float,
+def session_too_long(
+    session_started_ts: float | None, now: float, max_session: float
 ) -> bool:
-    """Whether a tracked load should finish on the time-based signals.
-
-    The reliable completion path on washers whose energy meter can't time the
-    end. While drying: prefer the washer's **own estimated finish** captured at
-    the dry's start (``dry_eta_ts``) — it adapts per load; only when that's
-    missing fall back to a fixed ``dry_duration`` after the dry began. The
-    **backstop** is ``max_session`` (a stuck cycle can never live forever). Pure
-    so the coordinator's timing is unit-tested without the HA harness. A reported
-    ``job_state == 'finish'`` completes earlier on its own path; this only ever
-    fires while a load is still tracked.
+    """Absolute safety net: a tracked load that has run ``max_session`` is forced
+    done so a stuck session (estimate frozen in the future, no 'finish') can
+    never live forever. Pure so it's unit-tested without the HA harness.
     """
-    if in_drying:
-        if dry_eta_ts is not None:
-            if now >= dry_eta_ts:
-                return True
-        elif (
-            dry_started_ts is not None
-            and (now - dry_started_ts) >= dry_duration
-        ):
-            return True
-    if (
+    return (
         session_started_ts is not None
         and (now - session_started_ts) >= max_session
-    ):
-        return True
-    return False
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -138,14 +113,17 @@ class EnergyDetector:
         load re-fires ``EV_STARTED`` (the caller supersedes the lingering done
         message). This is the case the old completion-energy guard broke.
       * **Unreliable meter (this washer)** — the energy meter can freeze, reset,
-        or read flat for an entire load, so it cannot be trusted to *time*
-        completion. The energy idle-timeout is therefore only a backstop for a
-        load running while the cloud is dark (``job_active`` False). While
-        job_state IS reporting an active phase the caller passes
-        ``job_active`` True and completion is decided by job_state / a dry timer
-        in the coordinator instead — the meter can never finish a load here then.
-      * **Removed early / abandoned mid-cycle (offline)** — with the cloud dark,
-        energy goes flat and the load finishes after ``idle_timeout``.
+        or read flat for an entire load, so it cannot time completion on its own.
+        When the washer's own estimate is available (``has_eta``) completion is
+        gated on it: the load finishes only once that estimate has passed
+        (``eta_passed``) AND the meter has settled for ``eta_grace``. This both
+        (a) lets a frozen/flat meter never fire early — it must wait for the
+        estimate — and (b) does not depend on job_state advancing, so a job_state
+        frozen mid-cycle can't block completion. The plain ``idle_timeout`` is
+        used ONLY when there's no usable estimate (``has_eta`` False, a truly
+        offline load).
+      * **Removed early / abandoned (offline)** — with no estimate, energy goes
+        flat and the load finishes after ``idle_timeout``.
       * **Pause to add a sock, then resume** — a gap shorter than
         ``idle_timeout`` does not finish the load; the meter resuming just
         re-arms the timer.
@@ -158,7 +136,8 @@ class EnergyDetector:
     """
 
     start_jump: float = 0.3   # kWh rise in one sample => a load (offline/batch)
-    idle_timeout: float = 3600.0  # s of no load-energy rise => finished (offline)
+    idle_timeout: float = 3600.0  # s flat => finished, ONLY when no usable ETA
+    eta_grace: float = 1200.0  # s the meter must settle after the ETA passes
 
     phase: str = RUN_IDLE
     last_energy: float | None = None
@@ -174,7 +153,8 @@ class EnergyDetector:
         job_is_real: bool = False,
         job_is_finish: bool = False,
         wrinkle_active: bool = False,
-        job_active: bool = False,
+        has_eta: bool = False,
+        eta_passed: bool = False,
     ) -> str | None:
         """Process one sample; return an event or ``None``.
 
@@ -183,11 +163,15 @@ class EnergyDetector:
         wash); ``job_is_real`` marks any real wash phase (for a mid-cycle
         catch-up); ``job_is_finish`` marks job_state == 'finish'.
         ``wrinkle_active`` is the optional wrinkle-prevent sensor — when true, a
-        rise is attributed to tumbling, not the load. ``job_active`` is true when
-        job_state is currently reporting a real active phase: the cloud is online
-        and tracking, so the (unreliable) energy idle-timeout is suppressed and
-        completion is owned by the coordinator (job 'finish' / dry timer). Energy
-        only times completion for an offline load (``job_active`` False).
+        rise is attributed to tumbling, not the load.
+
+        Completion gating: ``has_eta`` is true when the washer's own completion
+        estimate (for this cycle) is available; ``eta_passed`` is true once that
+        estimate has elapsed. With an estimate, the load finishes only when it
+        has passed AND the meter has been flat for ``eta_grace`` — so a frozen or
+        dead meter can't fire early, and a stalled job_state can't block it.
+        Without an estimate (offline), the plain ``idle_timeout`` flat-energy
+        backstop applies instead.
         """
         rose = False
         jumped = False
@@ -224,17 +208,19 @@ class EnergyDetector:
             return EV_FINISHED
         if rose and not wrinkle_active:
             self.last_rise_ts = ts  # load is still drawing => re-arm the timer
-        # The energy idle-timeout is ONLY a backstop for an offline load (cloud
-        # dark). When job_state is reporting an active phase the meter on this
-        # washer is too unreliable to time the end (it can freeze/reset/read flat
-        # for a whole load), so completion is decided by the coordinator instead.
-        if (
-            not job_active
-            and self.last_rise_ts is not None
-            and (ts - self.last_rise_ts) >= self.idle_timeout
-        ):
-            self.reset()
-            return EV_FINISHED
+        if self.last_rise_ts is not None:
+            flat_for = ts - self.last_rise_ts
+            if has_eta:
+                # The washer's estimate is the gate: finish only once it has
+                # passed and the (unreliable) meter has settled. A frozen/flat
+                # meter can't fire early, and a stalled job_state can't block it.
+                if eta_passed and flat_for >= self.eta_grace:
+                    self.reset()
+                    return EV_FINISHED
+            elif flat_for >= self.idle_timeout:
+                # No usable estimate (offline): energy-only flat backstop.
+                self.reset()
+                return EV_FINISHED
         return None
 
     def reset(self) -> None:

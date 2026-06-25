@@ -24,7 +24,7 @@ sys.modules[_spec.name] = _detect  # dataclass needs the module registered
 _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
 load_is_active = _detect.load_is_active
-time_completion_due = _detect.time_completion_due
+session_too_long = _detect.session_too_long
 
 # Load const by path too (no Home Assistant imports) so the phase sets the test
 # uses stay in lockstep with the integration.
@@ -123,54 +123,20 @@ def test_real_midcycle_catchup_starts() -> None:
     assert _active("drying", energy=15.2, completion=14.8) is True
 
 
-DRY = 120 * 60      # default dry_duration (s)
 MAXS = 720 * 60     # max_session safety net (s)
 
 
-def _due(in_drying, dry_started, session_started, now, dry_eta=None):
-    return time_completion_due(
-        in_drying=in_drying,
-        dry_started_ts=dry_started,
-        dry_eta_ts=dry_eta,
-        session_started_ts=session_started,
-        now=now,
-        dry_duration=DRY,
-        max_session=MAXS,
-    )
+def test_session_too_long_is_the_final_safety_net() -> None:
+    # Force-finish a load that has run max_session (e.g. estimate frozen in the
+    # future, no 'finish'): not before, yes at/after the cap.
+    assert session_too_long(0, MAXS - 1, MAXS) is False
+    assert session_too_long(0, MAXS, MAXS) is True
+    assert session_too_long(0, MAXS + 10_000, MAXS) is True
 
 
-def test_dry_eta_is_preferred_when_captured() -> None:
-    # The washer's own estimated finish (captured at dry-start) governs: not done
-    # before it, done at/after it — regardless of the fixed dry_duration.
-    eta = 95 * 60  # washer estimated done 95 min in (shorter than dry_duration)
-    assert _due(True, 0, 0, eta - 60, dry_eta=eta) is False
-    assert _due(True, 0, 0, eta, dry_eta=eta) is True
-    # A longer estimate than dry_duration is still honored (not cut off early).
-    long_eta = 5 * 60 * 60
-    assert _due(True, 0, 0, DRY + 600, dry_eta=long_eta) is False
-    assert _due(True, 0, 0, long_eta, dry_eta=long_eta) is True
-
-
-def test_dry_duration_used_only_when_no_eta() -> None:
-    # No captured estimate => fall back to the fixed dry_duration after dry-start.
-    assert _due(True, 0, 0, DRY - 60, dry_eta=None) is False
-    assert _due(True, 0, 0, DRY, dry_eta=None) is True
-
-
-def test_dry_timer_inert_while_still_washing() -> None:
-    # Before the dry phase, completion can't fire (this is the false-done the
-    # dead energy meter used to cause mid-wash). dry_started is None until drying.
-    assert _due(False, None, 0, DRY * 5) is False
-    # Even a long wash doesn't finish until the dry phase...
-    assert _due(False, None, 0, MAXS - 60) is False
-    # ...except the absolute max-session safety net.
-    assert _due(False, None, 0, MAXS) is True
-
-
-def test_max_session_backstop_finishes_a_stuck_load() -> None:
-    # Stuck with no usable dry signal at all: the session cap still closes it.
-    assert _due(True, None, 0, MAXS) is True
-    assert _due(True, None, 0, MAXS - 1) is False
+def test_session_too_long_inert_when_not_tracking() -> None:
+    # No session start => never fires (nothing is being tracked).
+    assert session_too_long(None, MAXS * 5, MAXS) is False
 
 
 def _run() -> None:

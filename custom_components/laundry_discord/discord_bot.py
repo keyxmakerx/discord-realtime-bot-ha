@@ -235,19 +235,20 @@ class DiscordBot:
             ),
         )
 
-    async def async_announce_done(self, embed: discord.Embed) -> None:
-        """Post a fresh, push-silent 'done' message with no @mentions.
+    async def async_announce_done(self, content: str) -> None:
+        """Post a fresh, push-silent 'done' nudge as plain text (no embed).
 
-        Used when an unclaimed load finishes: an in-place edit of the original
-        card stays buried in the channel history, so we also drop a new message
-        at the bottom where people will actually see it. ``silent=True`` keeps it
-        visible without firing a push notification, and mentions are disabled so
-        nobody is pinged.
+        Used when an unclaimed load finishes: the original card is edited in place
+        (keeping the embed + Claim button) but stays buried in the channel
+        history, so we drop a short text line at the bottom where people will
+        actually see it. Plain text — not a second embed — so it doesn't look
+        like a duplicate of the card. ``silent=True`` keeps it visible without a
+        push, and mentions are disabled so nobody is pinged.
         """
         await self._client.wait_until_ready()
         channel = await self._get_channel()
         await channel.send(
-            embed=embed,
+            content=content,
             silent=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
