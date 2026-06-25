@@ -68,6 +68,29 @@ def load_is_active(
     return True
 
 
+def offline_completion_due(
+    *,
+    offline_since: float | None,
+    last_eta_ts: float | None,
+    now: float,
+    offline_after: float,
+    eta_grace: float,
+) -> bool:
+    """Whether to complete a load while the washer is offline/unverifiable.
+
+    Fires only when the device has been unavailable for ``offline_after`` AND its
+    last-known completion estimate has passed by ``eta_grace`` (a cushion in case
+    the dry ran long). The caller marks such a completion as unverified. If the
+    device went offline before the ETA passed we can't know it finished, so this
+    stays False (the absolute max-session net is the last resort). Pure → tested.
+    """
+    if offline_since is None or last_eta_ts is None:
+        return False
+    if (now - offline_since) < offline_after:
+        return False
+    return now >= last_eta_ts + eta_grace
+
+
 def session_too_long(
     session_started_ts: float | None, now: float, max_session: float
 ) -> bool:
@@ -224,8 +247,11 @@ class EnergyDetector:
                 if eta_passed and flat_for >= self.eta_grace:
                     self.reset()
                     return EV_FINISHED
-            elif flat_for >= self.idle_timeout:
-                # No usable estimate (offline): energy-only flat backstop.
+            elif energy is not None and flat_for >= self.idle_timeout:
+                # No usable estimate but the meter IS reporting (e.g. an offline
+                # batch load): energy-only flat backstop. When energy is None the
+                # device is unavailable — we have no data, so we do NOT guess a
+                # finish here; the coordinator's offline-aware path handles that.
                 self.reset()
                 return EV_FINISHED
         return None

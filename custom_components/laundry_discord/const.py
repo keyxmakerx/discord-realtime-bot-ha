@@ -61,6 +61,13 @@ MAX_ENERGY_IDLE = 240
 # neither hit 'finish' nor had its completion estimate pass, so a stuck session
 # (e.g. an estimate frozen in the future) can't live forever.
 MAX_SESSION_MINUTES = 720
+# Minutes the washer must be continuously unavailable (cloud/device offline)
+# during a tracked load before we (a) flag the card as offline/unverifiable and
+# (b) allow an offline completion.
+OFFLINE_NOTICE_MINUTES = 60
+# Extra minutes past the last-known ETA before completing a load while offline —
+# a cushion in case the dry ran a bit long. The completion is marked unverified.
+OFFLINE_COMPLETE_GRACE_MINUTES = 30
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5

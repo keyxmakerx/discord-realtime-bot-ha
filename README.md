@@ -92,6 +92,15 @@ are ignored while a wash is already running.
 > reaches HA on reconnect, so that message is necessarily *after the fact*, and a
 > load smaller than the threshold with no phases can't be caught — a cloud limit.
 
+> **Washer goes offline mid-load:** if the washer drops off the cloud (its
+> entities go `unavailable`) for ~1h during a tracked load, the card shows a
+> **"⚠️ Washer offline — can't verify"** notice instead of pretending to track.
+> If by then its **last-known ETA has already passed**, the bot still posts the
+> completion (at ETA + ~30 min, a cushion for a long dry) but **flags it as
+> unverified** ("the washer went offline, couldn't confirm — worth a peek"). It
+> will *not* guess a finish for a load that went offline *before* its ETA passed
+> (it can't know), leaving the absolute max-session cap as the last resort.
+
 > **Wrinkle-prevent:** after a cycle the drum tumbles for hours, nudging the
 > meter. Point the optional **wrinkle-prevent sensor** at the bot and those
 > nudges won't keep a finished load "alive" or spawn a phantom one.

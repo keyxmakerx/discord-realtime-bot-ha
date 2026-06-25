@@ -248,6 +248,16 @@ def test_energy_jump_while_idle_does_not_start() -> None:
     assert det3.observe(0, 18.0, job_is_early=True, machine_idle=True) == EV_STARTED
 
 
+def test_no_meter_data_does_not_idle_complete() -> None:
+    # Device unavailable mid-load: energy reads None (no data). The idle-timeout
+    # backstop must NOT guess a finish — the coordinator's offline-aware path owns
+    # that. (A real offline-batch load reports a number and still completes.)
+    det = EnergyDetector(idle_timeout=IDLE)
+    assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
+    assert _poll_flat(det, 300, None, until=3 * IDLE) is None  # None = unavailable
+    assert det.phase == RUN_ACTIVE
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
