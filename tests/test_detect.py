@@ -25,6 +25,7 @@ _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
 load_is_active = _detect.load_is_active
 session_too_long = _detect.session_too_long
+offline_completion_due = _detect.offline_completion_due
 
 # Load const by path too (no Home Assistant imports) so the phase sets the test
 # uses stay in lockstep with the integration.
@@ -137,6 +138,41 @@ def test_session_too_long_is_the_final_safety_net() -> None:
 def test_session_too_long_inert_when_not_tracking() -> None:
     # No session start => never fires (nothing is being tracked).
     assert session_too_long(None, MAXS * 5, MAXS) is False
+
+
+OFF = 60 * 60       # offline_after (s)
+EGRACE = 30 * 60    # offline completion grace past the last ETA (s)
+
+
+def _offdue(offline_since, last_eta_ts, now):
+    return offline_completion_due(
+        offline_since=offline_since,
+        last_eta_ts=last_eta_ts,
+        now=now,
+        offline_after=OFF,
+        eta_grace=EGRACE,
+    )
+
+
+def test_offline_completion_needs_long_offline_and_passed_eta() -> None:
+    # Offline 70 min, ETA was 40 min ago (> 30 grace) => complete (unverified).
+    assert _offdue(offline_since=0, last_eta_ts=30 * 60, now=70 * 60) is True
+
+
+def test_offline_completion_waits_for_eta_plus_grace() -> None:
+    # Offline long enough, but only 10 min past the ETA (< 30 grace) => not yet.
+    assert _offdue(offline_since=0, last_eta_ts=60 * 60, now=70 * 60) is False
+
+
+def test_offline_completion_needs_sustained_offline() -> None:
+    # ETA long passed, but offline only 20 min (< 60) => don't fire on a blip.
+    assert _offdue(offline_since=50 * 60, last_eta_ts=0, now=70 * 60) is False
+
+
+def test_offline_completion_inert_without_offline_or_eta() -> None:
+    # Online (no offline_since) or no known ETA => never fires.
+    assert _offdue(offline_since=None, last_eta_ts=0, now=10 * 60 * 60) is False
+    assert _offdue(offline_since=0, last_eta_ts=None, now=10 * 60 * 60) is False
 
 
 def _run() -> None:

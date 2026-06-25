@@ -55,6 +55,8 @@ from .const import (
     MACHINE_RUN,
     MACHINE_STOP,
     MAX_SESSION_MINUTES,
+    OFFLINE_COMPLETE_GRACE_MINUTES,
+    OFFLINE_NOTICE_MINUTES,
     MIDCYCLE_PHASES,
     PROGRESS_PHASES,
     UNAVAILABLE_STATES,
@@ -78,6 +80,7 @@ from .detect import (
     RUN_ACTIVE,
     RUN_IDLE,
     EnergyDetector,
+    offline_completion_due,
     session_too_long,
 )
 from .discord_bot import ClaimView, DiscordBot
@@ -132,6 +135,12 @@ class LaundryCoordinator:
         # completion ETA freshness and back the absolute max-session safety net.
         # None whenever no load is being tracked.
         self._session_started_ts: float | None = None
+        # Offline tracking: when the washer first went unavailable during this
+        # load, the last completion estimate we saw, and whether the load was
+        # completed while offline (so the 'done' message is flagged unverified).
+        self._offline_since: float | None = None
+        self._last_eta_ts: float | None = None
+        self._offline_unverified: bool = False
         # The energy-primary liveness core: the single source of truth for load
         # start/finish. job_state/machine_state are only accelerants + enrichment
         # feeding it; they can never override the meter. See detect.EnergyDetector.
@@ -204,6 +213,16 @@ class LaundryCoordinator:
     def max_session(self) -> int:
         """Seconds before a tracked load is force-finished as a safety net."""
         return MAX_SESSION_MINUTES * 60
+
+    @property
+    def offline_after(self) -> int:
+        """Seconds the washer must be offline before we flag it / offline-finish."""
+        return OFFLINE_NOTICE_MINUTES * 60
+
+    @property
+    def offline_complete_grace(self) -> int:
+        """Seconds past the last-known ETA before an offline completion fires."""
+        return OFFLINE_COMPLETE_GRACE_MINUTES * 60
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -354,6 +373,9 @@ class LaundryCoordinator:
         self._energy_start = data.get("energy_start")
         self._water_start = data.get("water_start")
         self._session_started_ts = data.get("session_started_ts")
+        self._offline_since = data.get("offline_since")
+        self._last_eta_ts = data.get("last_eta_ts")
+        self._offline_unverified = data.get("offline_unverified", False)
         # Restore the liveness detector so a load in progress (or its baseline)
         # survives a restart and a load that ran during downtime is caught.
         det = data.get("detector") or {}
@@ -384,6 +406,9 @@ class LaundryCoordinator:
                 "energy_start": self._energy_start,
                 "water_start": self._water_start,
                 "session_started_ts": self._session_started_ts,
+                "offline_since": self._offline_since,
+                "last_eta_ts": self._last_eta_ts,
+                "offline_unverified": self._offline_unverified,
                 "detector": {
                     "phase": self._detector.phase,
                     "last_energy": self._detector.last_energy,
@@ -424,6 +449,37 @@ class LaundryCoordinator:
         st = self.hass.states.get(self.wrinkle_entity) if self.wrinkle_entity else None
         return st is not None and st.state == "on"
 
+    def _washer_online(self) -> bool:
+        """True if any key washer entity is reporting a real value.
+
+        When the device/cloud drops, all its entities go ``unavailable`` together
+        (observed), so 'none readable' = the washer is offline.
+        """
+        for ent in (
+            self.job_state_entity,
+            self.running_entity,
+            self.energy_entity,
+            self.eta_entity,
+        ):
+            st = self.hass.states.get(ent) if ent else None
+            if st is not None and st.state not in UNAVAILABLE_STATES | {"", None}:
+                return True
+        return False
+
+    @callback
+    def _track_offline(self) -> None:
+        """Maintain ``_offline_since`` from current availability (called per feed)."""
+        if self._washer_online():
+            self._offline_since = None
+        elif self._offline_since is None:
+            self._offline_since = dt_util.utcnow().timestamp()
+
+    def _offline_for(self) -> float:
+        """Seconds the washer has been continuously offline (0 if online)."""
+        if self._offline_since is None:
+            return 0.0
+        return dt_util.utcnow().timestamp() - self._offline_since
+
     def _eta_status(self) -> tuple[bool, bool]:
         """(has_eta, eta_passed) for the washer's own completion estimate.
 
@@ -432,7 +488,8 @@ class LaundryCoordinator:
         load (``last_changed`` before this session started) is treated as no
         estimate, so a stale ETA can't drive completion. ``eta_passed`` is True
         once that estimate is in the past. Both False when no load is tracked or
-        completion_time is unavailable (a genuinely offline load).
+        completion_time is unavailable (a genuinely offline load). Also snapshots
+        the last good estimate into ``_last_eta_ts`` for the offline-completion.
         """
         if self._session_started_ts is None:
             return (False, False)
@@ -452,20 +509,33 @@ class LaundryCoordinator:
         margin = self.confirm_delay + 300
         if st.last_changed.timestamp() < self._session_started_ts - margin:
             return (False, False)  # stale estimate frozen from a previous load
+        self._last_eta_ts = target.timestamp()  # remember for offline completion
         return (True, dt_util.utcnow() >= target)
 
     @callback
     def _check_time_completion(self, _now=None) -> None:
-        """Absolute max-session safety net (job 'finish' / the ETA gate normally
-        complete a load far earlier). Called from the periodic ticks.
+        """Time-based completions on the periodic ticks (job 'finish' / the ETA
+        gate normally complete far earlier).
+
+        - **Offline completion:** the washer has been unavailable a long time AND
+          its last-known ETA has passed (+grace) — finish, flagged *unverified*.
+        - **Max-session:** absolute safety net so a stuck session can't live on.
         """
         if self.stage not in (STAGE_WASHING, STAGE_DRYING):
             return
-        if session_too_long(
-            self._session_started_ts,
-            dt_util.utcnow().timestamp(),
-            float(self.max_session),
+        now = dt_util.utcnow().timestamp()
+        if offline_completion_due(
+            offline_since=self._offline_since,
+            last_eta_ts=self._last_eta_ts,
+            now=now,
+            offline_after=float(self.offline_after),
+            eta_grace=float(self.offline_complete_grace),
         ):
+            _LOGGER.debug("Offline completion (washer unavailable, ETA passed)")
+            self._offline_unverified = True
+            self.hass.async_create_task(self._async_handle_finished())
+            return
+        if session_too_long(self._session_started_ts, now, float(self.max_session)):
             _LOGGER.debug("Max-session safety completion (stage=%s)", self.stage)
             self.hass.async_create_task(self._async_handle_finished())
 
@@ -482,6 +552,7 @@ class LaundryCoordinator:
         one-shot restore), so a transient phase flap can never start a load — the
         energy meter remains the authority for everything else.
         """
+        self._track_offline()
         phase = self._job_phase()
         is_real = job_accel and phase in REAL_PHASES and phase != JOB_STATE_FINISH
         is_early = is_real and phase not in MIDCYCLE_PHASES
@@ -753,6 +824,9 @@ class LaundryCoordinator:
                 self._water_start = self._entity_float(self.water_entity)
             # Anchor the ETA-freshness check + max-session net to this load.
             self._session_started_ts = dt_util.utcnow().timestamp()
+            self._offline_since = None
+            self._last_eta_ts = None
+            self._offline_unverified = False
 
             # The start post is a normal, visible message with the Claim button
             # so people can call dibs early. It never @mentions anyone — the only
@@ -801,11 +875,21 @@ class LaundryCoordinator:
             # path completed the load (dry timer, job 'finish', energy backstop).
             self._detector.reset()
             self._session_started_ts = None
+            self._offline_since = None
+            self._last_eta_ts = None
+            unverified = self._offline_unverified
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
             embed = self.build_embed()
             view = ClaimView(self, show="unclaim" if claimed else "claim")
+            # Unverified (offline) completions hedge the wording.
+            done = "should be done" if unverified else "done"
+            unv = (
+                " ⚠️ the washer went **offline**, so I couldn't verify — worth a peek."
+                if unverified
+                else ""
+            )
             try:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed, view=view)
@@ -813,14 +897,14 @@ class LaundryCoordinator:
                     # Quiet mode: name them, but no @mention and no push — a
                     # visible "done" that won't wake them.
                     await self.bot.async_announce_done(
-                        f"🌙 {self.claimed_by}, your laundry's done — "
-                        "don't forget the lint tray!"
+                        f"🌙 {self.claimed_by}, your laundry's {done} — "
+                        f"don't forget the lint tray!{unv}"
                     )
                 elif claimed and self.ping_claimant_on_complete:
                     # The one push per load: @mention the claimant.
                     await self.bot.async_send_ping(
-                        f"<@{self.claimed_by_id}> 🧺 Your laundry's done — "
-                        "don't forget the lint tray!"
+                        f"<@{self.claimed_by_id}> 🧺 Your laundry's {done} — "
+                        f"don't forget the lint tray!{unv}"
                     )
                 elif not claimed:
                     # Nobody claimed it: no @ping, but drop a short, push-silent
@@ -828,11 +912,12 @@ class LaundryCoordinator:
                     # is visible (the original card above keeps the Claim button).
                     # Plain text, not a second embed, so it isn't a duplicate card.
                     await self.bot.async_announce_done(
-                        "🧺 **Laundry's done and up for grabs** — come move it, "
-                        "and don't forget the **lint tray**!"
+                        f"🧺 **Laundry's {done} and up for grabs** — come move it, "
+                        f"and don't forget the **lint tray**!{unv}"
                     )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
+            self._offline_unverified = False
             await self._async_save()
             self._notify_entities()
 
@@ -850,6 +935,9 @@ class LaundryCoordinator:
             self._energy_start = self._entity_float(self.energy_entity)
             self._water_start = self._entity_float(self.water_entity)
             self._session_started_ts = dt_util.utcnow().timestamp()
+            self._offline_since = None
+            self._last_eta_ts = None
+            self._offline_unverified = False
             # Visible, but never a claim button and never a ping.
             try:
                 self.message_id = await self.bot.async_post(
@@ -874,6 +962,9 @@ class LaundryCoordinator:
             self._stop_eta_timer()
             self._detector.reset()  # keep the detector in lockstep
             self._session_started_ts = None
+            self._offline_since = None
+            self._last_eta_ts = None
+            self._offline_unverified = False
             embed = self._selfclean_embed(done=True)
             try:
                 if self.message_id:
@@ -1097,6 +1188,7 @@ class LaundryCoordinator:
             )
             self._add_progress_and_eta(embed)
             self._add_claimant(embed)
+            self._add_offline_notice(embed)
         elif self.stage == STAGE_DRYING:
             desc = "Pull out anything you don't want dried!"
             if self.paused:
@@ -1108,6 +1200,7 @@ class LaundryCoordinator:
             )
             self._add_progress_and_eta(embed)
             self._add_claimant(embed)
+            self._add_offline_notice(embed)
         elif self.stage == STAGE_DONE_WAITING:
             if self.claimed_by and self.claimed_by != UNCLAIMED:
                 embed = discord.Embed(
@@ -1130,6 +1223,15 @@ class LaundryCoordinator:
             usage = self._usage_text()
             if usage:
                 embed.add_field(name="This load used", value=usage, inline=False)
+            if self._offline_unverified:
+                embed.add_field(
+                    name="⚠️ Unverified",
+                    value=(
+                        "The washer was **offline** at the end, so I couldn't "
+                        "confirm it actually finished — worth a quick check."
+                    ),
+                    inline=False,
+                )
         else:
             embed = discord.Embed(
                 title="Laundry", description="Idle.", color=_COLOR_CLAIMED
@@ -1151,6 +1253,20 @@ class LaundryCoordinator:
             if self.quiet:
                 value += "  ·  🌙 quiet (named, not pinged)"
             embed.add_field(name="Claimed by", value=value, inline=False)
+
+    def _add_offline_notice(self, embed: discord.Embed) -> None:
+        """Warn on the live card when the washer has been offline a while."""
+        offline = self._offline_for()
+        if offline >= self.offline_after:
+            mins = int(offline // 60)
+            embed.add_field(
+                name="⚠️ Washer offline",
+                value=(
+                    f"No data from the washer for ~{mins} min — can't verify "
+                    "progress right now. I'll still post when it should be done."
+                ),
+                inline=False,
+            )
 
     def _usage_text(self) -> str | None:
         """Energy/water used this load (meter delta since start), or None."""
