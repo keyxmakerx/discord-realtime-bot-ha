@@ -155,6 +155,7 @@ class EnergyDetector:
         wrinkle_active: bool = False,
         has_eta: bool = False,
         eta_passed: bool = False,
+        machine_idle: bool = False,
     ) -> str | None:
         """Process one sample; return an event or ``None``.
 
@@ -171,7 +172,9 @@ class EnergyDetector:
         has passed AND the meter has been flat for ``eta_grace`` — so a frozen or
         dead meter can't fire early, and a stalled job_state can't block it.
         Without an estimate (offline), the plain ``idle_timeout`` flat-energy
-        backstop applies instead.
+        backstop applies instead. ``machine_idle`` is true when the washer
+        reports stopped/idle; it vetoes an energy-*jump* start (meter catch-up on
+        a reconnect is not a load), but never blocks a wash-phase start.
         """
         rose = False
         jumped = False
@@ -196,7 +199,11 @@ class EnergyDetector:
             )
             # Start on: an energy jump (offline batch), the early-phase accelerant
             # (online, even while the meter lags), or a corroborated catch-up.
-            if jumped or job_is_early or catchup:
+            # An energy jump is ignored while the washer reports idle/stopped
+            # (``machine_idle``): on a reconnect the meter catches up in one step
+            # while the machine is off — that's not a load. A real load run shows
+            # a wash phase (job_is_early/catchup) or a non-stopped machine.
+            if (jumped and not machine_idle) or job_is_early or catchup:
                 self.phase = RUN_ACTIVE
                 self.last_rise_ts = ts
                 return EV_STARTED

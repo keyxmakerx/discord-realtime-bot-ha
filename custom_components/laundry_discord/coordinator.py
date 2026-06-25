@@ -497,6 +497,7 @@ class LaundryCoordinator:
             wrinkle_active=self._wrinkle_active(),
             has_eta=has_eta,
             eta_passed=eta_passed,
+            machine_idle=self._machine_state() == MACHINE_STOP,
         )
         if ev == EV_STARTED:
             self._on_detector_started(phase)

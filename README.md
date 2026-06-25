@@ -84,7 +84,10 @@ are ignored while a wash is already running.
 > `job_state` never reports a phase — but the meter jumps in one batch when the
 > cloud reconnects. A single energy jump of `energy_load_jump` kWh (default
 > **0.3**) is treated as a load that ran while offline, and a catch-up message is
-> posted. Slow standby/wrinkle-prevent creep (small per-sample steps) and meter
+> posted — **unless** the washer is reporting **stopped/idle** at that moment, in
+> which case the jump is taken as harmless meter catch-up on reconnect, not a
+> load (this prevents a false "running" right after the device comes back online).
+> Slow standby/wrinkle-prevent creep (small per-sample steps) and meter
 > resets (a decrease) never trip it. Telemetry for a fully offline load only
 > reaches HA on reconnect, so that message is necessarily *after the fact*, and a
 > load smaller than the threshold with no phases can't be caught — a cloud limit.
