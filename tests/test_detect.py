@@ -24,6 +24,7 @@ sys.modules[_spec.name] = _detect  # dataclass needs the module registered
 _spec.loader.exec_module(_detect)
 energy_jumped = _detect.energy_jumped
 load_is_active = _detect.load_is_active
+session_too_long = _detect.session_too_long
 
 # Load const by path too (no Home Assistant imports) so the phase sets the test
 # uses stay in lockstep with the integration.
@@ -120,6 +121,22 @@ def test_frozen_late_phase_does_not_restart() -> None:
 def test_real_midcycle_catchup_starts() -> None:
     # Same late phase but the meter has moved past completion = a real catch-up.
     assert _active("drying", energy=15.2, completion=14.8) is True
+
+
+MAXS = 720 * 60     # max_session safety net (s)
+
+
+def test_session_too_long_is_the_final_safety_net() -> None:
+    # Force-finish a load that has run max_session (e.g. estimate frozen in the
+    # future, no 'finish'): not before, yes at/after the cap.
+    assert session_too_long(0, MAXS - 1, MAXS) is False
+    assert session_too_long(0, MAXS, MAXS) is True
+    assert session_too_long(0, MAXS + 10_000, MAXS) is True
+
+
+def test_session_too_long_inert_when_not_tracking() -> None:
+    # No session start => never fires (nothing is being tracked).
+    assert session_too_long(None, MAXS * 5, MAXS) is False
 
 
 def _run() -> None:

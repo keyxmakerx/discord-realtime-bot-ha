@@ -20,7 +20,6 @@ CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
-CONF_ETA_IDLE_GRACE = "eta_idle_grace"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -51,20 +50,17 @@ MAX_CONFIRM_DELAY = 300
 # Minutes the energy meter must be FLAT (no kWh increase) before a tracked cycle
 # is considered done — the reliable completion signal when this washer's
 # job_state/machine_state freeze. Must exceed the active low-power update gap.
+# Minutes the energy meter must be flat to finish a load — used ONLY as the
+# offline backstop, when the washer's own completion estimate is unavailable. A
+# normal (online) load completes on that estimate + a short settle, or on
+# job_state='finish', not on this.
 DEFAULT_ENERGY_IDLE = 60
 MIN_ENERGY_IDLE = 10
 MAX_ENERGY_IDLE = 240
-# Minutes the energy meter must be FLAT *after the washer's own completion time
-# has already passed* before a tracked cycle is closed. The completion-time
-# sensor is the only signal that spans the (barely-metered) dry phase, so once
-# it has elapsed a short flat-energy confirmation is enough to finish — far
-# faster than the full energy-idle backstop above, and it rescues loads whose
-# job_state/machine_state freeze on 'drying' and never reach 'finish'. Must stay
-# above the meter's active update gap (~15 min) so an ordinary between-readings
-# gap inside a live cycle can never be mistaken for the end.
-DEFAULT_ETA_IDLE_GRACE = 30
-MIN_ETA_IDLE_GRACE = 15
-MAX_ETA_IDLE_GRACE = 120
+# Absolute safety net (minutes): force-finish a tracked load that has somehow
+# neither hit 'finish' nor had its completion estimate pass, so a stuck session
+# (e.g. an estimate frozen in the future) can't live forever.
+MAX_SESSION_MINUTES = 720
 # How long (minutes) to keep showing the last-known ETA when the completion
 # sensor goes unavailable, so a connection flap never flickers the embed.
 DEFAULT_AVAILABILITY_GRACE = 5

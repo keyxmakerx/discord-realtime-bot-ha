@@ -35,7 +35,6 @@ from .const import (
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
-    CONF_ETA_IDLE_GRACE,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
@@ -47,7 +46,6 @@ from .const import (
     DEFAULT_ENERGY_ENTITY,
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
-    DEFAULT_ETA_IDLE_GRACE,
     DEFAULT_ETA_INTERVAL,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
@@ -56,6 +54,7 @@ from .const import (
     MACHINE_PAUSE,
     MACHINE_RUN,
     MACHINE_STOP,
+    MAX_SESSION_MINUTES,
     MIDCYCLE_PHASES,
     PROGRESS_PHASES,
     UNAVAILABLE_STATES,
@@ -73,7 +72,14 @@ from .const import (
     STORAGE_VERSION,
     UNCLAIMED,
 )
-from .detect import EV_FINISHED, EV_STARTED, RUN_ACTIVE, RUN_IDLE, EnergyDetector
+from .detect import (
+    EV_FINISHED,
+    EV_STARTED,
+    RUN_ACTIVE,
+    RUN_IDLE,
+    EnergyDetector,
+    session_too_long,
+)
 from .discord_bot import ClaimView, DiscordBot
 
 _LOGGER = logging.getLogger(__name__)
@@ -119,10 +125,9 @@ class LaundryCoordinator:
         # measurable, e.g. a mid-cycle catch-up where there's no true baseline).
         self._energy_start: float | None = None
         self._water_start: float | None = None
-        # Wall-clock (unix) time the current session started. Used to tell a
-        # fresh completion-time (published during this cycle) from one frozen at
-        # the previous load's value, so the ETA-grace finish can't close the
-        # next load early. None whenever no load is being tracked.
+        # Wall-clock (unix) time the current session started — used to gate the
+        # completion ETA freshness and back the absolute max-session safety net.
+        # None whenever no load is being tracked.
         self._session_started_ts: float | None = None
         # The energy-primary liveness core: the single source of truth for load
         # start/finish. job_state/machine_state are only accelerants + enrichment
@@ -130,7 +135,6 @@ class LaundryCoordinator:
         self._detector = EnergyDetector(
             start_jump=self.energy_load_jump,
             idle_timeout=float(self.energy_idle_timeout),
-            eta_grace=float(self.eta_idle_grace),
         )
         # Unix timestamps of job_state -> unavailable transitions (connection
         # health). Pruned to a rolling 24h window.
@@ -194,14 +198,9 @@ class LaundryCoordinator:
         return int(self._cfg.get(CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE)) * 60
 
     @property
-    def eta_idle_grace(self) -> int:
-        """Seconds of flat energy, once the washer's ETA has passed, to finish.
-
-        Shorter than ``energy_idle_timeout``: the appliance's completion time is
-        the only signal that spans the dry, so once it elapses a brief settle is
-        enough to close the load instead of waiting out the full backstop.
-        """
-        return int(self._cfg.get(CONF_ETA_IDLE_GRACE, DEFAULT_ETA_IDLE_GRACE)) * 60
+    def max_session(self) -> int:
+        """Seconds before a tracked load is force-finished as a safety net."""
+        return MAX_SESSION_MINUTES * 60
 
     @property
     def ping_claimant_on_complete(self) -> bool:
@@ -285,6 +284,7 @@ class LaundryCoordinator:
         # energy jump while idle, and drives the time-based completion even when
         # no state events arrive) and keep the health sensor fresh.
         self._feed_detector()
+        self._check_time_completion()
         self._notify_entities()
 
     async def async_run_bot(self) -> None:
@@ -419,30 +419,50 @@ class LaundryCoordinator:
         st = self.hass.states.get(self.wrinkle_entity) if self.wrinkle_entity else None
         return st is not None and st.state == "on"
 
-    def _eta_passed(self) -> bool:
-        """Has the washer's own completion time for *this* cycle already passed?
+    def _eta_status(self) -> tuple[bool, bool]:
+        """(has_eta, eta_passed) for the washer's own completion estimate.
 
-        The completion-time sensor is the one signal that covers the dry phase,
-        but it freezes at the previous load's value when the cloud goes stale.
-        So we only trust it when it was (re)published during the current session
-        (``last_changed`` at/after the session start) — a frozen, stale ETA from
-        an earlier load is ignored, which keeps it from finishing the next load
-        early. Returns False whenever no load is tracked or the ETA is missing.
+        ``has_eta`` is True when completion_time holds a real value that was
+        (re)published during the current cycle — a value frozen from a previous
+        load (``last_changed`` before this session started) is treated as no
+        estimate, so a stale ETA can't drive completion. ``eta_passed`` is True
+        once that estimate is in the past. Both False when no load is tracked or
+        completion_time is unavailable (a genuinely offline load).
         """
         if self._session_started_ts is None:
-            return False
+            return (False, False)
         st = self.hass.states.get(self.eta_entity)
         if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
-            return False
+            return (False, False)
         target = dt_util.parse_datetime(st.state)
         if target is None:
-            return False
+            return (False, False)
         if target.tzinfo is None:
             target = dt_util.as_utc(target)
-        # Reject an ETA frozen from a previous load (stale-stuck integration).
-        if st.last_changed.timestamp() < self._session_started_ts:
-            return False
-        return dt_util.utcnow() >= target
+        # Treat the estimate as belonging to this cycle if it was last published
+        # around or after the session began. The margin covers confirm_delay (the
+        # session starts that long after the washer first sets the estimate) so we
+        # don't wrongly reject a fresh estimate and fall back to the offline
+        # backstop; a value frozen from a *previous* load changed long before this.
+        margin = self.confirm_delay + 300
+        if st.last_changed.timestamp() < self._session_started_ts - margin:
+            return (False, False)  # stale estimate frozen from a previous load
+        return (True, dt_util.utcnow() >= target)
+
+    @callback
+    def _check_time_completion(self, _now=None) -> None:
+        """Absolute max-session safety net (job 'finish' / the ETA gate normally
+        complete a load far earlier). Called from the periodic ticks.
+        """
+        if self.stage not in (STAGE_WASHING, STAGE_DRYING):
+            return
+        if session_too_long(
+            self._session_started_ts,
+            dt_util.utcnow().timestamp(),
+            float(self.max_session),
+        ):
+            _LOGGER.debug("Max-session safety completion (stage=%s)", self.stage)
+            self.hass.async_create_task(self._async_handle_finished())
 
     @callback
     def _feed_detector(self, _now=None, *, job_accel: bool = False) -> None:
@@ -461,6 +481,7 @@ class LaundryCoordinator:
         is_real = job_accel and phase in REAL_PHASES and phase != JOB_STATE_FINISH
         is_early = is_real and phase not in MIDCYCLE_PHASES
         is_finish = job_accel and phase == JOB_STATE_FINISH
+        has_eta, eta_passed = self._eta_status()
         before = (self._detector.last_energy, self._detector.last_rise_ts)
         ev = self._detector.observe(
             dt_util.utcnow().timestamp(),
@@ -469,7 +490,8 @@ class LaundryCoordinator:
             job_is_real=is_real,
             job_is_finish=is_finish,
             wrinkle_active=self._wrinkle_active(),
-            eta_passed=self._eta_passed(),
+            has_eta=has_eta,
+            eta_passed=eta_passed,
         )
         if ev == EV_STARTED:
             self._on_detector_started(phase)
@@ -722,7 +744,7 @@ class LaundryCoordinator:
             else:
                 self._energy_start = self._entity_float(self.energy_entity)
                 self._water_start = self._entity_float(self.water_entity)
-            # Anchor "is the ETA fresh?" to this load's start (see _eta_passed).
+            # Anchor the ETA-freshness check + max-session net to this load.
             self._session_started_ts = dt_util.utcnow().timestamp()
 
             # The start post is a normal, visible message with the Claim button
@@ -769,8 +791,9 @@ class LaundryCoordinator:
             self.stage = STAGE_DONE_WAITING
             self.paused = False
             # Keep the detector in lockstep with the session, regardless of which
-            # path completed the load (detector idle-timeout, job 'finish', etc.).
+            # path completed the load (dry timer, job 'finish', energy backstop).
             self._detector.reset()
+            self._session_started_ts = None
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
@@ -786,11 +809,14 @@ class LaundryCoordinator:
                         "don't forget the lint tray!"
                     )
                 elif not claimed:
-                    # Nobody claimed it: no @ping, but still post a fresh,
-                    # push-silent 'done' message so the finished load is visible
-                    # at the bottom of the channel, not just a buried in-place
-                    # edit of the original card.
-                    await self.bot.async_announce_done(embed)
+                    # Nobody claimed it: no @ping, but drop a short, push-silent
+                    # text nudge at the bottom of the channel so the finished load
+                    # is visible (the original card above keeps the Claim button).
+                    # Plain text, not a second embed, so it isn't a duplicate card.
+                    await self.bot.async_announce_done(
+                        "🧺 **Laundry's done and up for grabs** — come move it, "
+                        "and don't forget the **lint tray**!"
+                    )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
             await self._async_save()
@@ -833,6 +859,7 @@ class LaundryCoordinator:
                 return
             self._stop_eta_timer()
             self._detector.reset()  # keep the detector in lockstep
+            self._session_started_ts = None
             embed = self._selfclean_embed(done=True)
             try:
                 if self.message_id:
@@ -904,9 +931,10 @@ class LaundryCoordinator:
             self._eta_unsub = None
 
     async def _async_eta_tick(self, now) -> None:
-        # Drive the detector (this is the regular feed that fires the time-based
-        # completion while a cycle is active), then refresh the live embed.
+        # Drive the detector + the time-based completion (dry timer / max
+        # session) while a cycle is active, then refresh the live embed.
         self._feed_detector()
+        self._check_time_completion()
         if not self.message_id:
             return
         if self.stage in (STAGE_WASHING, STAGE_DRYING):

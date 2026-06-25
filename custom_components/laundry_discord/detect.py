@@ -68,6 +68,19 @@ def load_is_active(
     return True
 
 
+def session_too_long(
+    session_started_ts: float | None, now: float, max_session: float
+) -> bool:
+    """Absolute safety net: a tracked load that has run ``max_session`` is forced
+    done so a stuck session (estimate frozen in the future, no 'finish') can
+    never live forever. Pure so it's unit-tested without the HA harness.
+    """
+    return (
+        session_started_ts is not None
+        and (now - session_started_ts) >= max_session
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Energy-primary liveness state machine (the permanent detection core).
 #
@@ -99,16 +112,18 @@ class EnergyDetector:
       * **Back-to-back loads** — after a finish it returns to idle, so the next
         load re-fires ``EV_STARTED`` (the caller supersedes the lingering done
         message). This is the case the old completion-energy guard broke.
-      * **Drying never "finishes"** — on this washer the dry phase is barely
-        metered and job_state/machine_state freeze on 'drying' forever, so a
-        flat-energy timeout alone is either premature (fires mid-dry) or never
-        clean. When the caller passes ``eta_passed`` (the appliance's own
-        completion time has elapsed), a much shorter ``eta_grace`` of flat
-        energy closes the load near its true end. The caller only sets it for a
-        fresh ETA (not one frozen from the previous load), so it can't finish
-        the next load early.
-      * **Removed early / abandoned mid-cycle** — energy simply goes flat, so
-        the load finishes after ``idle_timeout`` like any other.
+      * **Unreliable meter (this washer)** — the energy meter can freeze, reset,
+        or read flat for an entire load, so it cannot time completion on its own.
+        When the washer's own estimate is available (``has_eta``) completion is
+        gated on it: the load finishes only once that estimate has passed
+        (``eta_passed``) AND the meter has settled for ``eta_grace``. This both
+        (a) lets a frozen/flat meter never fire early — it must wait for the
+        estimate — and (b) does not depend on job_state advancing, so a job_state
+        frozen mid-cycle can't block completion. The plain ``idle_timeout`` is
+        used ONLY when there's no usable estimate (``has_eta`` False, a truly
+        offline load).
+      * **Removed early / abandoned (offline)** — with no estimate, energy goes
+        flat and the load finishes after ``idle_timeout``.
       * **Pause to add a sock, then resume** — a gap shorter than
         ``idle_timeout`` does not finish the load; the meter resuming just
         re-arms the timer.
@@ -121,8 +136,8 @@ class EnergyDetector:
     """
 
     start_jump: float = 0.3   # kWh rise in one sample => a load (offline/batch)
-    idle_timeout: float = 3600.0  # s of no load-energy rise => finished
-    eta_grace: float = 1800.0  # s of flat energy *after* the ETA => finished
+    idle_timeout: float = 3600.0  # s flat => finished, ONLY when no usable ETA
+    eta_grace: float = 1200.0  # s the meter must settle after the ETA passes
 
     phase: str = RUN_IDLE
     last_energy: float | None = None
@@ -138,6 +153,7 @@ class EnergyDetector:
         job_is_real: bool = False,
         job_is_finish: bool = False,
         wrinkle_active: bool = False,
+        has_eta: bool = False,
         eta_passed: bool = False,
     ) -> str | None:
         """Process one sample; return an event or ``None``.
@@ -147,11 +163,15 @@ class EnergyDetector:
         wash); ``job_is_real`` marks any real wash phase (for a mid-cycle
         catch-up); ``job_is_finish`` marks job_state == 'finish'.
         ``wrinkle_active`` is the optional wrinkle-prevent sensor — when true, a
-        rise is attributed to tumbling, not the load. ``eta_passed`` is true when
-        the appliance's own (current-cycle) completion time has elapsed; it lets
-        a settled meter finish on the shorter ``eta_grace`` instead of waiting
-        out the full ``idle_timeout`` — the only way to cleanly close a load
-        whose state sensors freeze on 'drying'.
+        rise is attributed to tumbling, not the load.
+
+        Completion gating: ``has_eta`` is true when the washer's own completion
+        estimate (for this cycle) is available; ``eta_passed`` is true once that
+        estimate has elapsed. With an estimate, the load finishes only when it
+        has passed AND the meter has been flat for ``eta_grace`` — so a frozen or
+        dead meter can't fire early, and a stalled job_state can't block it.
+        Without an estimate (offline), the plain ``idle_timeout`` flat-energy
+        backstop applies instead.
         """
         rose = False
         jumped = False
@@ -190,15 +210,15 @@ class EnergyDetector:
             self.last_rise_ts = ts  # load is still drawing => re-arm the timer
         if self.last_rise_ts is not None:
             flat_for = ts - self.last_rise_ts
-            # The appliance says the cycle is over and the meter has settled:
-            # finish on the shorter ETA grace. This is what closes a load whose
-            # dry isn't metered and whose job/machine_state freeze on 'drying'.
-            # A still-drawing load keeps re-arming above, so a live cycle (even
-            # one whose ETA estimate was too short) can't be cut off here.
-            if eta_passed and flat_for >= self.eta_grace:
-                self.reset()
-                return EV_FINISHED
-            if flat_for >= self.idle_timeout:
+            if has_eta:
+                # The washer's estimate is the gate: finish only once it has
+                # passed and the (unreliable) meter has settled. A frozen/flat
+                # meter can't fire early, and a stalled job_state can't block it.
+                if eta_passed and flat_for >= self.eta_grace:
+                    self.reset()
+                    return EV_FINISHED
+            elif flat_for >= self.idle_timeout:
+                # No usable estimate (offline): energy-only flat backstop.
                 self.reset()
                 return EV_FINISHED
         return None
