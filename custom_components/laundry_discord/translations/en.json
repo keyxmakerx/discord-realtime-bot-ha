@@ -41,7 +41,8 @@
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
           "availability_grace": "Hold last ETA through a connection blip (minutes)",
           "handoff_fallback": "Handoff backstop — ping whoever's next this long after a load finishes when the claimant never tapped \"Emptied it\" (minutes, 0 disables)",
-          "queue_expiry": "\"I'm next\" expiry — drop somebody from the line this long after they tapped it, so a stale line never strands a handoff (hours)"
+          "queue_expiry": "\"I'm next\" expiry — drop somebody from the line this long after they tapped it, so a stale line never strands a handoff (hours)",
+          "show_assistant": "Show the 🤖 assistant button on the card — opens a private panel with the first-time explainer and each person's ping settings (DM / channel / off). Off hides the button; anything already chosen in it keeps working."
         }
       }
     }

@@ -31,6 +31,7 @@ from .const import (
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_QUEUE_EXPIRY,
     CONF_RUNNING_ENTITY,
+    CONF_SHOW_ASSISTANT,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
@@ -45,6 +46,7 @@ from .const import (
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_QUEUE_EXPIRY,
     DEFAULT_RUNNING_ENTITY,
+    DEFAULT_SHOW_ASSISTANT,
     DOMAIN,
     MAX_AVAILABILITY_GRACE,
     MAX_CONFIRM_DELAY,
@@ -168,6 +170,10 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
+            vol.Required(
+                CONF_SHOW_ASSISTANT,
+                default=defaults.get(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -313,6 +319,7 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                         user_input[CONF_HANDOFF_FALLBACK]
                     ),
                     CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
+                    CONF_SHOW_ASSISTANT: user_input[CONF_SHOW_ASSISTANT],
                 }
             )
 

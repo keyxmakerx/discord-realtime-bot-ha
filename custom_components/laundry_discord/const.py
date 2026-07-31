@@ -22,6 +22,7 @@ CONF_AVAILABILITY_GRACE = "availability_grace"
 CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
 CONF_HANDOFF_FALLBACK = "handoff_fallback"
 CONF_QUEUE_EXPIRY = "queue_expiry"
+CONF_SHOW_ASSISTANT = "show_assistant"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -97,6 +98,11 @@ MAX_HANDOFF_FALLBACK = 240
 DEFAULT_QUEUE_EXPIRY = 12
 MIN_QUEUE_EXPIRY = 1
 MAX_QUEUE_EXPIRY = 72
+# Whether the 🤖 button rides along on the card. On by default: the panel is
+# inert until somebody taps it (no pings, no channel lines, no stored record)
+# and it is the only place a newcomer or a guest can find out what the buttons
+# do. Turning it off hides the button entirely — existing prefs are kept.
+DEFAULT_SHOW_ASSISTANT = True
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -107,6 +113,12 @@ PLATFORMS = ["sensor", "binary_sensor"]
 # --- Storage ---
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.session"
+# Per-person preferences live in their OWN store, deliberately not alongside the
+# session (design doc §12): the session store is rewritten on every meter
+# sample and holds the live load, so a bug in the planner half must not be able
+# to corrupt it. Its own version too, so the two schemas can move separately.
+PLANNER_STORAGE_VERSION = 1
+PLANNER_STORAGE_KEY = f"{DOMAIN}.planner"
 
 # --- Dispatcher signal ---
 SIGNAL_UPDATE = f"{DOMAIN}_update"
@@ -123,6 +135,18 @@ NEXT_CUSTOM_ID = "laundry_discord_next"
 # the machine to whoever is next (completion alone doesn't — see the handoff
 # fallback above).
 EMPTIED_CUSTOM_ID = "laundry_discord_emptied"
+# The 🤖 assistant: opens a private (ephemeral) panel — the first-time explainer
+# for somebody who's never used the channel, the settings panel for everybody
+# else. Added last on the card so it renders rightmost; Discord lays buttons out
+# in add order and has no right-align.
+ASSISTANT_CUSTOM_ID = "laundry_discord_assistant"
+# The panel's own buttons. Every one of these must be handed to add_view or it
+# silently stops dispatching after a restart — the panel is ephemeral, but its
+# components dispatch through the same persistent-view registry.
+PANEL_DM_CUSTOM_ID = "laundry_discord_panel_dm"
+PANEL_CHANNEL_CUSTOM_ID = "laundry_discord_panel_channel"
+PANEL_OFF_CUSTOM_ID = "laundry_discord_panel_off"
+PANEL_MONITOR_CUSTOM_ID = "laundry_discord_panel_monitor"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"

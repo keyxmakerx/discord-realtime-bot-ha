@@ -14,7 +14,9 @@ from discord.utils import MISSING
 
 from homeassistant.core import HomeAssistant
 
+from .assistant import AssistantView
 from .const import (
+    ASSISTANT_CUSTOM_ID,
     CLAIM_CUSTOM_ID,
     EMPTIED_CUSTOM_ID,
     NEXT_CUSTOM_ID,
@@ -49,6 +51,23 @@ async def _safe_interaction_error(interaction: discord.Interaction) -> None:
         _LOGGER.debug("Could not send interaction error response", exc_info=True)
 
 
+async def _dm_notice_followup(
+    coordinator: "LaundryCoordinator", interaction: discord.Interaction
+) -> None:
+    """Piggyback the "I couldn't DM you" explainer on a card tap; never raises.
+
+    Design doc §10.5 rule 3 says *any* button, not just 🤖: somebody who has
+    already turned DMs on has no reason to open the panel again, so that is
+    precisely the person whose reminders would go quiet forever with nothing
+    telling them why. Runs after the callback's own response so it is a
+    followup rather than a competing second response.
+    """
+    try:
+        await coordinator.assistant.async_followup_dm_notice(interaction)
+    except Exception:  # noqa: BLE001 - a notice must never break a real tap
+        _LOGGER.debug("Could not follow up with the DM-failure notice", exc_info=True)
+
+
 class _ClaimButton(discord.ui.Button):
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
         super().__init__(
@@ -73,6 +92,7 @@ class _ClaimButton(discord.ui.Button):
                 await interaction.response.send_message(
                     "This load is no longer active.", ephemeral=True
                 )
+            await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001 - never let a bot callback bubble into HA
             _LOGGER.exception("Failed to handle Claim interaction")
             await _safe_interaction_error(interaction)
@@ -100,6 +120,7 @@ class _UnclaimButton(discord.ui.Button):
                 await interaction.response.send_message(
                     "This load is no longer active.", ephemeral=True
                 )
+            await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to handle Unclaim interaction")
             await _safe_interaction_error(interaction)
@@ -135,6 +156,7 @@ class _QuietButton(discord.ui.Button):
                 await interaction.response.send_message(
                     "This load is no longer active.", ephemeral=True
                 )
+            await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to handle Quiet interaction")
             await _safe_interaction_error(interaction)
@@ -183,6 +205,7 @@ class _NextUpButton(discord.ui.Button):
                     embed=self.coordinator.build_embed(),
                     view=view_for(self.coordinator),
                 )
+            await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to handle I'm next interaction")
             await _safe_interaction_error(interaction)
@@ -217,13 +240,45 @@ class _EmptiedButton(discord.ui.Button):
                 await interaction.response.send_message(
                     "This load is no longer active.", ephemeral=True
                 )
+            await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to handle Emptied it interaction")
             await _safe_interaction_error(interaction)
 
 
+class _AssistantButton(discord.ui.Button):
+    """Open the private 🤖 panel (settings, or the first-time explainer).
+
+    Emoji only and no label: it is the least important control on the card and
+    shouldn't compete with the ones that do laundry. It is added **last** so it
+    renders rightmost — Discord lays buttons out in add order and has no
+    right-align, so position is the only lever there is.
+
+    Unlike every other button here it does **not** need a live load: a tap on a
+    week-old card still opens the panel, which matters because someone
+    scrolling back through the channel is exactly the person who has never used
+    it before.
+    """
+
+    def __init__(self, coordinator: "LaundryCoordinator") -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            emoji="🤖",
+            custom_id=ASSISTANT_CUSTOM_ID,
+            row=1,
+        )
+        self.coordinator = coordinator
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.coordinator.assistant.async_open_panel(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to open the assistant panel")
+            await _safe_interaction_error(interaction)
+
+
 class ClaimView(discord.ui.View):
-    """Persistent view holding the Claim / Unclaim / queue buttons.
+    """Persistent view holding the card's Claim / queue / assistant buttons.
 
     Persistent views need ``timeout=None`` and fixed ``custom_id``s so the
     buttons keep working after an HA/bot restart (re-registered via
@@ -235,15 +290,17 @@ class ClaimView(discord.ui.View):
       - ``"both"``    — registration template so every custom_id stays live
         after a restart regardless of the message's current state.
 
-    ``with_next`` / ``with_emptied`` add the queue buttons, and the ``"both"``
-    template forces them on: a ``custom_id`` that was never handed to
-    ``add_view`` silently stops dispatching after a restart, which looks
-    exactly like a dead button and is a bug class this integration has already
-    been bitten by.
+    ``with_next`` / ``with_emptied`` / ``with_assistant`` add the queue and
+    assistant buttons, and the ``"both"`` template forces them on: a
+    ``custom_id`` that was never handed to ``add_view`` silently stops
+    dispatching after a restart, which looks exactly like a dead button and is
+    a bug class this integration has already been bitten by. The template
+    includes 🤖 even when the option hides it, so flipping the option on
+    doesn't leave a dead button until the next restart.
 
-    Rows are explicit — claim/unclaim/quiet on row 0, the queue pair on row 1 —
-    rather than left to Discord's 5-per-row auto-flow, so adding the 🤖 button
-    later doesn't reshuffle the card people have learned.
+    Rows are explicit — claim/unclaim/quiet on row 0, next/emptied/🤖 on row 1
+    (3 of the 5 a row allows) — rather than left to Discord's auto-flow, so the
+    card people have learned doesn't reshuffle when a button comes or goes.
 
     Prefer :func:`view_for` over calling this directly: it is the one place
     that maps coordinator state onto a button set.
@@ -256,6 +313,7 @@ class ClaimView(discord.ui.View):
         show: str = "both",
         with_next: bool = False,
         with_emptied: bool = False,
+        with_assistant: bool = False,
     ) -> None:
         super().__init__(timeout=None)
         template = show == "both"
@@ -268,6 +326,9 @@ class ClaimView(discord.ui.View):
             self.add_item(_NextUpButton(coordinator))
         if with_emptied or template:
             self.add_item(_EmptiedButton(coordinator))
+        # Last, always: rightmost is where it belongs (see _AssistantButton).
+        if with_assistant or template:
+            self.add_item(_AssistantButton(coordinator))
 
 
 def view_for(coordinator: "LaundryCoordinator") -> ClaimView:
@@ -282,6 +343,9 @@ def view_for(coordinator: "LaundryCoordinator") -> ClaimView:
     - ✅ **Emptied it** only makes sense on a *claimed*, finished load that
       hasn't been cleared yet: nobody else can confirm it, and once it's been
       tapped there is nothing left to confirm.
+    - 🤖 **Assistant** rides along on every card unless the option hides it. It
+      is inert until tapped — no pings, no channel lines, nothing stored — and
+      it is the only place a newcomer finds out what the rest of the row does.
     """
     claimed = (
         coordinator.claimed_by != UNCLAIMED and coordinator.claimed_by_id is not None
@@ -296,6 +360,7 @@ def view_for(coordinator: "LaundryCoordinator") -> ClaimView:
             and claimed
             and not coordinator.emptied
         ),
+        with_assistant=coordinator.show_assistant,
     )
 
 
@@ -308,13 +373,17 @@ class LaundryDiscordClient(discord.Client):
         self._view_registered = False
 
     async def on_ready(self) -> None:
-        """Register the persistent Claim view and let the coordinator restore."""
+        """Register the persistent views and let the coordinator restore."""
         if not self._view_registered:
             try:
                 self.add_view(ClaimView(self.coordinator))
+                # The panel's own buttons dispatch through the same registry,
+                # even though the message carrying them is ephemeral — without
+                # this, every panel opened before a restart goes dead.
+                self.add_view(AssistantView(self.coordinator.assistant))
                 self._view_registered = True
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("Failed to register persistent Claim view")
+                _LOGGER.exception("Failed to register persistent views")
         _LOGGER.debug("Discord bot connected as %s", self.user)
         try:
             await self.coordinator.async_on_bot_ready()
@@ -449,6 +518,27 @@ class DiscordBot:
                 users=True, roles=False, everyone=False
             ),
         )
+
+    async def async_dm_user(
+        self, user_id: int | str, content: str, *, view: discord.ui.View | None = None
+    ) -> None:
+        """Send one direct message to a known user ID.
+
+        Deliberately lets exceptions out: the assistant has to tell
+        ``discord.Forbidden`` (error 50007 — "this user has DMs from server
+        members turned off", which Discord never reveals to *them*) apart from
+        a transient failure, because only the first one is worth remembering.
+
+        DMing a bare user ID needs no privileged intent. ``get_user`` is tried
+        first so a cached user costs no HTTP round trip; ``fetch_user`` covers
+        somebody the gateway hasn't sent us yet.
+        """
+        await self._client.wait_until_ready()
+        uid = int(user_id)
+        user = self._client.get_user(uid)
+        if user is None:
+            user = await self._client.fetch_user(uid)
+        await user.send(content=content, view=view)
 
     async def async_announce_done(self, content: str) -> None:
         """Post a fresh, push-silent 'done' nudge as plain text (no embed).

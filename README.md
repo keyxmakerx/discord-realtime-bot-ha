@@ -8,7 +8,9 @@ only push notification is a single **@mention to whoever claimed the load, sent
 when it's done** — everything else updates silently, and if nobody claimed it the
 "done" message is posted with no ping at all. Anyone waiting on the machine can
 tap **🔜 I'm next** and gets their own ping when it's **actually free**, which is
-not the same moment the cycle ends.
+not the same moment the cycle ends. A **🤖** button opens a private panel where a
+newcomer can find out what any of that means and anyone can choose how they'd
+rather be pinged — in the channel (the default), in a DM, or not at all.
 
 - **Domain:** `laundry_discord`
 - **Install:** via [HACS](https://hacs.xyz/) as a custom repository
@@ -46,6 +48,10 @@ For a single load (a "session"):
    get in the queue, and tap it again to get out. The card shows who's waiting
    ("Next up 🔜 Sam, then Ty"), and when the machine is actually free the person
    at the head gets **their own ping**. See below for what "actually free" means.
+7. **The assistant** — the **🤖** button opens a panel **only you can see**: the
+   first-time explainer if you've never used the channel, otherwise your own
+   settings for how you'd rather be pinged. It posts nothing and changes nothing
+   until you tap something in it.
 
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
@@ -184,6 +190,107 @@ The queue is **session state** — it lives in the same store as the claimant an
 resets with the session — and it is **inert when unused**: no taps, no line, no
 field on the card, no extra messages.
 
+### The 🤖 assistant panel
+
+Rightmost on every card is a single **🤖** button. It opens a message that
+**only you can see** — Discord labels it in those words and posts nothing to the
+channel — which is what lets onboarding and personal settings exist here at all.
+The channel carries one card per load and nothing else; anything that's about
+*one person* happens in private or in a DM.
+
+> **Why rightmost, and why one button.** Discord lays buttons out left-to-right
+> in the order they were added and has **no right-alignment**, so "rightmost" is
+> achieved by adding it last — which is also where the least important control
+> belongs. It never competes with the buttons that actually do laundry.
+
+The button works on **any** card, including one from last week with no live load
+behind it. That's deliberate: someone scrolling back through the channel is
+exactly the person who has never used it before.
+
+**First time?** Anyone who hasn't answered the panel gets the explainer rather
+than the settings — the whole onboarding story, in private, with zero channel
+noise:
+
+```
+👋 First time?
+This channel watches the washer and posts one message per load…
+
+🧺 Claim      — call dibs, and I'll tell you when it's done
+🔜 I'm next   — get told when the washer is actually free
+🌙 Quiet      — claim without the ping, for when you're asleep
+✅ Emptied it — you've cleared the drum; whoever's waiting is told
+
+How should I reach you when something's actually for you?
+[ 📬 Yes, DM me ] [ 💬 In the channel ] [ 🚫 No thanks ]
+        Only you can see this
+```
+
+**Returning:**
+
+```
+🤖 Your laundry assistant
+
+  Pings        💬 In the channel, with an @mention
+  Monitoring   👁 on — your loads can be logged
+
+[ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ] [ 👁 Monitoring: on ]
+        Only you can see this
+```
+
+Two settings, and deliberately only two — the week grid, day-guessing and slot
+trades are later phases of the [planner design](docs/rsvp-planner-design.md), and
+a button that does nothing yet is worse than no button:
+
+- **Pings** — where the messages that are **about you** go: your load finishing,
+  and the "washer's free" handoff after you tapped 🔜. Nothing else moves.
+  - **💬 In the channel** — an @mention, exactly as before. **This is the
+    default**, so anyone who never opens the panel keeps getting precisely what
+    they got in v0.16 and earlier. Opting in is a deliberate act.
+  - **📬 DM me** — the same message, sent to you directly, nothing in the
+    channel. If the DM fails it falls back to the channel mention, because a
+    handoff nobody hears is worse than a line in the channel.
+  - **🚫 No pings** — the message is still posted and you're still *named*, but
+    push-silently and with the mention suppressed. It removes the buzz, not the
+    information — the same trade 🌙 Quiet already makes on the card.
+- **Monitoring** — per-person consent to logging your loads, so a later phase can
+  learn the days you usually wash. Nothing is logged yet; this is your answer for
+  when it is, recorded now so the answer exists before the question does. **No
+  stats about anyone are ever shown to the household** — no streaks, no counts,
+  no "who does the most laundry."
+
+#### When Discord won't let the bot DM you
+
+If you have **DMs from server members** turned off, a DM from the bot fails with
+`Forbidden` (error 50007) — and Discord tells the *sender*, never you. So a DM
+that bounces is handled in three steps: the failure is remembered (the bot stops
+trying and uses the channel), the message goes out as a normal channel @mention
+so it isn't lost, and **the next time you open 🤖** the panel leads with the fix:
+
+```
+⚠️ I couldn't DM you
+Two settings control this:
+ • Right-click the server icon → Privacy Settings → allow DMs from members
+ • User Settings → Privacy → allow direct messages from server members
+Until then I'll ping you in the channel instead.
+```
+
+That notice shows **once** per failure — it's information, not nagging. Tapping
+**📬 DM me** again re-arms DM delivery, which is how this self-heals: it reaches
+the only person who can fix it, costs the channel nothing, and the moment they
+fix it the next DM goes through. It is deliberately **not** an alert to the HA
+owner, who can't change somebody else's privacy settings.
+
+> DMing a known user ID needs **no privileged intent and no extra bot
+> permission** — the same as the @mention. **Message Content** stays off.
+
+The panel's preferences live in their **own** `Store` key
+(`laundry_discord.planner`), separate from the session store that holds the live
+load, the claimant and the 🔜 line. That separation is on purpose: the session
+store is rewritten on every meter sample, and a bug on the preferences side must
+not be able to corrupt a load in progress. They survive restarts, unloads and
+resets, and the whole button can be hidden from the card with the **Show the 🤖
+assistant button** option if it's not wanted.
+
 ### Entities it creates
 
 | Entity | Meaning |
@@ -232,7 +339,9 @@ estimate**, which can drift. It is presented as approximate (`~3:40 PM, about
 3. **OAuth2 → URL Generator** → scope **`bot`**; bot permissions:
    **View Channels, Send Messages, Embed Links, Read Message History**. That's
    all — pinging the claimant is a *user* mention, which needs no special
-   permission. Open the generated URL and invite the bot to your server.
+   permission, and neither the 🤖 panel (an interaction response) nor a DM to a
+   known user ID needs one either. Open the generated URL and invite the bot to
+   your server.
 4. Enable **Developer Mode** (User Settings → Advanced), then right-click your
    target channel → **Copy ID** → that's your `channel_id`.
 
@@ -262,6 +371,7 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Ping claimant on complete | `true` | @mention whoever claimed the load when it's done. Turn off for zero pings. |
 | Handoff backstop *(options)* | `25` min | Ping whoever's next this long after a load finishes if the claimant never tapped **✅ Emptied it**. `0` disables the backstop — the tap still works. |
 | "I'm next" expiry *(options)* | `12` h | How long a 🔜 tap stays in the line before it ages out. |
+| Show the 🤖 assistant button *(options)* | `true` | Puts the 🤖 button on the card. It's inert until tapped — no pings, no channel lines, nothing stored — and it's the only place a newcomer finds out what the other buttons do. Turning it off hides the button; anything already chosen in the panel keeps working. |
 
 > **Ping note:** the only push per load is a *user* mention of the claimant, sent
 > as a small separate message when the load finishes. If nobody claimed it, no
@@ -273,6 +383,9 @@ Collected in the UI config flow (options can be changed later without re-adding)
 1. Developer Tools → **Actions** → call `laundry_discord.test_post`.
    - Confirm the embed posts, **Claim** updates it to "Claimed by *you*" (and
      `sensor.laundry_claimed_by` updates in HA), and **Unclaim** reverts it.
+   - The test post also carries **🤖**, so you can open the panel and (by
+     choosing **📬 DM me** and finishing a load) check the DM path without
+     waiting for a real wash.
 2. To exercise the real path, Developer Tools → **States**: set
    `sensor.washer_washer_job_state` to `drying`, then to `none`, to trigger the
    drying and finished edits.
@@ -292,15 +405,31 @@ this match.
   drying/finished transitions **ignore any `old_state` of
   `unavailable`/`unknown`/`none`/`None`**, so flaps never produce phantom events.
 - **Persistent buttons.** Every button uses a persistent view (`timeout=None` +
-  fixed `custom_id`) and the view re-registered on startup deliberately contains
-  **every** `custom_id` — claim, unclaim, quiet, next, emptied — not just the ones
-  the current card happens to show. An unregistered `custom_id` doesn't error, it
-  silently stops dispatching, which looks exactly like a dead button.
+  fixed `custom_id`) and the views re-registered on startup deliberately contain
+  **every** `custom_id` — claim, unclaim, quiet, next, emptied, 🤖 and the
+  panel's own four — not just the ones the current card happens to show. An
+  unregistered `custom_id` doesn't error, it silently stops dispatching, which
+  looks exactly like a dead button. The 🤖 button is registered even when the
+  option hides it, so switching the option on doesn't leave a dead button behind
+  until the next restart.
 - **Restart-safe sessions.** The active message ID, stage, waiting flag,
   claimant, the 🔜 line and the "emptied" flag are persisted with HA's `Store`.
   On startup an in-progress session is restored — ETA edits resume and the
   buttons still work. A store written by an older version simply comes back
   without a line.
+- **Two stores, one direction.** Per-person preferences live under their own
+  `Store` key, never alongside the session, so a fault on that side can't corrupt
+  a live load. Records are normalised on load — missing, half-written and
+  outright corrupt fields all come back as sane defaults instead of raising
+  inside a button callback, and a mapping keyed by user ID is re-keyed
+  explicitly, because JSON object keys are always strings and
+  `interaction.user.id` is an int.
+- **Ephemeral panels expire, gracefully.** A Discord interaction token dies after
+  **15 minutes**. Every tap carries a fresh one, so a panel someone is actively
+  using keeps editing in place — but a tap on a panel opened an hour ago can't
+  edit that old message, and Discord rejects it. That's expected, not an error,
+  so it answers with a brand new private panel instead of leaving the user
+  looking at "interaction failed".
 - **Outbound-only & defensive.** No inbound ports; the bot runs as a background
   task tied to the config entry and is closed cleanly on unload. The bot token
   is never written to logs.
@@ -322,10 +451,14 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   **Shipped** as **✅ Emptied it** — with a reason to exist: people tap it because
   they're handing the machine over, not because a bot asked them to do a chore.
 - A nag edit if `binary_sensor.laundry_waiting` stays `on` for more than X hours.
+- ~~A 🤖 assistant panel with per-person reminder settings.~~ **Shipped** as
+  Phase 2 — the private panel above, including the DM plumbing and the
+  "I couldn't DM you" self-heal.
 - The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
-  a 🤖 assistant panel, an anonymous week grid, habit-based DM reminders and a
-  double-blind slot trade broker. The 🔜 queue above is Phase 1 of that plan and
-  ships alone, because it's the only phase that touches the session machine.
+  an anonymous week grid (Phase 3), habit-based DM reminders on the days you
+  usually wash (Phase 4) and a double-blind slot trade broker (Phase 5). The 🔜
+  queue was Phase 1 and shipped alone, because it's the only phase that touches
+  the session machine.
 
 ## License
 

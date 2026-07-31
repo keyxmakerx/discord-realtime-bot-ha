@@ -41,6 +41,7 @@ from .const import (
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_QUEUE_EXPIRY,
     CONF_RUNNING_ENTITY,
+    CONF_SHOW_ASSISTANT,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
@@ -53,6 +54,7 @@ from .const import (
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_QUEUE_EXPIRY,
+    DEFAULT_SHOW_ASSISTANT,
     DEFAULT_WATER_ENTITY,
     DEFAULT_WRINKLE_ENTITY,
     MACHINE_PAUSE,
@@ -79,6 +81,7 @@ from .const import (
     UNCLAIMED,
 )
 from . import queue
+from .assistant import LaundryAssistant
 from .detect import (
     EV_FINISHED,
     EV_STARTED,
@@ -114,6 +117,11 @@ class LaundryCoordinator:
         self.bot = DiscordBot(
             hass, self, self._cfg[CONF_BOT_TOKEN], self._cfg[CONF_CHANNEL_ID]
         )
+        # The 🤖 assistant: per-person prefs (its own Store), the private panel
+        # and the DM plumbing. The dependency runs one way — the coordinator
+        # asks it to deliver a message or open a panel, and it never touches
+        # session state — so a fault in there can't reach the state machine.
+        self.assistant = LaundryAssistant(hass, self.bot)
 
         # Session state (persisted).
         self.stage: str = STAGE_IDLE
@@ -273,6 +281,16 @@ class LaundryCoordinator:
         return int(self._cfg.get(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY)) * 3600
 
     @property
+    def show_assistant(self) -> bool:
+        """Whether the 🤖 button is on the card.
+
+        On by default: the panel is inert until tapped and it's the onboarding
+        surface. Off hides the button only — anything already chosen in it
+        keeps working.
+        """
+        return bool(self._cfg.get(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT))
+
+    @property
     def energy_load_jump(self) -> float:
         """kWh rise in one sample that marks a load run while job_state was dark."""
         return float(
@@ -301,6 +319,7 @@ class LaundryCoordinator:
     async def async_setup(self) -> None:
         """Load persisted session and subscribe to the watched entities."""
         await self._async_load()
+        await self.assistant.async_load()
         self._unsubs.append(
             async_track_state_change_event(
                 self.hass, [self.running_entity], self._on_running
@@ -959,10 +978,17 @@ class LaundryCoordinator:
                         f"don't forget the lint tray!{unv}"
                     )
                 elif claimed and self.ping_claimant_on_complete:
-                    # The one push per load: @mention the claimant.
-                    await self.bot.async_send_ping(
-                        f"<@{self.claimed_by_id}> 🧺 Your laundry's {done} — "
+                    # The one push per load, routed by whatever the claimant
+                    # chose in 🤖 — an @mention in the channel unless they've
+                    # opted into a DM. Unset means channel, i.e. unchanged.
+                    body = (
+                        f"🧺 Your laundry's {done} — "
                         f"don't forget the lint tray!{unv}"
+                    )
+                    await self.assistant.async_route_ping(
+                        self.claimed_by_id,
+                        dm_text=body,
+                        channel_text=f"<@{self.claimed_by_id}> {body}",
                     )
                 elif not claimed:
                     # Nobody claimed it: no @ping, but drop a short, push-silent
@@ -1163,16 +1189,22 @@ class LaundryCoordinator:
         if head is None:
             return  # nobody waiting — the line being empty is the normal case
         if hedged:
-            text = (
-                f"<@{head.get('id')}> 🔜 The washer's been done a while and "
-                "nobody's checked in — probably free, worth a look."
+            body = (
+                "🔜 The washer's been done a while and nobody's checked in — "
+                "probably free, worth a look."
             )
         else:
-            text = f"<@{head.get('id')}> 🔜 Washer's free — you're up."
+            body = "🔜 Washer's free — you're up."
         try:
-            # A real @mention (users only), because the whole point is a push —
-            # an embed edit never makes a phone buzz.
-            await self.bot.async_send_ping(text)
+            # However they asked to be reached in 🤖, defaulting to a real
+            # @mention in the channel (users only) — the whole point is a push,
+            # and an embed edit never makes a phone buzz. A DM that bounces
+            # falls back to that same mention, so the handoff is never lost.
+            await self.assistant.async_route_ping(
+                head.get("id"),
+                dm_text=body,
+                channel_text=f"<@{head.get('id')}> {body}",
+            )
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to ping the next person in line")
         # The line just moved, so the card's "Next up" is stale. Silent edit,
@@ -1257,7 +1289,13 @@ class LaundryCoordinator:
             embed = self.build_embed(test=True)
             try:
                 self.message_id = await self.bot.async_post(
-                    embed, view=ClaimView(self, show="claim"), silent=True
+                    embed,
+                    # 🤖 rides along so the panel can be opened (and the DM
+                    # route tested) without waiting for a real load.
+                    view=ClaimView(
+                        self, show="claim", with_assistant=self.show_assistant
+                    ),
+                    silent=True,
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("test_post failed")
