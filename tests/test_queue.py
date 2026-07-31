@@ -36,7 +36,9 @@ format_queue = _queue.format_queue
 next_in_line = _queue.next_in_line
 position = _queue.position
 prune = _queue.prune
+remove_user = _queue.remove_user
 same_user = _queue.same_user
+select_handoff = _queue.select_handoff
 toggle_member = _queue.toggle_member
 
 HOUR = 3600.0
@@ -152,6 +154,69 @@ def test_carry_forward_also_prunes() -> None:
         {"id": 3, "name": "Fresh", "ts": EXPIRY},
     ]
     assert _names(carry_forward(q, None, EXPIRY, EXPIRY)) == ["Fresh"]
+
+
+# --- the handoff selection --------------------------------------------------
+
+
+def test_select_handoff_returns_the_head_and_pops_it() -> None:
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 1.0}]
+    head, rest = select_handoff(q, 10.0, EXPIRY, None)
+    assert head["name"] == "Sam"
+    assert _names(rest) == ["Ty"]  # popped, so the fallback can't re-ping Sam
+
+
+def test_select_handoff_on_an_empty_line_pops_nothing() -> None:
+    # The normal case: a load finishes and nobody is waiting.
+    assert select_handoff([], 10.0, EXPIRY, None) == (None, [])
+
+
+def test_select_handoff_never_hands_the_washer_to_its_own_claimant() -> None:
+    # Sam queued during Alex's load, then took the machine themselves. Sam must
+    # not get "washer's free" for the load Sam is running — Ty is next.
+    q = [{"id": 2, "name": "Sam", "ts": 0.0}, {"id": 3, "name": "Ty", "ts": 1.0}]
+    head, rest = select_handoff(q, 10.0, EXPIRY, 2)
+    assert head["name"] == "Ty"
+    assert rest == []
+    # ...and with Sam alone in the line, nobody is pinged at all.
+    assert select_handoff(q[:1], 10.0, EXPIRY, 2) == (None, [])
+
+
+def test_select_handoff_excludes_a_claimant_across_id_types() -> None:
+    # Ids come back off the Store as strings; the claimant id is an int.
+    q = [{"id": "2", "name": "Sam", "ts": 0.0}]
+    assert select_handoff(q, 10.0, EXPIRY, 2) == (None, [])
+
+
+def test_select_handoff_skips_a_stale_head_rather_than_pinging_it() -> None:
+    # An entry past expiry must not absorb the handoff and strand the person
+    # who is actually standing there with a basket.
+    q = [
+        {"id": 1, "name": "Yesterday", "ts": 0.0},
+        {"id": 2, "name": "Fresh", "ts": EXPIRY},
+    ]
+    head, rest = select_handoff(q, EXPIRY + 1, EXPIRY, None)
+    assert head["name"] == "Fresh"
+    assert rest == []
+
+
+def test_select_handoff_does_not_mutate_the_input() -> None:
+    original = [{"id": 1, "name": "Sam", "ts": 0.0}]
+    snapshot = json.dumps(original)
+    select_handoff(original, 10.0, EXPIRY, None)
+    select_handoff(original, 10.0, EXPIRY, 1)
+    assert json.dumps(original) == snapshot
+
+
+def test_remove_user_drops_the_claimer_and_tolerates_none() -> None:
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 1.0}]
+    assert _names(remove_user(q, 1)) == ["Ty"]
+    assert _names(remove_user(q, "1")) == ["Ty"]
+    assert _names(remove_user(q, 99)) == ["Sam", "Ty"]
+    # An unclaimed load passes None; that must remove nobody, including an
+    # entry whose id failed to persist.
+    assert remove_user(q, None) == q
+    assert remove_user([{"id": None, "name": "Odd", "ts": 0.0}], None) != []
 
 
 # --- store round-trip -------------------------------------------------------

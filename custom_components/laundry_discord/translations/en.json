@@ -39,7 +39,9 @@
           "energy_idle": "Energy-idle backstop — flat kWh for this long = done, used ONLY when the washer's own completion estimate is unavailable (an offline load) (minutes)",
           "energy_load_jump": "Offline-load detection — energy jump this big (with no wash phase) = a load ran while offline (kWh)",
           "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
-          "availability_grace": "Hold last ETA through a connection blip (minutes)"
+          "availability_grace": "Hold last ETA through a connection blip (minutes)",
+          "handoff_fallback": "Handoff backstop — ping whoever's next this long after a load finishes when the claimant never tapped \"Emptied it\" (minutes, 0 disables)",
+          "queue_expiry": "\"I'm next\" expiry — drop somebody from the line this long after they tapped it, so a stale line never strands a handoff (hours)"
         }
       }
     }

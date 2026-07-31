@@ -25,9 +25,11 @@ from .const import (
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
+    CONF_HANDOFF_FALLBACK,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
+    CONF_QUEUE_EXPIRY,
     CONF_RUNNING_ENTITY,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
@@ -39,7 +41,9 @@ from .const import (
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
+    DEFAULT_HANDOFF_FALLBACK,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
+    DEFAULT_QUEUE_EXPIRY,
     DEFAULT_RUNNING_ENTITY,
     DOMAIN,
     MAX_AVAILABILITY_GRACE,
@@ -47,11 +51,15 @@ from .const import (
     MAX_ENERGY_IDLE,
     MAX_ENERGY_LOAD_JUMP,
     MAX_ETA_INTERVAL,
+    MAX_HANDOFF_FALLBACK,
+    MAX_QUEUE_EXPIRY,
     MIN_AVAILABILITY_GRACE,
     MIN_CONFIRM_DELAY,
     MIN_ENERGY_IDLE,
     MIN_ENERGY_LOAD_JUMP,
     MIN_ETA_INTERVAL,
+    MIN_HANDOFF_FALLBACK,
+    MIN_QUEUE_EXPIRY,
 )
 
 
@@ -131,6 +139,32 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     max=MAX_AVAILABILITY_GRACE,
                     step=1,
                     unit_of_measurement="minutes",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_HANDOFF_FALLBACK,
+                default=defaults.get(
+                    CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_HANDOFF_FALLBACK,
+                    max=MAX_HANDOFF_FALLBACK,
+                    step=5,
+                    unit_of_measurement="minutes",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_QUEUE_EXPIRY,
+                default=defaults.get(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_QUEUE_EXPIRY,
+                    max=MAX_QUEUE_EXPIRY,
+                    step=1,
+                    unit_of_measurement="hours",
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
@@ -275,6 +309,10 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_AVAILABILITY_GRACE: int(
                         user_input[CONF_AVAILABILITY_GRACE]
                     ),
+                    CONF_HANDOFF_FALLBACK: int(
+                        user_input[CONF_HANDOFF_FALLBACK]
+                    ),
+                    CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
                 }
             )
 

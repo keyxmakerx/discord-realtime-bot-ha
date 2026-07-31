@@ -6,7 +6,9 @@ ETA** and a **wash → dry progress bar** that edit the same message in place, p
 a **claim / unclaim button** you can tap from the moment the wash starts. The
 only push notification is a single **@mention to whoever claimed the load, sent
 when it's done** — everything else updates silently, and if nobody claimed it the
-"done" message is posted with no ping at all.
+"done" message is posted with no ping at all. Anyone waiting on the machine can
+tap **🔜 I'm next** and gets their own ping when it's **actually free**, which is
+not the same moment the cycle ends.
 
 - **Domain:** `laundry_discord`
 - **Install:** via [HACS](https://hacs.xyz/) as a custom repository
@@ -40,6 +42,10 @@ For a single load (a "session"):
    them — a visible "done" with no push, for when they're asleep; tapping it again
    (**🔔 Unmute**) restores the ping. The load stops being claimable only when the
    **next load starts**.
+6. **The line** — anyone can tap **🔜 I'm next** at any point during a load to
+   get in the queue, and tap it again to get out. The card shows who's waiting
+   ("Next up 🔜 Sam, then Ty"), and when the machine is actually free the person
+   at the head gets **their own ping**. See below for what "actually free" means.
 
 There is only ever **one active embed per load**. Duplicate "start" transitions
 are ignored while a wash is already running.
@@ -123,6 +129,61 @@ are ignored while a wash is already running.
 > *user* mention — which needs no special bot permission and never pings a whole
 > role or @everyone.
 
+### The "I'm next" line (🔜) and the handoff
+
+In a shared house the washer is a contended resource, and the thing that
+actually wastes people's evenings isn't *not knowing the load is done* — it's
+walking down to a machine that's still full. So the queue is deliberately not
+wired to completion.
+
+> **Done ≠ free.** The washer finishing does not mean it's empty. The claimant's
+> clothes are still in the drum, and they may be at work, asleep, or three
+> episodes deep. Pinging the next person the moment the cycle ends sends them to
+> a full machine, and after that happens twice **the ping stops being trusted** —
+> at which point the whole feature is worse than nothing. The handoff therefore
+> gets its **own trigger**, separate from completion.
+
+The sequence, for a **claimed** load:
+
+1. The load finishes → the existing one-per-load ping goes to the claimant
+   ("your laundry's done — don't forget the lint tray"). Whoever's next is
+   **named on the card, not pinged**: *"Next up 🔜 Sam — you're up once Alex
+   clears it."*
+2. The claimant taps **✅ Emptied it** → Sam gets *"🔜 Washer's free — you're
+   up."* That tap is the handoff, and it only exists on a claimed, finished load
+   that hasn't been cleared yet — nobody else can confirm it, and once it's been
+   tapped there's nothing left to confirm.
+3. Nobody taps it within the **handoff backstop** (default **25 min**, 0 to
+   disable) → Sam is pinged anyway, but **hedged**: *"the washer's been done a
+   while and nobody's checked in — probably free, worth a look."* The wording is
+   honest about the fact that at that point we genuinely don't know. This is the
+   backstop, not the mechanism; people forget.
+
+If the load was **unclaimed** there is nobody to do the emptying, so the head of
+the line is pinged **immediately** at completion, alongside (not instead of) the
+existing up-for-grabs nudge.
+
+Rules that stop the line becoming its own problem:
+
+- **It's a toggle.** Tapping 🔜 while already in the line takes you out of it.
+- **FIFO**, and **capped at 5** — past that the button says the line is full
+  rather than silently swallowing the tap.
+- **Pinged means popped.** Whoever gets the handoff comes out of the line, so the
+  backstop timer can't ping the same person twice.
+- **It carries forward.** When the next load starts the line rolls over, minus
+  whoever claimed that load — they're running a wash, not waiting for one. A
+  three-deep queue is a real thing: A finishes, B takes the machine, C is still
+  next.
+- **Entries expire** after `queue_expiry` (default **12 h**). Somebody who tapped
+  last night and went to bed shouldn't be pinged at 6am, and a line that never
+  empties would strand every future handoff.
+- **The line is never @mentioned from the card.** It's rendered as plain names;
+  the only push anyone in it gets is their own handoff message.
+
+The queue is **session state** — it lives in the same store as the claimant and
+resets with the session — and it is **inert when unused**: no taps, no line, no
+field on the card, no extra messages.
+
 ### Entities it creates
 
 | Entity | Meaning |
@@ -199,6 +260,8 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Water-usage sensor *(optional)* | `sensor.washer_water_consumption` | Shows **water used** on the done message. |
 | ETA interval | `90` s | How often to edit the ETA/progress (min 30). |
 | Ping claimant on complete | `true` | @mention whoever claimed the load when it's done. Turn off for zero pings. |
+| Handoff backstop *(options)* | `25` min | Ping whoever's next this long after a load finishes if the claimant never tapped **✅ Emptied it**. `0` disables the backstop — the tap still works. |
+| "I'm next" expiry *(options)* | `12` h | How long a 🔜 tap stays in the line before it ages out. |
 
 > **Ping note:** the only push per load is a *user* mention of the claimant, sent
 > as a small separate message when the load finishes. If nobody claimed it, no
@@ -228,12 +291,16 @@ this match.
   ~51-minute timer and recovers. Start keys off the **debounced** running sensor;
   drying/finished transitions **ignore any `old_state` of
   `unavailable`/`unknown`/`none`/`None`**, so flaps never produce phantom events.
-- **Persistent Claim button.** The button uses a persistent view
-  (`timeout=None` + fixed `custom_id`) re-registered on every startup, so it
-  keeps working after an HA/bot restart.
-- **Restart-safe sessions.** The active message ID, stage, waiting flag, and
-  claimant are persisted with HA's `Store`. On startup an in-progress session is
-  restored — ETA edits resume and the button still works.
+- **Persistent buttons.** Every button uses a persistent view (`timeout=None` +
+  fixed `custom_id`) and the view re-registered on startup deliberately contains
+  **every** `custom_id` — claim, unclaim, quiet, next, emptied — not just the ones
+  the current card happens to show. An unregistered `custom_id` doesn't error, it
+  silently stops dispatching, which looks exactly like a dead button.
+- **Restart-safe sessions.** The active message ID, stage, waiting flag,
+  claimant, the 🔜 line and the "emptied" flag are persisted with HA's `Store`.
+  On startup an in-progress session is restored — ETA edits resume and the
+  buttons still work. A store written by an older version simply comes back
+  without a line.
 - **Outbound-only & defensive.** No inbound ports; the bot runs as a background
   task tied to the config entry and is closed cleanly on unload. The bot token
   is never written to logs.
@@ -251,8 +318,14 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   feature with its own "wash done, dry prep pending" alert + ping. Pending the
   exact `job_state` (or `machine_state`) value that mode reports.
 - Per-person claim buttons instead of "whoever taps".
-- A second **Folded ✓** button to close the loop after the claimant finishes.
+- ~~A second **Folded ✓** button to close the loop after the claimant finishes.~~
+  **Shipped** as **✅ Emptied it** — with a reason to exist: people tap it because
+  they're handing the machine over, not because a bot asked them to do a chore.
 - A nag edit if `binary_sensor.laundry_waiting` stays `on` for more than X hours.
+- The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
+  a 🤖 assistant panel, an anonymous week grid, habit-based DM reminders and a
+  double-blind slot trade broker. The 🔜 queue above is Phase 1 of that plan and
+  ships alone, because it's the only phase that touches the session machine.
 
 ## License
 

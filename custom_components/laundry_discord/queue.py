@@ -98,6 +98,19 @@ def toggle_member(
     )
 
 
+def remove_user(queue: list[dict], user_id) -> list[dict]:
+    """The line without ``user_id``. A None id removes nobody.
+
+    The None guard is load-bearing: an unclaimed load has ``claimed_by_id is
+    None``, and :func:`same_user` stringifies both sides, so without it every
+    entry whose id failed to persist (``{"id": None}``) would be silently
+    dropped from an unclaimed load's line.
+    """
+    if user_id is None:
+        return list(queue)
+    return [e for e in queue if not same_user(e, user_id)]
+
+
 def carry_forward(
     queue: list[dict], claimant_id, now: float, expiry: float
 ) -> list[dict]:
@@ -108,10 +121,32 @@ def carry_forward(
     the next session — but B, who is now running a load, is obviously not
     waiting for it, so they come out of the line.
     """
-    rolled = prune(queue, now, expiry)
-    if claimant_id is None:
-        return rolled
-    return [e for e in rolled if not same_user(e, claimant_id)]
+    return remove_user(prune(queue, now, expiry), claimant_id)
+
+
+def select_handoff(
+    queue: list[dict], now: float, expiry: float, claimant_id
+) -> tuple[dict | None, list[dict]]:
+    """Pick who gets the washer, and return the line with them taken off it.
+
+    Returns ``(entry_or_None, new_queue)``. Three rules, all of which have a
+    way of going wrong in a live channel and none of which are obvious from the
+    call site, which is why they live here rather than in the coordinator:
+
+    - **Stale entries never get the handoff.** Somebody who tapped 🔜 at
+      breakfast and left the house would otherwise absorb the ping and leave
+      the person actually standing there unnotified.
+    - **The claimant is never handed the machine they are using.** They can
+      still be in the line — they tapped 🔜 during someone else's load and then
+      took the washer themselves — and pinging them would both break the
+      one-push-per-load rule and silently consume the real next person's turn.
+    - **The chosen entry comes out of the line**, so the fallback timer can't
+      ping them a second time for the same load.
+    """
+    remaining = remove_user(prune(queue, now, expiry), claimant_id)
+    if not remaining:
+        return (None, remaining)
+    return (remaining[0], remaining[1:])
 
 
 def next_in_line(queue: list[dict]) -> dict | None:

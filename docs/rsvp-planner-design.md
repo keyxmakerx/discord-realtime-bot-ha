@@ -585,6 +585,15 @@ Phase 1 cases: toggle add/remove, FIFO order, dedupe, expiry, cap, carry-forward
 minus claimant, empty-queue completion, unclaimed-load completion, fallback
 timing, R2 slot-holder reordering.
 
+Two of those do not land in Phase 1, deliberately:
+
+- **R2 slot-holder reordering** needs the week grid to have a slot holder at
+  all, so it moves to Phase 3 with the rest of the plan layer.
+- **Fallback *timing*** is `async_call_later`, i.e. the HA timer rather than
+  queue logic, so it stays out of the pure suite. What was pure in it has been
+  extracted: `queue.select_handoff` makes the *selection* (expiry, claimant
+  exclusion, pop) testable, and both the ✅ and fallback paths go through it.
+
 ---
 
 ## 17. Open questions

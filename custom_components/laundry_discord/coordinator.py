@@ -35,9 +35,11 @@ from .const import (
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
+    CONF_HANDOFF_FALLBACK,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
+    CONF_QUEUE_EXPIRY,
     CONF_RUNNING_ENTITY,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
@@ -47,8 +49,10 @@ from .const import (
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_ETA_INTERVAL,
+    DEFAULT_HANDOFF_FALLBACK,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
+    DEFAULT_QUEUE_EXPIRY,
     DEFAULT_WATER_ENTITY,
     DEFAULT_WRINKLE_ENTITY,
     MACHINE_PAUSE,
@@ -74,6 +78,7 @@ from .const import (
     STORAGE_VERSION,
     UNCLAIMED,
 )
+from . import queue
 from .detect import (
     EV_FINISHED,
     EV_STARTED,
@@ -83,7 +88,7 @@ from .detect import (
     offline_completion_due,
     session_too_long,
 )
-from .discord_bot import ClaimView, DiscordBot
+from .discord_bot import ClaimView, DiscordBot, view_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -118,6 +123,14 @@ class LaundryCoordinator:
         # When True, the claimant is named in plain text at completion instead of
         # being @mentioned — a visible, push-silent "done" (e.g. they're asleep).
         self.quiet: bool = False
+        # The "I'm next" line: FIFO entries {"id", "name", "ts"} (see queue.py).
+        # Session state, not planner state — it belongs to the machine, carries
+        # into the next load, and dies with a reset like everything else here.
+        self.queue: list[dict] = []
+        # True once the claimant confirms they've cleared the drum. A finished
+        # washer is not an *empty* one — their clothes are still in it — so the
+        # handoff to whoever is next waits for this, not for completion.
+        self.emptied: bool = False
         self.message_id: int | None = None
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
@@ -162,6 +175,8 @@ class LaundryCoordinator:
         self._job_confirm_unsub = None
         # Pending self-clean detect/end timer (running + job_state stuck none).
         self._selfclean_unsub = None
+        # Pending handoff-fallback timer (nobody tapped "Emptied it").
+        self._handoff_unsub = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -239,6 +254,23 @@ class LaundryCoordinator:
             int(self._cfg.get(CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE))
             * 60
         )
+
+    @property
+    def handoff_fallback(self) -> int:
+        """Seconds after a load finishes before the queue head is pinged anyway.
+
+        The claimant's "Emptied it" tap is the real handoff trigger; this is the
+        backstop for when they forget, and its wording hedges accordingly. 0
+        disables the backstop entirely (the tap still works).
+        """
+        return (
+            int(self._cfg.get(CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK)) * 60
+        )
+
+    @property
+    def queue_expiry(self) -> int:
+        """Seconds an "I'm next" entry survives before it ages out of the line."""
+        return int(self._cfg.get(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY)) * 3600
 
     @property
     def energy_load_jump(self) -> float:
@@ -330,6 +362,7 @@ class LaundryCoordinator:
         if self._selfclean_unsub is not None:
             self._selfclean_unsub()
             self._selfclean_unsub = None
+        self._cancel_handoff_timer()
         try:
             await self.bot.async_close()
         except Exception:  # noqa: BLE001
@@ -366,6 +399,10 @@ class LaundryCoordinator:
         self.claimed_by = data.get("claimed_by", UNCLAIMED)
         self.claimed_by_id = data.get("claimed_by_id")
         self.quiet = data.get("quiet", False)
+        # .get() with defaults: a store written before the queue shipped has
+        # neither key, and an upgrade must not KeyError on the first load.
+        self.queue = list(data.get("queue") or [])
+        self.emptied = data.get("emptied", False)
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
         self.paused = data.get("paused", False)
@@ -399,6 +436,8 @@ class LaundryCoordinator:
                 "claimed_by": self.claimed_by,
                 "claimed_by_id": self.claimed_by_id,
                 "quiet": self.quiet,
+                "queue": self.queue,
+                "emptied": self.emptied,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
                 "paused": self.paused,
@@ -797,11 +836,27 @@ class LaundryCoordinator:
             # job_state is dark); if a self-clean took the session first, yield.
             if offline and self.stage == STAGE_SELF_CLEAN:
                 return
+            # Who claimed the *previous* load, captured before the reset below
+            # wipes it — they're the one person the line rolls forward without.
+            prev_claimant_id = self.claimed_by_id
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
             self.quiet = False
             self.message_id = None
+            # The line survives into this load minus whoever just took the
+            # machine: A's load finishes, B claims the next one, C is still
+            # waiting. Stale taps age out here too, so a line nobody cleared
+            # overnight can't strand tomorrow's handoff.
+            self.queue = queue.carry_forward(
+                self.queue,
+                prev_claimant_id,
+                dt_util.utcnow().timestamp(),
+                float(self.queue_expiry),
+            )
+            self.emptied = False
+            # Any pending handoff belonged to the load this one supersedes.
+            self._cancel_handoff_timer()
             self.paused = self._machine_state() == MACHINE_PAUSE
             # Seed the last confirmed phase from the current job state so a
             # caught-up (already-drying) load still detects its finish.
@@ -835,7 +890,7 @@ class LaundryCoordinator:
             try:
                 self.message_id = await self.bot.async_post(
                     embed,
-                    view=ClaimView(self, show="claim"),
+                    view=view_for(self),
                     content=None,
                     silent=False,
                 )
@@ -881,8 +936,11 @@ class LaundryCoordinator:
             # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
+            # Done is not empty: this load's clothes are still in the drum until
+            # somebody says otherwise, so every completion starts un-emptied.
+            self.emptied = False
             embed = self.build_embed()
-            view = ClaimView(self, show="unclaim" if claimed else "claim")
+            view = view_for(self)
             # Unverified (offline) completions hedge the wording.
             done = "should be done" if unverified else "done"
             unv = (
@@ -917,6 +975,17 @@ class LaundryCoordinator:
                     )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
+            # The handoff. A claimed load is released by the claimant's ✅ tap,
+            # with the fallback timer as the backstop for when they forget. An
+            # *unclaimed* one has nobody to do the emptying, so whoever's next
+            # is told straight away — in addition to the up-for-grabs nudge
+            # above, which is aimed at the house rather than at them.
+            # NOTE: the lock is already held here, hence the _locked variant —
+            # asyncio.Lock is not reentrant and would deadlock the session.
+            if claimed:
+                self._arm_handoff_timer()
+            else:
+                await self._async_ping_next_locked(hedged=False)
             self._offline_unverified = False
             await self._async_save()
             self._notify_entities()
@@ -987,6 +1056,12 @@ class LaundryCoordinator:
             return False
         self.claimed_by = who
         self.claimed_by_id = user_id
+        # Taking the machine means you are no longer waiting for it (§4.3). The
+        # carry-forward at session start can only drop the *previous* load's
+        # claimant — this load's claimant isn't known until right now — so
+        # without this the card would read "Claimed by 🧺 Alex / Next up 🔜
+        # Alex", and Alex would later be handed the washer they are using.
+        self.queue = queue.remove_user(self.queue, user_id)
         if self.stage == STAGE_DONE_WAITING:
             self.waiting = False
         await self._async_save()
@@ -1019,6 +1094,152 @@ class LaundryCoordinator:
         self._notify_entities()
         return True
 
+    async def handle_next_toggle(self, who: str, user_id: int) -> str:
+        """Join or leave the "I'm next" line (the 🔜 button).
+
+        Returns one of the ``queue.TOGGLE_*`` results so the button can pick its
+        reply — ``TOGGLE_STALE`` on a tap against an old card with no live load
+        behind it, which is what happens when someone scrolls up in the channel.
+        """
+        if self.stage not in self._CLAIMABLE_STAGES:
+            return queue.TOGGLE_STALE
+        now = dt_util.utcnow().timestamp()
+        # Prune before toggling: an expired entry must not hold a slot against
+        # the cap, and whatever we re-render should already be the current line.
+        pruned = queue.prune(self.queue, now, float(self.queue_expiry))
+        self.queue, result = queue.toggle_member(pruned, user_id, who, now)
+        await self._async_save()
+        self._notify_entities()
+        return result
+
+    async def handle_emptied(self) -> bool:
+        """The claimant confirming the drum is actually clear (the ✅ button).
+
+        This is the handoff trigger — completion only means the machine stopped,
+        and pinging someone to a full washer is how the ping stops being
+        trusted. Returns False on a stale tap.
+
+        The ``emptied`` half of the guard matters: the button vanishes once
+        tapped, but a card further up the channel that never got its edit
+        through still shows it — and a second tap must not hand the machine to
+        a second person.
+        """
+        if self.stage != STAGE_DONE_WAITING or self.emptied:
+            return False
+        self.emptied = True
+        # The backstop exists for exactly this not happening; it just did.
+        self._cancel_handoff_timer()
+        await self._async_save()
+        self._notify_entities()
+        # The handoff is deliberately *not* awaited. It takes the session lock
+        # and does two Discord round trips (the ping, then the card refresh),
+        # and the button's callback still has to answer the interaction inside
+        # Discord's 3-second window — one rate-limit sleep on the message-edit
+        # bucket and the token is dead, leaving the tapper with "interaction
+        # failed" and a card that still offers ✅. State is already saved, so
+        # the ping is safe to finish on its own.
+        self.hass.async_create_task(
+            self._async_ping_next(hedged=False, expect_emptied=True)
+        )
+        return True
+
+    # ------------------------------------------------------------- the handoff
+    async def _async_ping_next_locked(self, *, hedged: bool) -> None:
+        """Hand the washer to whoever is next. **Assumes the lock is held.**
+
+        ``asyncio.Lock`` is not reentrant, so the caller that already owns it
+        (``_async_handle_finished``) must use this variant — taking the lock a
+        second time there would deadlock the whole session machine.
+
+        ``hedged`` softens the wording for the fallback timer, where nobody has
+        confirmed anything and we genuinely don't know the machine is free.
+        """
+        now = dt_util.utcnow().timestamp()
+        # Expiry, the claimant exclusion and the pop are one decision, made in
+        # queue.py so they're covered by the pure tests.
+        head, self.queue = queue.select_handoff(
+            self.queue, now, float(self.queue_expiry), self.claimed_by_id
+        )
+        if head is None:
+            return  # nobody waiting — the line being empty is the normal case
+        if hedged:
+            text = (
+                f"<@{head.get('id')}> 🔜 The washer's been done a while and "
+                "nobody's checked in — probably free, worth a look."
+            )
+        else:
+            text = f"<@{head.get('id')}> 🔜 Washer's free — you're up."
+        try:
+            # A real @mention (users only), because the whole point is a push —
+            # an embed edit never makes a phone buzz.
+            await self.bot.async_send_ping(text)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to ping the next person in line")
+        # The line just moved, so the card's "Next up" is stale. Silent edit,
+        # but with the state-derived view attached: on the ✅ path the button's
+        # own edit may never land (expired token, transient 5xx), and without
+        # this the card would keep offering "✅ Emptied it" forever — there is
+        # no further re-render in done_waiting, the ETA timer having stopped.
+        if self.message_id:
+            try:
+                await self.bot.async_edit(
+                    self.message_id, self.build_embed(), view=view_for(self)
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to refresh the card after a handoff")
+        await self._async_save()
+        self._notify_entities()
+
+    async def _async_ping_next(self, *, hedged: bool, expect_emptied: bool) -> None:
+        """Lock-taking wrapper for callers that don't already hold the lock.
+
+        Both callers are scheduled tasks that can sit behind the lock for a
+        while — a session transition posts to Discord while holding it — so the
+        check they did before scheduling is stale by the time we get in. A new
+        load may have started, or the ✅ tap may have already handed this one
+        off, and pinging then would push "washer's free" mid-wash *and* burn
+        that person's place in line. ``expect_emptied`` is the state this ping
+        was decided under; anything else means it no longer applies.
+        """
+        async with self._lock:
+            if self.stage != STAGE_DONE_WAITING or self.emptied != expect_emptied:
+                return
+            await self._async_ping_next_locked(hedged=hedged)
+
+    @callback
+    def _arm_handoff_timer(self) -> None:
+        """Arm the "nobody tapped Emptied it" backstop for this finished load.
+
+        Armed even with an empty line: people tap 🔜 *after* seeing the done
+        card, and the callback re-checks the line anyway.
+        """
+        self._cancel_handoff_timer()
+        delay = self.handoff_fallback
+        if delay <= 0:
+            return  # disabled — the ✅ tap is then the only handoff trigger
+        self._handoff_unsub = async_call_later(
+            self.hass, delay, self._async_handoff_fallback
+        )
+
+    @callback
+    def _cancel_handoff_timer(self) -> None:
+        if self._handoff_unsub is not None:
+            self._handoff_unsub()
+            self._handoff_unsub = None
+
+    @callback
+    def _async_handoff_fallback(self, _now=None) -> None:
+        """The claimant never confirmed — tell the next person anyway, hedged."""
+        self._handoff_unsub = None
+        # Never fire against a superseded session: a new load may have started
+        # since, or the claimant may have cleared it and cancelled this timer's
+        # reason to exist a moment before it fired.
+        if self.stage != STAGE_DONE_WAITING or self.emptied:
+            return
+        self.hass.async_create_task(
+            self._async_ping_next(hedged=True, expect_emptied=False)
+        )
+
     async def async_test_post(self) -> None:
         """Debug service: post a sample embed with a working Claim button."""
         async with self._lock:
@@ -1026,6 +1247,13 @@ class LaundryCoordinator:
             self.waiting = True
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
+            # A real load's handoff must not fire against this synthetic state:
+            # the debug post forces done_waiting and repoints message_id, so a
+            # timer armed by an actual finished load would sail past its guard,
+            # ping the head of the line for a load that no longer exists and
+            # overwrite the sample message with the live embed.
+            self.emptied = False
+            self._cancel_handoff_timer()
             embed = self.build_embed(test=True)
             try:
                 self.message_id = await self.bot.async_post(
@@ -1188,6 +1416,7 @@ class LaundryCoordinator:
             )
             self._add_progress_and_eta(embed)
             self._add_claimant(embed)
+            self._add_queue(embed)
             self._add_offline_notice(embed)
         elif self.stage == STAGE_DRYING:
             desc = "Pull out anything you don't want dried!"
@@ -1200,6 +1429,7 @@ class LaundryCoordinator:
             )
             self._add_progress_and_eta(embed)
             self._add_claimant(embed)
+            self._add_queue(embed)
             self._add_offline_notice(embed)
         elif self.stage == STAGE_DONE_WAITING:
             if self.claimed_by and self.claimed_by != UNCLAIMED:
@@ -1223,6 +1453,7 @@ class LaundryCoordinator:
             usage = self._usage_text()
             if usage:
                 embed.add_field(name="This load used", value=usage, inline=False)
+            self._add_queue(embed)
             if self._offline_unverified:
                 embed.add_field(
                     name="⚠️ Unverified",
@@ -1253,6 +1484,25 @@ class LaundryCoordinator:
             if self.quiet:
                 value += "  ·  🌙 quiet (named, not pinged)"
             embed.add_field(name="Claimed by", value=value, inline=False)
+
+    def _add_queue(self, embed: discord.Embed) -> None:
+        """Show the "I'm next" line, so contention is visible without asking.
+
+        Named only — the line is never @mentioned from the card; the one ping
+        anybody in it gets is the handoff, sent as its own message.
+        """
+        line = queue.format_queue(self.queue)
+        if not line:
+            return  # no line, no field — an empty "Next up" is just clutter
+        value = f"🔜 {line}"
+        if (
+            self.stage == STAGE_DONE_WAITING
+            and not self.emptied
+            and self.claimed_by != UNCLAIMED
+        ):
+            # Set the expectation: the washer being done doesn't make it free.
+            value += f" — you're up once {self.claimed_by} clears it"
+        embed.add_field(name="Next up", value=value, inline=False)
 
     def _add_offline_notice(self, embed: discord.Embed) -> None:
         """Warn on the live card when the washer has been offline a while."""
