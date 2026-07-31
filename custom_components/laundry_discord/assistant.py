@@ -565,11 +565,14 @@ class LaundryAssistant:
     async def async_open_grid(self, interaction: discord.Interaction) -> None:
         """Answer 📅 with this person's own view of the week.
 
-        Opens on today, because the overwhelmingly common reason to look is
-        "can I wash tonight".
+        Always opens on today, because the overwhelmingly common reason to look
+        is "can I wash tonight". Deliberately an assignment rather than a
+        ``setdefault``: remembering the last day somebody happened to be
+        looking at makes 📅 open somewhere different depending on history they
+        can't see, and "it opens on today" is a promise worth keeping.
         """
         user_id = interaction.user.id
-        self._grid_day.setdefault(str(user_id), self._today())
+        self._grid_day[str(user_id)] = self._today()
         await self._async_render_grid(interaction, edit=True)
 
     async def async_pick_day(
@@ -599,9 +602,13 @@ class LaundryAssistant:
         self._overrides, _booked = plan_mod.toggle_booking(
             self._people, self._overrides, week, cell, user_id
         )
-        # Booking a slot is the clearest possible statement that somebody is
-        # using this bot, so it enrols them — otherwise their own bookings
-        # would render as somebody else's the next time they looked.
+        # Booking a slot enrols them. Not because the grid needs it — a
+        # booking stores the raw id in the override, so it renders as theirs
+        # whether or not a prefs record exists — but because deliberately
+        # planning a wash is an unambiguous "I use this bot", which merely
+        # *looking* at the panel is not (see async_open_panel, which pointedly
+        # doesn't enrol a guest). It gives them a record to hold a display name
+        # and, from Phase 4, reminder settings.
         if not people_mod.is_known(self._people, user_id):
             self._people = people_mod.set_person(
                 self._people, user_id, name=interaction.user.display_name
