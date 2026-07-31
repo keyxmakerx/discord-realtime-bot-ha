@@ -291,6 +291,56 @@ not be able to corrupt a load in progress. They survive restarts, unloads and
 resets, and the whole button can be hidden from the card with the **Show the 🤖
 assistant button** option if it's not wanted.
 
+### The 📅 week grid
+
+Behind **📅 My week** on the assistant panel is the whole week at a glance:
+
+```
+      Mo Tu We Th Fr Sa Su
+AM     ·  ·  ▓  ·  ·  ▓  ·
+Mid    ·  ·  ·  ▓  ·  ·  ·
+PM     ▓  ·  ·  ▓  ·  ·  ▓
+Eve    ·  ▓  ·  █  ·  ▓  ·
+
+█ yours  ▓ taken  · free
+```
+
+**Four slots a day, because at 4–5 hours a cycle one slot is about one load.**
+A cell isn't a time range you're renting, it's roughly "a wash" — AM 06:00–12:00,
+Mid 12:00–16:00, PM 16:00–20:00, Eve 20:00–00:00.
+
+> **Nobody's name is ever on it.** A cell is *free*, *taken* or *yours* — never
+> "taken by Alex", never a count that would let you work it out. In a house this
+> size a plan board that names people turns into a scoreboard, and the moment it
+> does, people stop putting anything on it. What you actually need to know to
+> avoid a collision is that Thursday evening is spoken for, not who by.
+>
+> That anonymity is exactly why the grid is **ephemeral** and not a pinned
+> channel message: your own cells have to render differently from everyone
+> else's (`█` vs `▓`), and one shared message can only have one rendering. So
+> each person gets their own private view — "only you can see this" — and the
+> channel stays at one card per load.
+
+**It's information, not permission.** Booking a slot says *I'm planning to wash
+then*. It doesn't reserve the machine, nothing stops anyone else using it, and
+two people can hold the same cell — the grid's job is to make that visible so
+one of them moves, not to arbitrate. Nothing here can enforce a booking, so
+nothing here pretends to.
+
+**A tap always means "this week".** Bookings are stored as per-week overrides
+rather than as a standing habit, because "Thursday evening" is the only thing
+you can actually know on a Tuesday. Touching a cell also pins it for that week,
+so a later change to anyone's usual days can't reach back into a week somebody
+has already edited by hand.
+
+You pick a day from the dropdown and tap one of the four slot buttons; the grid
+redraws in place. It's a **display**, not a clickable table — Discord caps a
+message at 25 components and 7 days × 4 slots is 28, so a button per cell isn't
+possible even before it'd be unreadable on a phone. The block is kept to 26
+characters wide for the same reason, and everything decorative lives outside the
+code fence, since an emoji inside one breaks the column alignment the whole grid
+depends on.
+
 ### Entities it creates
 
 | Entity | Meaning |
@@ -454,11 +504,17 @@ different library. If HA ever reports a dependency clash, adjust the pin in
 - ~~A 🤖 assistant panel with per-person reminder settings.~~ **Shipped** as
   Phase 2 — the private panel above, including the DM plumbing and the
   "I couldn't DM you" self-heal.
+- ~~An anonymous week grid.~~ **Shipped** as Phase 3 — 📅 above.
+- A **pinned anonymous occupancy board** in the channel. Deliberately deferred
+  rather than dropped: the renderer already produces it (the board is just the
+  grid with no viewer), but it needs a persisted message and a refresh on every
+  change, and a second permanent message has to earn its place in a channel
+  whose whole premise is one card per load. Worth revisiting once the house has
+  lived with the ephemeral grid for a week.
 - The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
-  an anonymous week grid (Phase 3), habit-based DM reminders on the days you
-  usually wash (Phase 4) and a double-blind slot trade broker (Phase 5). The 🔜
-  queue was Phase 1 and shipped alone, because it's the only phase that touches
-  the session machine.
+  habit-based DM reminders on the days you usually wash (Phase 4) and a
+  double-blind slot trade broker (Phase 5). The 🔜 queue was Phase 1 and shipped
+  alone, because it's the only phase that touches the session machine.
 
 ## License
 

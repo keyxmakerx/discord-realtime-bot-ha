@@ -598,8 +598,15 @@ Two of those do not land in Phase 1, deliberately:
 
 ## 17. Open questions
 
-1. **Pinned occupancy board — keep or drop?** It's passive visibility (valuable)
-   but redundant with the ephemeral grid one tap away. Decide at Phase 3.
+1. **Pinned occupancy board — keep or drop?** *Deferred at Phase 3, not
+   dropped.* The renderer already supports it: `render_grid(occupancy)` with no
+   `viewer_id` produces the fully anonymous board, which is the only difference
+   between the two. What's missing is the plumbing — a persisted message id, a
+   refresh on every booking change, and an answer to when a second permanent
+   message earns its place in a channel whose whole premise is "one card per
+   load". Worth revisiting once the house has used the ephemeral grid for a
+   week and knows whether it actually wants passive visibility. Nothing was
+   shipped half-built: there is no board option in the config flow.
 2. **Slot boundaries** — the §6.1 windows are a first guess; may want to be
    configurable once real usage lands.
 3. **HA `calendar.laundry` mirror** — cheap (one service call) and puts the plan

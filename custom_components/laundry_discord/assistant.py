@@ -41,13 +41,19 @@ import discord
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from . import people as people_mod
+from . import plan as plan_mod
 from .const import (
+    GRID_BACK_CUSTOM_ID,
+    GRID_DAY_CUSTOM_ID,
+    GRID_SLOT_CUSTOM_IDS,
     PANEL_CHANNEL_CUSTOM_ID,
     PANEL_DM_CUSTOM_ID,
     PANEL_MONITOR_CUSTOM_ID,
     PANEL_OFF_CUSTOM_ID,
+    PANEL_WEEK_CUSTOM_ID,
     PLANNER_STORAGE_KEY,
     PLANNER_STORAGE_VERSION,
 )
@@ -148,6 +154,148 @@ class _MonitorButton(discord.ui.Button):
             await self.assistant.async_report_error(interaction)
 
 
+class _WeekButton(discord.ui.Button):
+    """Open the 📅 week grid from the settings panel."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="My week",
+            style=discord.ButtonStyle.primary,
+            emoji="📅",
+            custom_id=PANEL_WEEK_CUSTOM_ID,
+            row=1,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_open_grid(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to open the week grid")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GridDaySelect(discord.ui.Select):
+    """Which day the four slot buttons act on.
+
+    A select rather than seven buttons because the grid is 7 x 4 = 28 cells and
+    a message holds at most 25 components — a button per cell is impossible
+    before it is even unreadable (design doc §6.4). So the grid is a *display*
+    and this is how you point at a column of it.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant", day: int) -> None:
+        super().__init__(
+            placeholder="Pick a day",
+            custom_id=GRID_DAY_CUSTOM_ID,
+            min_values=1,
+            max_values=1,
+            row=0,
+            options=[
+                discord.SelectOption(
+                    label=name,
+                    value=str(index),
+                    default=index == day,
+                )
+                for index, name in enumerate(plan_mod.DAY_NAMES)
+            ],
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_pick_day(interaction, self.values[0])
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to change the grid's day")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GridSlotButton(discord.ui.Button):
+    """Book or free one slot on the selected day.
+
+    Green when it's yours, grey otherwise. It is deliberately **not** disabled
+    when somebody else holds the cell: the plan is information, not permission
+    (§8), so two people can want the same slot and the grid's job is to make
+    that visible rather than to arbitrate it.
+    """
+
+    def __init__(
+        self, assistant: "LaundryAssistant", slot: str, *, mine: bool
+    ) -> None:
+        super().__init__(
+            label=plan_mod.slot_label(slot),
+            style=(
+                discord.ButtonStyle.success if mine else discord.ButtonStyle.secondary
+            ),
+            custom_id=GRID_SLOT_CUSTOM_IDS[slot],
+            row=1,
+        )
+        self.assistant = assistant
+        self.slot = slot
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_toggle_cell(interaction, self.slot)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to toggle a grid slot")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GridBackButton(discord.ui.Button):
+    """Back to the settings panel."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="↩️",
+            custom_id=GRID_BACK_CUSTOM_ID,
+            row=2,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_back_to_panel(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to return to the panel")
+            await self.assistant.async_report_error(interaction)
+
+
+class GridView(discord.ui.View):
+    """The week grid's controls: day select, four slot toggles, back.
+
+    Three rows, six components — well inside the 5-row / 25-component ceiling,
+    with the select occupying a whole row of its own as Discord requires.
+
+    ``occupancy`` and ``day`` are used only to label and colour the buttons.
+    Passing neither builds the neutral registration template for ``add_view``,
+    which must carry **every** ``custom_id`` — one that was never registered
+    doesn't error, it silently stops dispatching, and this integration has
+    already been bitten by that.
+    """
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        *,
+        occupancy: dict | None = None,
+        day: int = 0,
+        viewer_id=None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_GridDaySelect(assistant, day))
+        for slot in plan_mod.SLOTS:
+            cell = plan_mod.cell_key(day, slot)
+            mine = bool(
+                occupancy is not None
+                and cell is not None
+                and plan_mod.is_mine(occupancy, cell, viewer_id)
+            )
+            self.add_item(_GridSlotButton(assistant, slot, mine=mine))
+        self.add_item(_GridBackButton(assistant))
+
+
 class AssistantView(discord.ui.View):
     """Persistent view for the ephemeral panel.
 
@@ -212,6 +360,10 @@ class AssistantView(discord.ui.View):
                     assistant, enabled=person["monitor"] if person else None
                 )
             )
+            # Same reasoning for the grid: a first-timer is being asked how to
+            # be reached, not invited to plan their week. Row 1 keeps it clear
+            # of the three reminder-mode buttons on row 0.
+            self.add_item(_WeekButton(assistant))
 
 
 class LaundryAssistant:
@@ -228,6 +380,15 @@ class LaundryAssistant:
             hass, PLANNER_STORAGE_VERSION, PLANNER_STORAGE_KEY
         )
         self._people: dict[str, dict] = {}
+        # Per-ISO-week booking overrides: {"2026-W32": {"3-eve": [ids]}}.
+        # Recurring slots live on the person; this is "what actually happens
+        # this week", which is the only thing a tap on the grid can mean.
+        self._overrides: dict[str, dict[str, list[str]]] = {}
+        # Which day each person's open grid is pointed at. Deliberately memory
+        # only: it's view state, not a preference, and losing it on a restart
+        # just means the grid reopens on today — which is where it should start
+        # anyway. Keyed by the string form of the id, like everything else here.
+        self._grid_day: dict[str, int] = {}
 
     # ------------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -241,13 +402,40 @@ class LaundryAssistant:
         # Normalise once, here, so every later read works on a known shape —
         # including the string-keyed mapping JSON always hands back.
         self._people = people_mod.normalise_people(source)
+        # .get with a default: a store written by v0.17.0 has no overrides at
+        # all, and an upgrade must not be the thing that breaks the panel.
+        raw = data.get("overrides") if isinstance(data, dict) else None
+        self._overrides = plan_mod.prune_overrides(
+            plan_mod.normalise_overrides(raw), self._current_week()
+        )
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
         try:
-            await self._store.async_save({"people": self._people})
+            await self._store.async_save(
+                {"people": self._people, "overrides": self._overrides}
+            )
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to save assistant prefs")
+
+    # -------------------------------------------------------------- the clock
+    def _now(self):
+        """Local time, per HA's configured timezone.
+
+        The grid is the only part of this integration that cares what day it
+        is, and it has to agree with the household's wall clock rather than
+        UTC — a Sunday-evening booking made at 23:00 local is not Monday.
+        """
+        return dt_util.now()
+
+    def _current_week(self) -> str:
+        """This week's ISO key, or "" if the clock is somehow unreadable."""
+        return plan_mod.iso_week_key(self._now()) or ""
+
+    def _today(self) -> int:
+        """Today's Monday-based weekday index, defaulting to Monday."""
+        day = plan_mod.weekday_of(self._now())
+        return day if day is not None else 0
 
     # --------------------------------------------------------------------- DMs
     async def async_send_dm(
@@ -372,6 +560,107 @@ class LaundryAssistant:
         )
         await self._async_save()
         await self._async_rerender(interaction)
+
+    # -------------------------------------------------------------- the grid
+    async def async_open_grid(self, interaction: discord.Interaction) -> None:
+        """Answer 📅 with this person's own view of the week.
+
+        Opens on today, because the overwhelmingly common reason to look is
+        "can I wash tonight".
+        """
+        user_id = interaction.user.id
+        self._grid_day.setdefault(str(user_id), self._today())
+        await self._async_render_grid(interaction, edit=True)
+
+    async def async_pick_day(
+        self, interaction: discord.Interaction, value
+    ) -> None:
+        """Point the four slot buttons at a different day."""
+        try:
+            day = int(value)
+        except (TypeError, ValueError):
+            day = self._today()
+        if not plan_mod.is_weekday(day):
+            day = self._today()
+        self._grid_day[str(interaction.user.id)] = day
+        await self._async_render_grid(interaction, edit=True)
+
+    async def async_toggle_cell(
+        self, interaction: discord.Interaction, slot: str
+    ) -> None:
+        """Book or free one cell for the selected day, this week."""
+        user_id = interaction.user.id
+        day = self._grid_day.get(str(user_id), self._today())
+        cell = plan_mod.cell_key(day, slot)
+        week = self._current_week()
+        if cell is None or not week:
+            await self._async_render_grid(interaction, edit=True)
+            return
+        self._overrides, _booked = plan_mod.toggle_booking(
+            self._people, self._overrides, week, cell, user_id
+        )
+        # Booking a slot is the clearest possible statement that somebody is
+        # using this bot, so it enrols them — otherwise their own bookings
+        # would render as somebody else's the next time they looked.
+        if not people_mod.is_known(self._people, user_id):
+            self._people = people_mod.set_person(
+                self._people, user_id, name=interaction.user.display_name
+            )
+        await self._async_save()
+        await self._async_render_grid(interaction, edit=True)
+
+    async def async_back_to_panel(self, interaction: discord.Interaction) -> None:
+        """Return from the grid to the settings panel."""
+        await self._async_rerender(interaction)
+
+    async def _async_render_grid(
+        self, interaction: discord.Interaction, *, edit: bool
+    ) -> None:
+        """Draw the grid for this viewer, in place where possible."""
+        user_id = interaction.user.id
+        day = self._grid_day.get(str(user_id), self._today())
+        week = self._current_week()
+        occupancy = plan_mod.effective_week(self._people, self._overrides, week)
+        embed = self._grid_embed(occupancy, user_id, day)
+        view = GridView(self, occupancy=occupancy, day=day, viewer_id=user_id)
+        await self._async_respond(interaction, embed, view, edit=edit)
+
+    def _grid_embed(self, occupancy, user_id, day: int) -> discord.Embed:
+        """The week as a monospace block, plus this person's own cells.
+
+        The block is fenced so Discord renders it monospace — without that the
+        columns pull apart into nonsense on a proportional font. Everything
+        decorative (the legend, the slot windows) lives *outside* the fence,
+        because an emoji inside a code block breaks the alignment the whole
+        display depends on.
+        """
+        embed = discord.Embed(
+            title="📅 The week",
+            description=(
+                f"```\n{plan_mod.render_grid(occupancy, viewer_id=user_id)}\n```\n"
+                f"{plan_mod.render_legend()}\n"
+                f"-# {plan_mod.render_windows()}"
+            ),
+            color=_COLOR_PANEL,
+        )
+        mine = plan_mod.describe_cells(occupancy, user_id)
+        embed.add_field(
+            name="Yours this week",
+            value=mine or "nothing booked — tap a slot below",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"Tap a slot for {plan_mod.DAY_NAMES[day]}",
+            value=(
+                "Booking says *I'm planning to wash then* — it doesn't reserve "
+                "the machine, and it never stops anyone else using it."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="Nobody sees who booked what — only that a slot is taken."
+        )
+        return embed
 
     async def _async_rerender(self, interaction: discord.Interaction) -> None:
         """Redraw the panel in place after a setting changed."""

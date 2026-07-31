@@ -14,7 +14,7 @@ from discord.utils import MISSING
 
 from homeassistant.core import HomeAssistant
 
-from .assistant import AssistantView
+from .assistant import AssistantView, GridView
 from .const import (
     ASSISTANT_CUSTOM_ID,
     CLAIM_CUSTOM_ID,
@@ -381,6 +381,8 @@ class LaundryDiscordClient(discord.Client):
                 # even though the message carrying them is ephemeral — without
                 # this, every panel opened before a restart goes dead.
                 self.add_view(AssistantView(self.coordinator.assistant))
+                # Likewise the grid's day select and slot toggles.
+                self.add_view(GridView(self.coordinator.assistant))
                 self._view_registered = True
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to register persistent views")

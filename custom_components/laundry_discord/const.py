@@ -23,7 +23,6 @@ CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
 CONF_HANDOFF_FALLBACK = "handoff_fallback"
 CONF_QUEUE_EXPIRY = "queue_expiry"
 CONF_SHOW_ASSISTANT = "show_assistant"
-CONF_SHOW_BOARD = "show_board"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -104,14 +103,6 @@ MAX_QUEUE_EXPIRY = 72
 # and it is the only place a newcomer or a guest can find out what the buttons
 # do. Turning it off hides the button entirely — existing prefs are kept.
 DEFAULT_SHOW_ASSISTANT = True
-# Whether the anonymous occupancy board lives in the channel: one extra
-# message, edited in place all week, never reposted. OFF by default because the
-# design doc leaves it undecided (§17 q1) — it is passive visibility, which is
-# the thing that actually prevents collisions, but it is also redundant with
-# the ephemeral grid one tap away, and a second permanent message in a channel
-# whose entire premise is "one card per load" has to earn its place. Off by
-# default lets a house try it without the integration having decided for them.
-DEFAULT_SHOW_BOARD = False
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
