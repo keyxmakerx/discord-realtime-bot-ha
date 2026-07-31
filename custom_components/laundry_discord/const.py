@@ -20,6 +20,8 @@ CONF_ENERGY_IDLE = "energy_idle"
 CONF_PING_CLAIMANT_ON_COMPLETE = "ping_claimant_on_complete"
 CONF_AVAILABILITY_GRACE = "availability_grace"
 CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
+CONF_HANDOFF_FALLBACK = "handoff_fallback"
+CONF_QUEUE_EXPIRY = "queue_expiry"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -81,6 +83,20 @@ MAX_AVAILABILITY_GRACE = 120
 DEFAULT_ENERGY_LOAD_JUMP = 0.3
 MIN_ENERGY_LOAD_JUMP = 0.1
 MAX_ENERGY_LOAD_JUMP = 5.0
+# Minutes after a load finishes before whoever is next in line gets pinged
+# anyway, when the claimant never taps "Emptied it". A finished washer is not
+# an *empty* washer — the claimant's clothes are still in it — so the handoff
+# ping normally waits for that tap. People forget, hence the backstop; its
+# wording hedges because at that point we genuinely don't know. 0 disables it.
+DEFAULT_HANDOFF_FALLBACK = 25
+MIN_HANDOFF_FALLBACK = 0
+MAX_HANDOFF_FALLBACK = 240
+# Hours a "I'm next" entry stays in the line. Someone who tapped last night and
+# went to bed shouldn't be pinged at 6am, and a line that never empties would
+# strand every future handoff.
+DEFAULT_QUEUE_EXPIRY = 12
+MIN_QUEUE_EXPIRY = 1
+MAX_QUEUE_EXPIRY = 72
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -101,6 +117,12 @@ UNCLAIM_CUSTOM_ID = "laundry_discord_unclaim"
 # Toggle: when on, the claimant is named in plain text at completion instead of
 # being @mentioned — a visible "done" with no push (for when they're asleep).
 QUIET_CUSTOM_ID = "laundry_discord_quiet"
+# Join/leave the "I'm next" line — get pinged when the washer is actually free.
+NEXT_CUSTOM_ID = "laundry_discord_next"
+# The claimant confirming they've pulled their load out, which is what releases
+# the machine to whoever is next (completion alone doesn't — see the handoff
+# fallback above).
+EMPTIED_CUSTOM_ID = "laundry_discord_emptied"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"
