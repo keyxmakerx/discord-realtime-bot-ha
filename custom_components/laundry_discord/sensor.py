@@ -88,8 +88,26 @@ class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
+        """Last drop, and roughly how long ago — deliberately *roughly*.
+
+        The recorder writes a history row whenever a state or an attribute
+        changes, and this entity is refreshed by the 5-minute health tick. A
+        minutes-since value recomputed to one decimal therefore differed on
+        every single tick, so this one diagnostic wrote ~288 rows a day
+        forever — and on this washer, whose cloud drops roughly hourly, the
+        flap list is never empty, so it never quiets down.
+
+        Bucketing to a quarter of an hour keeps the attribute answering the
+        only question anyone actually asks it ("recently, or ages ago?") while
+        making it change 4 times an hour at most instead of 12, and not at all
+        overnight once a drop is hours old. The precise value stays available
+        as the timestamp above.
+        """
         last = self.coordinator.last_flap
+        minutes = self.coordinator.minutes_since_flap
         return {
             "last_drop": last.isoformat() if last is not None else None,
-            "minutes_since_last_drop": self.coordinator.minutes_since_flap,
+            "minutes_since_last_drop": (
+                None if minutes is None else int(minutes // 15) * 15
+            ),
         }

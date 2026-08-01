@@ -1,12 +1,16 @@
 {
   "domain": "laundry_discord",
   "name": "Laundry Discord Bot",
-  "codeowners": ["@keyxmakerx"],
+  "codeowners": [
+    "@keyxmakerx"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/keyxmakerx/discord-realtime-bot-ha",
   "integration_type": "service",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/keyxmakerx/discord-realtime-bot-ha/issues",
-  "requirements": ["discord.py==2.7.1"],
-  "version": "0.15.0"
+  "requirements": [
+    "discord.py==2.7.1"
+  ],
+  "version": "0.21.0"
 }
