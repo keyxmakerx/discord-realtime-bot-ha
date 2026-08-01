@@ -594,6 +594,15 @@ class LaundryAssistant:
         # separate from the session, exactly as §12 draws it.
         self._history: list[dict] = []
         self._corrections: list[dict] = []
+        # The nudge budget (P2), per person: {"<id>": {"last_nudge_ts", ...}}.
+        # §12 puts ``last_nudge_ts`` / ``nudges_this_week`` on the person; they
+        # live in their own mapping here because they are *accounting*, not a
+        # preference — nothing in the panel reads or writes them, and keeping
+        # them apart means a nudge can never be one merge away from rewriting
+        # somebody's settings. On disk they are in the planner Store like
+        # everything else, which is what makes a restart not refill anybody's
+        # allowance: the counters are loaded, not reset.
+        self._budgets: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ config
     @property
@@ -638,6 +647,12 @@ class LaundryAssistant:
         self._history = habit_mod.prune_history(raw_history, now)
         raw_corrections = data.get("corrections") if isinstance(data, dict) else None
         self._corrections = habit_mod.prune_corrections(raw_corrections, now)
+        # Normalised, never cleared: a restart that handed everybody a fresh
+        # allowance would turn "1 DM a day" into "1 DM per restart", and the
+        # windows the counters belong to are stored alongside them so the reset
+        # is a comparison rather than something anybody has to remember to do.
+        raw_budgets = data.get("budgets") if isinstance(data, dict) else None
+        self._budgets = habit_mod.normalise_budgets(raw_budgets)
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
@@ -648,6 +663,7 @@ class LaundryAssistant:
                     "overrides": self._overrides,
                     "history": self._history,
                     "corrections": self._corrections,
+                    "budgets": self._budgets,
                 }
             )
         except Exception:  # noqa: BLE001
@@ -761,6 +777,144 @@ class LaundryAssistant:
         """
         prediction = self._prediction(user_id)
         return [prediction["cell"]] if prediction else []
+
+    # ------------------------------------------------ the reminder loop's window
+    # :mod:`reminders` owns *when* somebody is contacted; this store owns
+    # everything it needs to decide and everything a reply changes. The split is
+    # the same one the coordinator already gets: it asks for a delivery or a
+    # record, and never touches the Store itself. Every writer below saves only
+    # when the value actually changed — a trigger that decides "no" must not
+    # cost a disk write, and with nobody opted in that is every trigger.
+
+    def now(self):
+        """The clock the whole planner shares. See :meth:`_now`."""
+        return self._now()
+
+    @property
+    def people_map(self) -> dict[str, dict]:
+        """The prefs mapping, for :func:`nudge.eligible`. A copy, not the store."""
+        return dict(self._people)
+
+    @property
+    def budgets(self) -> dict[str, dict]:
+        """The nudge accounting (P2), for the claim. A copy, not the store."""
+        return dict(self._budgets)
+
+    def prediction_for(self, user_id) -> dict | None:
+        """This person's own top guess, or None — the same one 🔮 shows.
+
+        Deliberately :meth:`_prediction`, so the house's ``learn_habits`` option
+        and the person's own 👁 / 🔮 toggles gate the DM exactly as they gate the
+        panel. A reminder can never be sent about a guess the person cannot see.
+        """
+        return self._prediction(user_id)
+
+    def load_times(self, user_id) -> list[float]:
+        """When this person's own retained loads happened, as timestamps.
+
+        Only theirs — like every read in :mod:`habit` — and only so the reminder
+        loop can tell that somebody has already done the laundry it is about to
+        suggest. Timestamps rather than rows, because that is the entire
+        question and a row has a slot in it that nothing here needs.
+        """
+        return [
+            row["ts"]
+            for row in habit_mod.history_for(self._history, user_id, self._now())
+        ]
+
+    def booked_cells(self, user_id, week=None) -> list[str]:
+        """The cells this person has actually booked in a week (§6.4).
+
+        Defaults to the week that is running, which is what every reader wants;
+        ``week`` exists for the one writer that does not — ⏭ Push to tomorrow
+        on a Sunday, where "tomorrow" is the *next* ISO week.
+        """
+        target = week if isinstance(week, str) and week else self._current_week()
+        occupancy = plan_mod.effective_week(self._people, self._overrides, target)
+        return [
+            cell
+            for cell in occupancy
+            if plan_mod.is_mine(occupancy, cell, user_id)
+        ]
+
+    async def async_store_budgets(self, budgets) -> None:
+        """Persist the accounting a claim came back with.
+
+        Called **before** the DM goes out, never after: a send that raises
+        ``Forbidden`` has still spent the nudge, and refunding it would mean
+        retrying somebody with closed DMs at every trigger forever.
+        """
+        updated = habit_mod.normalise_budgets(budgets)
+        if updated == self._budgets:
+            return  # a denied claim changes nothing, so it costs no write
+        self._budgets = updated
+        await self._async_save()
+
+    async def async_set_predict(self, user_id, enabled: bool) -> None:
+        """🔕 Stop asking — the permanent opt-out from the reminder DMs.
+
+        The same ``predict`` preference the 🔮 panel's own button flips, on
+        purpose: one switch, one meaning, and the panel is the way back (P7 —
+        additive *and* reversible). Nothing re-prompts somebody who has turned
+        it off, because :func:`nudge.eligible` refuses them outright.
+        """
+        if people_mod.get_person(self._people, user_id)["predict"] == bool(enabled):
+            return
+        self._people = people_mod.set_person(
+            self._people, user_id, predict=bool(enabled)
+        )
+        await self._async_save()
+        _LOGGER.debug("Predictions %s for %s", "on" if enabled else "off", user_id)
+
+    async def async_pause_until(self, user_id, until_ts: float) -> None:
+        """⏭ Skip this week — quiet until a timestamp, then back to normal."""
+        self._people = people_mod.set_person(
+            self._people, user_id, paused_until=float(until_ts)
+        )
+        await self._async_save()
+
+    async def async_book_cell(self, user_id, cell, week=None) -> bool:
+        """👍 On it — mark the slot taken on the anonymous board (§10.3).
+
+        Idempotent, unlike :meth:`async_toggle_cell`: a second tap on a nudge
+        must not *un*book the slot the first tap booked. The board still shows
+        only that a cell is taken, never by whom (P5).
+
+        ``week`` defaults to the week that is running. It has to be overridable
+        because a cell key carries a weekday and no date: ⏭ Push to tomorrow on
+        a **Sunday** lands on Monday, and Monday belongs to the *next* ISO week.
+        Booking it under the current one writes the Monday that is six days
+        past — a booking nobody made, on a day nobody can use, which the day-of
+        trigger then never finds.
+        """
+        key = plan_mod.normalise_cell(cell)
+        target = week if isinstance(week, str) and week else self._current_week()
+        if key is None or not target:
+            return False
+        if key in self.booked_cells(user_id, target):
+            return True  # already theirs — nothing changed, nothing written
+        self._overrides, _booked = plan_mod.toggle_booking(
+            self._people, self._overrides, target, key, user_id
+        )
+        await self._async_save()
+        return True
+
+    async def async_record_push(self, user_id, cell) -> None:
+        """⏭ Push to tomorrow — a correction that is **not** a wrong guess.
+
+        §7.3 is exact about this: the day was right, the person just isn't doing
+        it tonight. Counting it as a miss would train the model out of every
+        correct guess anybody was ever too busy to act on, so it goes through
+        :func:`habit.mark_nudge_pushed` and nowhere near
+        :func:`habit.mark_prediction_wrong`.
+        """
+        updated = habit_mod.mark_nudge_pushed(
+            self._corrections, user_id, cell, self._now()
+        )
+        if updated == self._corrections:
+            return
+        self._corrections = updated
+        await self._async_save()
 
     # --------------------------------------------------------------------- DMs
     async def async_send_dm(

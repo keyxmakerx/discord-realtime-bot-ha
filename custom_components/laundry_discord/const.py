@@ -24,6 +24,10 @@ CONF_HANDOFF_FALLBACK = "handoff_fallback"
 CONF_QUEUE_EXPIRY = "queue_expiry"
 CONF_SHOW_ASSISTANT = "show_assistant"
 CONF_LEARN_HABITS = "learn_habits"
+CONF_REMIND_DMS = "remind_dms"
+CONF_PLAN_DM_WEEKDAY = "plan_dm_weekday"
+CONF_PLAN_DM_TIME = "plan_dm_time"
+CONF_NUDGE_LEAD = "nudge_lead"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -117,6 +121,35 @@ DEFAULT_SHOW_ASSISTANT = True
 # Per-person consent is a *second*, independent gate on top of this one (the 👁
 # Monitoring toggle, §11) — the house switch can never override somebody's no.
 DEFAULT_LEARN_HABITS = False
+# Whether the bot may start a conversation. This is the ONLY option in the
+# integration that makes it contact somebody who didn't tap anything first —
+# everything else here answers a button or edits a card — so it is off by
+# default (design doc §14 rule 7 / P7) and off means *inert*: with it off no
+# time trigger is registered, no dispatcher listener is connected, nothing is
+# evaluated and nothing is written.
+#
+# It is also not sufficient on its own. A reminder needs, on top of this: the
+# house's day-learning option on, and the person to have chosen 📬 DM in the
+# 🤖 panel, with 🔮 guessing and 👁 monitoring left on, and not be paused. The
+# default for somebody who never opened the panel is the channel, so switching
+# this on for a house that has never used the panel sends exactly nothing.
+DEFAULT_REMIND_DMS = False
+# When the Sunday plan DM goes out (design doc §10.2) — weekday 0=Monday, and a
+# local wall-clock time. Sunday evening by default: late enough that the week is
+# actually over, early enough to still be a reasonable hour to get a phone
+# buzz. One trigger, once a week, per person.
+DEFAULT_PLAN_DM_WEEKDAY = 6
+DEFAULT_PLAN_DM_TIME = "18:00:00"
+# How long before the END of somebody's slot the day-of backstop fires (§10.4
+# trigger b), in minutes. Not a fixed clock time: a single 18:00 reminder cannot
+# be "near the end of that slot" for four different slots, and it is useless to
+# the person who washes on Saturday mornings. One time per slot is derived from
+# this — with the default that is 11:00, 15:00, 19:00 and 23:00 — and each one
+# lands inside the window it belongs to, which is what lets the backstop and the
+# washer-freed event be the same decision asked twice.
+DEFAULT_NUDGE_LEAD = 60
+MIN_NUDGE_LEAD = 5
+MAX_NUDGE_LEAD = 180
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -134,8 +167,32 @@ STORAGE_KEY = f"{DOMAIN}.session"
 PLANNER_STORAGE_VERSION = 1
 PLANNER_STORAGE_KEY = f"{DOMAIN}.planner"
 
-# --- Dispatcher signal ---
+# --- Dispatcher signals ---
 SIGNAL_UPDATE = f"{DOMAIN}_update"
+# "The washer is now free" — emitted at the moments the coordinator ALREADY
+# treats as the handoff: the ✅ Emptied tap, the handoff fallback timer, and an
+# unclaimed completion (all three funnel through one method). Deliberately not a
+# second notion of "free": if the reminder loop invented its own, the two would
+# drift and the day-of nudge would start telling people the machine is empty
+# when the queue was told nothing of the sort. The dependency runs one way —
+# :mod:`coordinator` sends and never imports the listener (§14 rule 5).
+#
+# Carries one dict describing what actually happened, because "the washer came
+# free" alone is not enough to say anything true about it:
+#   ``handed_off``  — the head of the 🔜 line was just given this machine, so it
+#                     is not free for anybody else.
+#   ``hedged``      — the backstop fired and nobody confirmed anything; the
+#                     machine is *probably* free, which is not a fact.
+#   ``claimant_id`` — whose load this was, so a listener does not tell somebody
+#                     to do the laundry they have just taken out.
+SIGNAL_WASHER_FREE = f"{DOMAIN}_washer_free"
+
+# Which config entry owns the reminder loop. The planner Store key is global
+# (one household, one set of people), so a second entry — the config flow keys
+# on the *channel*, so two channels are two entries — would otherwise run a
+# second copy of the loop against the same people and send every reminder DM
+# twice, each entry claiming the budget against its own in-memory copy.
+DATA_REMINDER_OWNER = f"{DOMAIN}_reminder_owner"
 
 # --- Discord ---
 CLAIM_CUSTOM_ID = "laundry_discord_claim"
@@ -186,6 +243,19 @@ GUESS_RIGHT_CUSTOM_ID = "laundry_discord_guess_right"
 GUESS_WRONG_CUSTOM_ID = "laundry_discord_guess_wrong"
 GUESS_OFF_CUSTOM_ID = "laundry_discord_guess_off"
 GUESS_BACK_CUSTOM_ID = "laundry_discord_guess_back"
+# The reminder DMs' own buttons (design doc §10.2 / §10.3). A DM is a normal
+# message, so its components dispatch through the same persistent-view registry
+# as everything else — and these are the ids most likely to be tapped hours
+# after the message was sent, which is exactly when an unregistered one shows
+# the user "interaction failed". They are registered unconditionally, even with
+# the reminder option off: a DM already sitting in somebody's inbox must still
+# be able to say "stop asking".
+PLAN_YES_CUSTOM_ID = "laundry_discord_plan_yes"
+PLAN_CHANGE_CUSTOM_ID = "laundry_discord_plan_change"
+PLAN_STOP_CUSTOM_ID = "laundry_discord_plan_stop"
+NUDGE_ON_IT_CUSTOM_ID = "laundry_discord_nudge_on_it"
+NUDGE_PUSH_CUSTOM_ID = "laundry_discord_nudge_push"
+NUDGE_SKIP_CUSTOM_ID = "laundry_discord_nudge_skip"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"

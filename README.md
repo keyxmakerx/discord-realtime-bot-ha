@@ -247,13 +247,16 @@ later phase of the [planner design](docs/rsvp-planner-design.md), and a button
 that does nothing yet is worse than no button:
 
 - **Pings** — where the messages that are **about you** go: your load finishing,
-  and the "washer's free" handoff after you tapped 🔜. Nothing else moves.
+  and the "washer's free" handoff after you tapped 🔜.
   - **💬 In the channel** — an @mention, exactly as before. **This is the
     default**, so anyone who never opens the panel keeps getting precisely what
     they got in v0.16 and earlier. Opting in is a deliberate act.
   - **📬 DM me** — the same message, sent to you directly, nothing in the
     channel. If the DM fails it falls back to the channel mention, because a
-    handoff nobody hears is worse than a line in the channel.
+    handoff nobody hears is worse than a line in the channel. **This is also the
+    opt-in for the [reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first)**,
+    if the house has them switched on — they are DMs and nothing else, so
+    choosing the channel means you don't get them at all.
   - **🚫 No pings** — the message is still posted and you're still *named*, but
     push-silently and with the mention suppressed. It removes the buzz, not the
     information — the same trade 🌙 Quiet already makes on the card.
@@ -412,8 +415,10 @@ I think you wash Thursday evenings — 5 of your last 8 loads.
   again. Being told "no" and then arguing from the same loads would be the model
   learning from itself with extra steps.
 - **🚫 Stop guessing** — no more `░` for you, ever, and no guessing done on your
-  behalf. Tapping it again (**🔮 Start guessing**) puts it back; the loads
-  already noted are still there.
+  behalf. It is also the permanent opt-out from the reminder DMs below, and the
+  same switch **🔕 Stop asking** flips when you tap it on one of them. Tapping it
+  again (**🔮 Start guessing**) puts it back; the loads already noted are still
+  there.
 
 And if there's no guess yet, it says so plainly, with your own numbers and the
 bar it hasn't cleared — never an invented one.
@@ -426,7 +431,7 @@ Three independent switches, any of which stops it:
 |--------|-------|--------|
 | **Learn the days each person washes** | integration options | The house-wide master. **Off by default.** Nothing is logged for anybody and no `░` is drawn. |
 | **👁 Monitoring** | 🤖 panel, per person | Your loads are never written to history at all — not written and then filtered, simply not written. Also stops any guessing about you, so switching it off makes the existing history stop being read too (it isn't deleted; a toggle you flipped to see what it does shouldn't destroy three months of data). |
-| **🔮 Stop guessing** | 🔮 panel, per person | Keeps logging, stops guessing. For somebody who's happy to feed a future reminder but doesn't want the grid marked up. |
+| **🔮 Stop guessing** | 🔮 panel, per person | Keeps logging, stops guessing — and stops the reminder DMs, since there is nothing left to remind you about. Same switch as **🔕 Stop asking** on a DM. |
 
 History lives in the same planner `Store` as the panel's preferences, **never
 leaves your Home Assistant instance**, and is **capped at 90 days** — the cap is
@@ -434,11 +439,110 @@ applied every time a row is written, so it's bounded by the act of using it
 rather than by a cleanup job somebody has to remember. A row holds a timestamp,
 a user id and a slot; there is nowhere in it to put a name.
 
-> **Nothing in this version DMs you.** Predictions exist, are visible on your own
-> grid and can be argued with — and that's the whole of it. The reminders that
-> use them (the Sunday check-in and the day-of nudge, with a hard budget of 1 DM
-> a day and 2 a week) are the next phase, deliberately after this one, so the
-> guesses are correctable *before* anything reaches a phone.
+### The reminder DMs (the one thing here that messages you first)
+
+> **Read this bit even if you skim the rest.** Everything else in this
+> integration *answers* something — a button, a meter, a finished load. This is
+> the only feature that decides on its own to put a message on your phone. It is
+> **off by default**, and turning it off again is one toggle:
+> **Settings → Devices & Services → Laundry Discord Bot → Configure →
+> _Send reminder DMs_**. Off means off: with it off, nothing here is scheduled,
+> nothing is evaluated and nothing is sent.
+
+It ships with the guesses deliberately behind it, so `░` was correctable for a
+while *before* anything reached a phone. Two messages, both DMs, both with an
+opt-out button on them.
+
+**The weekly check-in**, once a week (Sunday evening by default):
+
+```
+🗓️ Next week's laundry
+I've got you down for Thursday evenings — 5 of your last 8 loads.
+Look right?
+
+[ ✅ Yep ]  [ 📅 Change ]  [ 🔕 Stop asking ]
+```
+
+- **✅ Yep** — acknowledged, and nothing is stored (same reason as the 🔮 panel:
+  a confirmation isn't evidence, and the loads behind the guess are already
+  counted).
+- **📅 Change** — opens your week grid, right there in the DM.
+- **🔕 Stop asking** — permanent. No check-in, no day-of nudge, no `░`. **🔮 Start
+  guessing** in the panel is the way back if you change your mind.
+
+**If the bot isn't confident about your days, you get no check-in at all** — not
+a message saying it doesn't know yet. For the first month, silence is the whole
+feature.
+
+**The day-of nudge** is the interesting one, because a fixed "6pm reminder" is a
+guess and *the washer actually being free* is a fact:
+
+```
+🧺 Laundry day
+I've got you down for tonight (5 of your last 8 loads), and the washer's
+free right now.
+
+[ 👍 On it ]  [ ⏭ Push to tomorrow ]  [ 🚫 Skip this week ]
+```
+
+It fires on **whichever comes first**:
+
+- **the washer actually coming free during your slot** — the same moment the 🔜
+  line gets handed off, not a second opinion about it: somebody tapping **✅
+  Emptied it**, the handoff backstop, or a load nobody claimed finishing. If
+  that machine went to somebody in the 🔜 line, it isn't free and nothing is
+  sent — two people are never told the same washer is theirs. And if it came
+  from the backstop, where nobody actually confirmed anything, the nudge only
+  goes out if the load was emptied or nobody had claimed it: "done" is not
+  "empty", and somebody else's wet clothes are not a free washer; or
+- **a backstop near the end of your slot**, if the washer never came free during
+  it — one time per slot, derived from that slot's own end, so it's 11:00 for
+  people who wash in the morning and 23:00 for people who wash at night. A
+  single evening reminder would be useless to the first group.
+
+Whichever one gets there first sends; the other is dropped. You never get two
+about one evening. And **if you've already run a load today you get nothing** —
+the washer coming free is very often your own load finishing, and "laundry day!"
+arriving while you're folding is the fastest way to get a bot muted.
+
+- **👍 On it** — marks the slot taken on the anonymous board, so nobody plans on
+  top of you. Still no names — just a full cell.
+- **⏭ Push to tomorrow** — books the same slot tomorrow, so the nudge follows
+  you. This is explicitly **not** the guess being wrong; it's you being busy,
+  and it won't change what the bot thinks your usual days are.
+- **🚫 Skip this week** — quiet until Monday. It expires on its own.
+
+#### What has to be true before anything is sent
+
+All of it, per person, every time:
+
+| Gate | Where |
+|------|-------|
+| **Send reminder DMs** on | integration options — **off by default** |
+| **Learn the days each person washes** on | integration options — also off by default |
+| **📬 DM me** chosen | 🤖 panel. The default is the channel, so somebody who never opened the panel gets **nothing** |
+| **🔮 guessing** and **👁 monitoring** left on | 🤖 panel, per person |
+| your DMs actually open | one `Forbidden` and the bot stops trying, and tells you why the next time you tap anything |
+| not paused, and a confident guess (or a booking) for *this* slot | — |
+
+And then the budget, which is arithmetic rather than a good intention:
+**1 DM per person per day, 2 per week.** Over budget is **dropped, not queued** —
+a nudge that arrives a day late is a reminder about a slot that already passed.
+The counters live in the same planner `Store` as everything else, so a Home
+Assistant restart doesn't hand anybody a fresh allowance; equally, a reminder
+whose moment passed while HA was down is simply missed, because a burst of
+catch-up DMs at boot is how a feature like this gets muted on day one.
+
+Two deliberate choices worth stating plainly:
+
+- **A reminder is never posted in the channel.** If your DMs are closed the
+  reminder is *dropped*, not redirected — "you're down for tonight" in a shared
+  channel is both noise for six other people and exactly the sort of per-person
+  fact this thing promises never to surface to the house. (The **handoff** ping
+  does still fall back to the channel; that one is about a machine, not about
+  you.)
+- **A bounced DM still costs you a nudge from the budget.** Otherwise somebody
+  with closed DMs gets retried at every single trigger, forever.
 
 ### Entities it creates
 
@@ -521,6 +625,10 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Handoff backstop *(options)* | `25` min | Ping whoever's next this long after a load finishes if the claimant never tapped **✅ Emptied it**. `0` disables the backstop — the tap still works. |
 | "I'm next" expiry *(options)* | `12` h | How long a 🔜 tap stays in the line before it ages out. |
 | Show the 🤖 assistant button *(options)* | `true` | Puts the 🤖 button on the card. It's inert until tapped — no pings, no channel lines, nothing stored — and it's the only place a newcomer finds out what the other buttons do. Turning it off hides the button; anything already chosen in the panel keeps working. |
+| Learn the days each person washes *(options)* | `false` | The habit model: logs each 🧺 Claim and draws `░` on that person's own grid. See [The 🔮 day guesses](#the--day-guesses-). |
+| **Send reminder DMs** *(options)* | `false` | **The only setting that lets the bot message somebody who didn't tap anything first.** Needs day-learning on as well, and only ever DMs a person who chose **📬 DM me** in 🤖. Max 1 DM per person per day, 2 per week. See [The reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first). |
+| Weekly plan DM — day / time *(options)* | Sunday, `18:00` | When the weekly check-in goes out. Ignored while reminder DMs are off. |
+| Day-of nudge backstop *(options)* | `60` min | How long before the **end of somebody's slot** to nudge them if the washer never came free during it. The nudge normally fires the moment the washer is actually free inside their slot; whichever happens first wins and only one is ever sent. |
 
 > **Ping note:** the only push per load is a *user* mention of the claimant, sent
 > as a small separate message when the load finishes. If nobody claimed it, no
@@ -555,12 +663,14 @@ this match.
   `unavailable`/`unknown`/`none`/`None`**, so flaps never produce phantom events.
 - **Persistent buttons.** Every button uses a persistent view (`timeout=None` +
   fixed `custom_id`) and the views re-registered on startup deliberately contain
-  **every** `custom_id` — claim, unclaim, quiet, next, emptied, 🤖 and the
-  panel's own four — not just the ones the current card happens to show. An
-  unregistered `custom_id` doesn't error, it silently stops dispatching, which
-  looks exactly like a dead button. The 🤖 button is registered even when the
-  option hides it, so switching the option on doesn't leave a dead button behind
-  until the next restart.
+  **every** `custom_id` — claim, unclaim, quiet, next, emptied, 🤖, the panel's
+  own controls and the reminder DMs' replies — not just the ones the current
+  card happens to show. An unregistered `custom_id` doesn't error, it silently
+  stops dispatching, which looks exactly like a dead button. The 🤖 button is
+  registered even when the option hides it, and the reminder replies even when
+  reminders are off, so switching an option doesn't leave a dead button behind
+  until the next restart — and a DM already sitting in an inbox can always still
+  say **🔕 Stop asking**.
 - **Restart-safe sessions.** The active message ID, stage, waiting flag,
   claimant, the 🔜 line and the "emptied" flag are persisted with HA's `Store`.
   On startup an in-progress session is restored — ETA edits resume and the
@@ -613,12 +723,16 @@ different library. If HA ever reports a dependency clash, adjust the pin in
 - ~~A model of the days each person usually washes.~~ **Shipped** as the first
   half of Phase 4 — 🔮 above: history from Claim taps, confidence-gated guesses
   drawn as `░` on your own grid, and the corrections that train it.
+- ~~The DM reminders those guesses are *for*.~~ **Shipped** as the second half of
+  Phase 4 — 📬 above: a weekly check-in, and a day-of nudge that fires on the
+  washer actually coming free rather than on a clock, under a hard budget of 1 DM
+  a day and 2 a week. Off by default, and the only feature here that starts a
+  conversation.
 - The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
-  the DM reminders those guesses are *for* — a Sunday check-in and an
-  event-driven nudge on the day, under a hard budget of 1 DM a day and 2 a week
-  (the second half of Phase 4) — and a double-blind slot trade broker (Phase 5).
-  The 🔜 queue was Phase 1 and shipped alone, because it's the only phase that
-  touches the session machine.
+  a double-blind slot trade broker (Phase 5), then the optional extras — a PNG
+  grid renderer, an HA `calendar.laundry` mirror and a `/laundry` slash command
+  (Phase 6). The 🔜 queue was Phase 1 and shipped alone, because it's the only
+  phase that touches the session machine.
 
 ## License
 

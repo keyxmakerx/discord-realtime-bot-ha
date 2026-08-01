@@ -29,8 +29,12 @@ from .const import (
     CONF_JOB_STATE_ENTITY,
     CONF_LEARN_HABITS,
     CONF_MACHINE_STATE_ENTITY,
+    CONF_NUDGE_LEAD,
     CONF_PING_CLAIMANT_ON_COMPLETE,
+    CONF_PLAN_DM_TIME,
+    CONF_PLAN_DM_WEEKDAY,
     CONF_QUEUE_EXPIRY,
+    CONF_REMIND_DMS,
     CONF_RUNNING_ENTITY,
     CONF_SHOW_ASSISTANT,
     CONF_WATER_ENTITY,
@@ -45,8 +49,12 @@ from .const import (
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_HANDOFF_FALLBACK,
     DEFAULT_LEARN_HABITS,
+    DEFAULT_NUDGE_LEAD,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
+    DEFAULT_PLAN_DM_TIME,
+    DEFAULT_PLAN_DM_WEEKDAY,
     DEFAULT_QUEUE_EXPIRY,
+    DEFAULT_REMIND_DMS,
     DEFAULT_RUNNING_ENTITY,
     DEFAULT_SHOW_ASSISTANT,
     DOMAIN,
@@ -56,6 +64,7 @@ from .const import (
     MAX_ENERGY_LOAD_JUMP,
     MAX_ETA_INTERVAL,
     MAX_HANDOFF_FALLBACK,
+    MAX_NUDGE_LEAD,
     MAX_QUEUE_EXPIRY,
     MIN_AVAILABILITY_GRACE,
     MIN_CONFIRM_DELAY,
@@ -63,8 +72,10 @@ from .const import (
     MIN_ENERGY_LOAD_JUMP,
     MIN_ETA_INTERVAL,
     MIN_HANDOFF_FALLBACK,
+    MIN_NUDGE_LEAD,
     MIN_QUEUE_EXPIRY,
 )
+from .plan import DAY_NAMES
 
 
 def _eta_interval_selector() -> selector.NumberSelector:
@@ -180,6 +191,44 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_LEARN_HABITS,
                 default=defaults.get(CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS),
             ): selector.BooleanSelector(),
+            # The one switch that lets the bot start a conversation. Off by
+            # default, and the three settings under it do nothing at all while
+            # it is off — they are here so somebody who turns it on isn't then
+            # hunting for when it will fire.
+            vol.Required(
+                CONF_REMIND_DMS,
+                default=defaults.get(CONF_REMIND_DMS, DEFAULT_REMIND_DMS),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_PLAN_DM_WEEKDAY,
+                default=str(
+                    defaults.get(CONF_PLAN_DM_WEEKDAY, DEFAULT_PLAN_DM_WEEKDAY)
+                ),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(value=str(index), label=name)
+                        for index, name in enumerate(DAY_NAMES)
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required(
+                CONF_PLAN_DM_TIME,
+                default=defaults.get(CONF_PLAN_DM_TIME, DEFAULT_PLAN_DM_TIME),
+            ): selector.TimeSelector(),
+            vol.Required(
+                CONF_NUDGE_LEAD,
+                default=defaults.get(CONF_NUDGE_LEAD, DEFAULT_NUDGE_LEAD),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_NUDGE_LEAD,
+                    max=MAX_NUDGE_LEAD,
+                    step=5,
+                    unit_of_measurement="minutes",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
         }
     )
 
@@ -327,6 +376,12 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
                     CONF_SHOW_ASSISTANT: user_input[CONF_SHOW_ASSISTANT],
                     CONF_LEARN_HABITS: user_input[CONF_LEARN_HABITS],
+                    CONF_REMIND_DMS: user_input[CONF_REMIND_DMS],
+                    # The select hands back a string; stored as the int the
+                    # weekday actually is, so nothing downstream has to parse it.
+                    CONF_PLAN_DM_WEEKDAY: int(user_input[CONF_PLAN_DM_WEEKDAY]),
+                    CONF_PLAN_DM_TIME: str(user_input[CONF_PLAN_DM_TIME]),
+                    CONF_NUDGE_LEAD: int(user_input[CONF_NUDGE_LEAD]),
                 }
             )
 

@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 
 from .const import DOMAIN, PLATFORMS, SERVICE_TEST_POST
 from .coordinator import LaundryCoordinator
+from .reminders import LaundryReminders
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +20,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_setup()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    # The reminder DMs (design doc §10) — the only part of this integration that
+    # contacts somebody unprompted, and the only one that is off by default.
+    # Set up here rather than inside the coordinator so the dependency stays one
+    # way: the reminder loop reads the session state and subscribes to a signal,
+    # and the state machine knows nothing about it. async_setup() returns
+    # immediately when the option is off, having registered nothing.
+    reminders = LaundryReminders(hass, entry, coordinator)
+    await reminders.async_setup()
+    entry.async_on_unload(reminders.shutdown)
 
     # Run the gateway as a background task tied to this entry; it is cancelled
     # automatically on unload. async_run_bot swallows errors so HA stays up.

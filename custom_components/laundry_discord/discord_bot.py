@@ -28,6 +28,7 @@ from .const import (
     UNCLAIMED,
 )
 from .queue import QUEUE_CAP, TOGGLE_FULL, TOGGLE_STALE
+from .reminders import NudgeView, PlanDMView
 
 if TYPE_CHECKING:
     from .coordinator import LaundryCoordinator
@@ -387,6 +388,12 @@ class LaundryDiscordClient(discord.Client):
                 # including the ones a given render leaves out.
                 self.add_view(GridView(self.coordinator.assistant))
                 self.add_view(GuessView(self.coordinator.assistant))
+                # The reminder DMs' replies. Registered whatever the reminder
+                # option currently says: a DM already sitting in somebody's
+                # inbox has to keep working, and "🔕 Stop asking" is the last
+                # button that should ever answer "interaction failed".
+                self.add_view(PlanDMView(self.coordinator.assistant))
+                self.add_view(NudgeView(self.coordinator.assistant))
                 self._view_registered = True
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to register persistent views")

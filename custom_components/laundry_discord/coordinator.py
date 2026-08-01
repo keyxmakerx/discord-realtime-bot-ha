@@ -71,6 +71,7 @@ from .const import (
     JOB_STATE_NONE,
     REAL_PHASES,
     SIGNAL_UPDATE,
+    SIGNAL_WASHER_FREE,
     STAGE_DONE_WAITING,
     STAGE_DRYING,
     STAGE_IDLE,
@@ -1187,10 +1188,32 @@ class LaundryCoordinator:
         confirmed anything and we genuinely don't know the machine is free.
         """
         now = dt_util.utcnow().timestamp()
+        claimant_id = self.claimed_by_id
         # Expiry, the claimant exclusion and the pop are one decision, made in
         # queue.py so they're covered by the pure tests.
         head, self.queue = queue.select_handoff(
             self.queue, now, float(self.queue_expiry), self.claimed_by_id
+        )
+        # All three handoff moments — the ✅ tap, the fallback timer and an
+        # unclaimed completion — arrive here, so this is where "the washer is
+        # now free" already exists. Announcing it costs nothing when nobody is
+        # listening and saves the planner inventing a second one (§14 rule 5).
+        #
+        # Announced *after* the pop, and carrying its outcome, because the
+        # answer to "is the washer free" is not the same before and after: a
+        # machine that has just been handed to the head of the 🔜 line is
+        # somebody's, and a listener told otherwise would tell a second person
+        # the same machine is theirs. ``hedged`` travels for the same reason —
+        # at the backstop nobody has confirmed anything, so "free" is a guess
+        # and a listener must be allowed to apply its own stricter test.
+        async_dispatcher_send(
+            self.hass,
+            SIGNAL_WASHER_FREE,
+            {
+                "handed_off": head is not None,
+                "hedged": hedged,
+                "claimant_id": claimant_id,
+            },
         )
         if head is None:
             return  # nobody waiting — the line being empty is the normal case
