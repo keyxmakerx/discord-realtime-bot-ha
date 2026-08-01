@@ -27,9 +27,23 @@ Four Discord facts shape this file (design doc §5.3 / §13):
   panel.
 
 Prefs live in their own ``Store`` key, separate from the session store, so a
-bug in here cannot corrupt a live load. The dependency runs one way: the
-coordinator reaches in for the panel and the ping routing, and nothing in this
-module knows anything about the session state machine.
+bug in here cannot corrupt a live load. The same store also holds the habit
+model's history and corrections (design doc §12) — one planner store, not two —
+and this module is the only thing that writes to it. The dependency runs one
+way: the coordinator reaches in for the panel, the ping routing and "a claim
+just happened", and nothing in this module knows anything about the session
+state machine.
+
+Two rules govern every write here, and both are about what a shared house can
+stand:
+
+* **A store write only when something actually changed.** Claim, Unclaim and
+  Reclaim are one load, so the second tap must cost nothing; the panel opening
+  costs nothing; a DM going through when we already knew it would costs
+  nothing.
+* **Silence at log level.** Normal operation adds no lines at all. What debug
+  lines exist mark a decision that was taken — a load recorded, a guess retired
+  — never an evaluation that concluded "no".
 """
 
 from __future__ import annotations
@@ -39,18 +53,27 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from . import habit as habit_mod
 from . import people as people_mod
 from . import plan as plan_mod
 from .const import (
+    CONF_LEARN_HABITS,
+    DEFAULT_LEARN_HABITS,
     GRID_BACK_CUSTOM_ID,
     GRID_DAY_CUSTOM_ID,
     GRID_SLOT_CUSTOM_IDS,
+    GUESS_BACK_CUSTOM_ID,
+    GUESS_OFF_CUSTOM_ID,
+    GUESS_RIGHT_CUSTOM_ID,
+    GUESS_WRONG_CUSTOM_ID,
     PANEL_CHANNEL_CUSTOM_ID,
     PANEL_DM_CUSTOM_ID,
+    PANEL_GUESS_CUSTOM_ID,
     PANEL_MONITOR_CUSTOM_ID,
     PANEL_OFF_CUSTOM_ID,
     PANEL_WEEK_CUSTOM_ID,
@@ -173,6 +196,156 @@ class _WeekButton(discord.ui.Button):
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to open the week grid")
             await self.assistant.async_report_error(interaction)
+
+
+class _GuessButton(discord.ui.Button):
+    """Open the 🔮 "here's what I think" panel (design doc §7.3)."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Fix a guess",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔮",
+            custom_id=PANEL_GUESS_CUSTOM_ID,
+            row=1,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_open_guess(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to open the guess panel")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GuessRightButton(discord.ui.Button):
+    """"That's right" — an acknowledgement, and deliberately nothing more.
+
+    §7.3 is exact that the model learns from **actual claims and explicit
+    corrections only**. A confirmation is neither: the loads that produced the
+    guess are already in history and already counted, so writing a row here
+    would be the guess feeding itself evidence with a human tap laundering it —
+    the precise drift the section exists to prevent. So this button stores
+    nothing, and the panel says so rather than implying a reward.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="That's right",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id=GUESS_RIGHT_CUSTOM_ID,
+            row=0,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_confirm_guess(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to acknowledge a guess")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GuessWrongButton(discord.ui.Button):
+    """"Wrong" — retire this guess (``habit.mark_prediction_wrong``)."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Wrong",
+            style=discord.ButtonStyle.secondary,
+            emoji="❌",
+            custom_id=GUESS_WRONG_CUSTOM_ID,
+            row=0,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_reject_guess(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to record a correction")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GuessOffButton(discord.ui.Button):
+    """"Stop guessing" — the person's ``predict`` preference, both ways.
+
+    §7.3 names only the off direction, but an opt-out with no way back is a
+    setting somebody has to edit a JSON store to undo (P7 — additive *and
+    reversible*). The label follows the state, so the same button is the way
+    out and the way back in.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant", *, predicting: bool) -> None:
+        super().__init__(
+            label="Stop guessing" if predicting else "Start guessing",
+            style=discord.ButtonStyle.secondary,
+            emoji="🚫" if predicting else "🔮",
+            custom_id=GUESS_OFF_CUSTOM_ID,
+            row=0,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_toggle_predict(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to toggle predictions")
+            await self.assistant.async_report_error(interaction)
+
+
+class _GuessBackButton(discord.ui.Button):
+    """Back to the settings panel.
+
+    Its own ``custom_id`` rather than the grid's, even though it does the same
+    thing: ``add_view`` keys the persistent registry by id, so two views sharing
+    one id means the second registration quietly wins for both.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="↩️",
+            custom_id=GUESS_BACK_CUSTOM_ID,
+            row=1,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_back_to_panel(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to return to the panel")
+            await self.assistant.async_report_error(interaction)
+
+
+class GuessView(discord.ui.View):
+    """The 🔮 panel's controls: the §7.3 three, plus back.
+
+    Two rows, at most four components. ``That's right`` and ``Wrong`` are only
+    added when there is a guess on screen to answer — a button that argues with
+    a sentence saying "I don't have a guess for you yet" is worse than no
+    button — but the registration template (built with no arguments) carries
+    every id, because an unregistered ``custom_id`` doesn't error, it silently
+    stops dispatching.
+    """
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        *,
+        has_guess: bool = True,
+        predicting: bool = True,
+    ) -> None:
+        super().__init__(timeout=None)
+        if has_guess:
+            self.add_item(_GuessRightButton(assistant))
+            self.add_item(_GuessWrongButton(assistant))
+        self.add_item(_GuessOffButton(assistant, predicting=predicting))
+        self.add_item(_GuessBackButton(assistant))
 
 
 class _GridDaySelect(discord.ui.Select):
@@ -310,10 +483,18 @@ class AssistantView(discord.ui.View):
     ``custom_id``, because one that was never registered doesn't error, it
     silently stops dispatching — a dead button, and a bug class this
     integration has already been bitten by.
+
+    Five components at most, in two rows: the three reminder modes on row 0,
+    and 👁 / 📅 / 🔮 on row 1. Discord allows 5 per row and 25 per message, so
+    row 1 has two slots left before anything has to move.
     """
 
     def __init__(
-        self, assistant: "LaundryAssistant", *, person: dict | None = None
+        self,
+        assistant: "LaundryAssistant",
+        *,
+        person: dict | None = None,
+        learning: bool = False,
     ) -> None:
         super().__init__(timeout=None)
         template = person is None
@@ -364,6 +545,13 @@ class AssistantView(discord.ui.View):
             # be reached, not invited to plan their week. Row 1 keeps it clear
             # of the three reminder-mode buttons on row 0.
             self.add_item(_WeekButton(assistant))
+        # 🔮 only exists while the house has day-learning on: with the option
+        # off there is no history, so the panel behind it could only ever say
+        # "nothing to show", and a button that can't do anything is worse than
+        # no button. The template still registers its id, so switching the
+        # option on doesn't leave a dead button until the next restart.
+        if template or (learning and onboarded):
+            self.add_item(_GuessButton(assistant))
 
 
 class LaundryAssistant:
@@ -373,9 +561,20 @@ class LaundryAssistant:
     Nothing here reaches back into the coordinator.
     """
 
-    def __init__(self, hass: HomeAssistant, bot: "DiscordBot") -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        bot: "DiscordBot",
+        entry: ConfigEntry | None = None,
+    ) -> None:
         self.hass = hass
         self.bot = bot
+        # The config entry, purely to read the one option this module owns.
+        # Deliberately the *entry* and not the coordinator: the dependency has
+        # to keep running one way (§14 rule 5), and options change by reloading
+        # the entry, which rebuilds this object anyway — so reading them once
+        # here can never go stale.
+        self._entry = entry
         self._store: Store = Store(
             hass, PLANNER_STORAGE_VERSION, PLANNER_STORAGE_KEY
         )
@@ -389,6 +588,26 @@ class LaundryAssistant:
         # just means the grid reopens on today — which is where it should start
         # anyway. Keyed by the string form of the id, like everything else here.
         self._grid_day: dict[str, int] = {}
+        # The habit model's two stores (design doc §12), both lists of rows
+        # carrying an id and a timestamp and nowhere to put a name. They live
+        # in *this* Store alongside people and overrides — one planner store,
+        # separate from the session, exactly as §12 draws it.
+        self._history: list[dict] = []
+        self._corrections: list[dict] = []
+
+    # ------------------------------------------------------------------ config
+    @property
+    def learn_habits(self) -> bool:
+        """Whether the house has day-learning switched on at all.
+
+        The outer of the two gates on every history write and every ``░``; the
+        inner one is the person's own 👁 Monitoring consent. Off by default
+        (§14 rule 7), and off means nothing is written *and* nothing is drawn.
+        """
+        if self._entry is None:
+            return DEFAULT_LEARN_HABITS
+        merged = {**self._entry.data, **self._entry.options}
+        return bool(merged.get(CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS))
 
     # ------------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -408,12 +627,28 @@ class LaundryAssistant:
         self._overrides = plan_mod.prune_overrides(
             plan_mod.normalise_overrides(raw), self._current_week()
         )
+        # History and corrections are normalised and aged **in memory** on the
+        # way in, and not written back: a load that changes nothing must not
+        # cost a store write, and startup is the definition of "nothing
+        # changed". The retention that matters is applied on the write path
+        # (habit.record_load / record_correction both prune), so the file on
+        # disk is bounded by the act of adding to it.
+        now = self._now()
+        raw_history = data.get("history") if isinstance(data, dict) else None
+        self._history = habit_mod.prune_history(raw_history, now)
+        raw_corrections = data.get("corrections") if isinstance(data, dict) else None
+        self._corrections = habit_mod.prune_corrections(raw_corrections, now)
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
         try:
             await self._store.async_save(
-                {"people": self._people, "overrides": self._overrides}
+                {
+                    "people": self._people,
+                    "overrides": self._overrides,
+                    "history": self._history,
+                    "corrections": self._corrections,
+                }
             )
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to save assistant prefs")
@@ -436,6 +671,96 @@ class LaundryAssistant:
         """Today's Monday-based weekday index, defaulting to Monday."""
         day = plan_mod.weekday_of(self._now())
         return day if day is not None else 0
+
+    # ------------------------------------------------------------- the model
+    async def async_note_claim(self, user_id) -> None:
+        """One real load happened, and this person claimed it (design doc §7.1).
+
+        The coordinator calls exactly this on a Claim tap and knows nothing
+        else about the model — not what a prediction is, not that history
+        exists. Everything that makes the tap safe to record lives here:
+
+        * **Two consent gates.** The house's ``learn_habits`` option, and then
+          this person's own 👁 Monitoring preference, passed to
+          :func:`habit.record_load` as ``monitor`` so the refusal happens at
+          the write itself. Monitoring off means *no row is written at all*
+          (§11) — not a row that later gets filtered out, because the one
+          mistake here that can't be undone by a later fix is having stored it.
+        * **A store write only when something changed.** ``record_load`` dedupes
+          within the hour, so Claim → Unclaim → Reclaim is one load and the
+          second tap returns the list unchanged; comparing before saving is
+          what keeps that from costing a disk write anyway. The same comparison
+          covers the monitoring-off case, which returns the pruned list and
+          therefore usually writes nothing at all.
+        * **Retention on the write path.** ``record_load`` prunes to 90 days and
+          caps the row count in the same call, so history is bounded by the act
+          of adding to it and never needs a sweeper.
+
+        Never raises. It is called from inside the Claim callback, and a
+        failure to log a load must not turn a successful claim into
+        "interaction failed".
+        """
+        try:
+            if not self.learn_habits:
+                return
+            monitor = people_mod.get_person(self._people, user_id)["monitor"]
+            updated = habit_mod.record_load(
+                self._history, user_id, self._now(), monitor=monitor
+            )
+            if updated == self._history:
+                return
+            self._history = updated
+            await self._async_save()
+            # A decision actually taken (a row exists now that didn't before),
+            # not a per-evaluation trace: the dedupe and consent paths above
+            # return before reaching this.
+            _LOGGER.debug("Logged a load for %s", user_id)
+        except Exception:  # noqa: BLE001 - never raise into a card callback
+            _LOGGER.exception("Failed to log a load for the habit model")
+
+    def _predicts_for(self, user_id) -> bool:
+        """Whether this person's guesses may be computed or shown at all.
+
+        Both gates again, plus the person's ``predict`` preference. Monitoring
+        is included on the *read* side deliberately: turning it off stops new
+        rows, but rows already stored would otherwise keep producing ``░`` for
+        somebody who just said stop watching me. Nothing is deleted — a toggle
+        somebody flips to see what it does must not destroy three months of
+        history — it simply stops being read.
+        """
+        if not self.learn_habits:
+            return False
+        person = people_mod.get_person(self._people, user_id)
+        return bool(person["predict"] and person["monitor"])
+
+    def _prediction(self, user_id) -> dict | None:
+        """This viewer's own top prediction, or None — usually None (P6)."""
+        if not self._predicts_for(user_id):
+            return None
+        return habit_mod.predict(
+            self._history, user_id, self._now(), self._corrections
+        )
+
+    def _predicted_cells(self, user_id) -> list[str]:
+        """The cells to draw as ``░`` — **only ever the viewer's own** (§11).
+
+        Every read in :mod:`habit` is scoped to one id, and the only id this is
+        ever called with is ``interaction.user.id``: the person looking at the
+        message. A prediction is a claim about one person's habits, and it is
+        never rendered into anything more than one person can see.
+
+        Deliberately the **top** guess alone, not every cell that clears the
+        gate. :func:`habit.predictions` can return up to three (4/3/3 of ten
+        loads all pass at 30%), but the 🔮 panel names exactly one and ❌ Wrong
+        retires exactly that one. Drawing the other two would put a ``░`` on
+        the grid that the only button for arguing with it cannot even mention,
+        let alone remove — and tapping Wrong about the Monday ``░`` would
+        silently discard the Thursday guess instead. P4 says the guesses are
+        visible *and correctable*; until the panel grows the doc's "📅 Wrong —
+        pick" step (§7.3), what is rendered is held to what can be corrected.
+        """
+        prediction = self._prediction(user_id)
+        return [prediction["cell"]] if prediction else []
 
     # --------------------------------------------------------------------- DMs
     async def async_send_dm(
@@ -561,6 +886,82 @@ class LaundryAssistant:
         await self._async_save()
         await self._async_rerender(interaction)
 
+    # ------------------------------------------------------------- the guess
+    async def async_open_guess(self, interaction: discord.Interaction) -> None:
+        """Answer 🔮 with what the model thinks, and the three ways to reply."""
+        await self._async_render_guess(interaction)
+
+    async def async_confirm_guess(self, interaction: discord.Interaction) -> None:
+        """"That's right" — acknowledged, and nothing is stored.
+
+        See :class:`_GuessRightButton`: confirming a guess is not one of the two
+        training signals §7.3 allows, and the loads behind it are already
+        counted. So this costs no store write and the panel says as much,
+        rather than implying the model was rewarded.
+        """
+        await self._async_render_guess(
+            interaction,
+            note="👍 Good — nothing to change, and nothing stored: the loads "
+            "behind this guess were already counted.",
+        )
+
+    async def async_reject_guess(self, interaction: discord.Interaction) -> None:
+        """"Wrong" — retire the guess for this cell (``mark_prediction_wrong``).
+
+        The cell is re-read at tap time rather than remembered from the render.
+        It is the same answer in every realistic case (nothing can change it
+        but a fresh claim), it survives a restart between opening the panel and
+        tapping, and "wrong" then always means the guess currently on screen
+        rather than one this process happens to still remember.
+        """
+        user_id = interaction.user.id
+        prediction = self._prediction(user_id)
+        cell = prediction["cell"] if prediction else None
+        if cell is None:
+            # Nothing to correct — most likely a second tap on a stale panel.
+            await self._async_render_guess(interaction)
+            return
+        self._corrections = habit_mod.mark_prediction_wrong(
+            self._corrections, user_id, cell, self._now()
+        )
+        await self._async_save()
+        _LOGGER.debug("Retired a prediction for %s", user_id)
+        await self._async_render_guess(
+            interaction,
+            note="✅ Dropped. I'll only put that slot back if you actually "
+            "wash then again — arguing from the same loads you just told me "
+            "were wrong would be me learning from myself.",
+        )
+
+    async def async_toggle_predict(self, interaction: discord.Interaction) -> None:
+        """"Stop guessing" / "Start guessing" — the ``predict`` preference."""
+        user_id = interaction.user.id
+        current = people_mod.get_person(self._people, user_id)["predict"]
+        self._people = people_mod.set_person(
+            self._people,
+            user_id,
+            predict=not current,
+            name=interaction.user.display_name,
+        )
+        await self._async_save()
+        _LOGGER.debug("Predictions %s for %s", "off" if current else "on", user_id)
+        await self._async_render_guess(interaction)
+
+    async def _async_render_guess(
+        self, interaction: discord.Interaction, *, note: str | None = None
+    ) -> None:
+        """Draw the 🔮 panel for this viewer, in place where possible."""
+        user_id = interaction.user.id
+        person = people_mod.get_person(self._people, user_id)
+        prediction = self._prediction(user_id)
+        embed = self._guess_embed(user_id, person, prediction, note=note)
+        view = GuessView(
+            self,
+            has_guess=prediction is not None,
+            predicting=bool(person["predict"]),
+        )
+        await self._async_respond(interaction, embed, view, edit=True)
+
     # -------------------------------------------------------------- the grid
     async def async_open_grid(self, interaction: discord.Interaction) -> None:
         """Answer 📅 with this person's own view of the week.
@@ -640,13 +1041,23 @@ class LaundryAssistant:
         decorative (the legend, the slot windows) lives *outside* the fence,
         because an emoji inside a code block breaks the alignment the whole
         display depends on.
+
+        ``expected`` is this viewer's own predicted cells and nobody else's.
+        The legend and the explainer both key off whether a ``░`` is *actually
+        on the block* rather than off whether a prediction exists, because
+        those differ: a guess whose cells have all been booked by somebody else
+        loses to those bookings and renders nothing. Asking the rendered string
+        is the one test that cannot drift from the renderer.
         """
+        expected = self._predicted_cells(user_id)
+        grid = plan_mod.render_grid(occupancy, viewer_id=user_id, expected=expected)
+        guessed = plan_mod.CELL_EXPECTED in grid
         embed = discord.Embed(
             title="📅 The week",
             description=(
-                f"```\n{plan_mod.render_grid(occupancy, viewer_id=user_id)}\n```\n"
-                f"{plan_mod.render_legend()}\n"
-                f"-# {plan_mod.render_windows()}"
+                f"```\n{grid}\n```\n"
+                + plan_mod.render_legend(expected=guessed)
+                + f"\n-# {plan_mod.render_windows()}"
             ),
             color=_COLOR_PANEL,
         )
@@ -656,6 +1067,16 @@ class LaundryAssistant:
             value=mine or "nothing booked — tap a slot below",
             inline=False,
         )
+        if guessed:
+            embed.add_field(
+                name="░ My guess at your usual days",
+                value=(
+                    "Worked out from your own loads, shown **only to you**, and "
+                    "never on a cell somebody has actually booked. Tap 🔮 on the "
+                    "panel to argue with it."
+                ),
+                inline=False,
+            )
         embed.add_field(
             name=f"Tap a slot for {plan_mod.DAY_NAMES[day]}",
             value=(
@@ -800,7 +1221,9 @@ class LaundryAssistant:
             embed = self._settings_embed(person, notice=notice)
         else:
             embed = self._welcome_embed(name, notice=notice)
-        return embed, AssistantView(self, person=person)
+        return embed, AssistantView(
+            self, person=person, learning=self.learn_habits
+        )
 
     def _welcome_embed(self, name: str, *, notice: bool) -> discord.Embed:
         """The 👋 first-time panel — the entire onboarding story, in private.
@@ -834,12 +1257,15 @@ class LaundryAssistant:
         return embed
 
     def _settings_embed(self, person: dict, *, notice: bool) -> discord.Embed:
-        """The 🤖 settings panel — current prefs, and the two controls we honour.
+        """The 🤖 settings panel — current prefs, and the controls we honour.
 
-        Slots, predictions and the week grid are deliberately absent: they
-        belong to later phases, and a button that does nothing yet is worse
-        than no button (design doc §15).
+        Every line here describes something that is actually true right now: a
+        panel claiming a setting that nothing reads is how a settings screen
+        stops being believed. So Monitoring reads differently depending on
+        whether the house has day-learning on, and the Guessing line only
+        appears when there is guessing to have an opinion about.
         """
+        learning = self.learn_habits
         embed = discord.Embed(
             title="🤖 Your laundry assistant",
             description=(
@@ -857,17 +1283,115 @@ class LaundryAssistant:
             # Never claim a delivery route that is currently failing.
             pings += "\n(your DMs are closed, so I'm using the channel)"
         embed.add_field(name="Pings", value=pings, inline=False)
-        embed.add_field(
-            name="Monitoring",
-            value=(
-                "👁 on — your loads can be logged, so I can learn the days you "
-                "usually wash"
-                if person["monitor"]
-                else "🚫 off — I won't log your loads at all"
+        if person["monitor"]:
+            monitoring = (
+                "👁 on — when you tap 🧺 Claim I note the day and time, so I can "
+                "work out the days you usually wash"
+                if learning
+                else "👁 on — your loads can be logged, so I can learn the days "
+                "you usually wash\n(day-learning is off for this channel, so "
+                "nothing is being logged — this is your answer for if it's "
+                "turned on)"
             )
-            + "\n(nothing is being logged yet — this is your answer for when it "
-            "is)",
-            inline=False,
-        )
+        else:
+            monitoring = "🚫 off — I won't log your loads at all"
+        embed.add_field(name="Monitoring", value=monitoring, inline=False)
+        if learning and person["monitor"]:
+            embed.add_field(
+                name="Guessing",
+                value=(
+                    "🔮 on — I'll mark the days I think you usually wash as ░ on "
+                    "**your** week, and nowhere else"
+                    if person["predict"]
+                    else "🚫 off — I won't guess your days"
+                ),
+                inline=False,
+            )
         embed.set_footer(text="No stats about you are ever shown to the house.")
         return embed
+
+    def _guess_embed(
+        self, user_id, person: dict, prediction: dict | None, *, note: str | None
+    ) -> discord.Embed:
+        """The 🔮 panel — what the model thinks, in the §7.3 wording.
+
+        The important case is the one with **no guess**, because for the first
+        month or so that is every case (P6). It says so plainly and shows the
+        arithmetic it is short of, rather than hedging its way into a sentence
+        that sounds like a prediction: "I think you *might* wash Thursdays" is
+        exactly the confident nonsense the gate exists to prevent, and somebody
+        who reads it once stops believing the ones that clear the bar.
+
+        The prose is :func:`habit.describe_prediction` and :func:`habit.explain`
+        rather than anything invented here — one place decides how a bucket is
+        said out loud, so the DM this becomes in the next phase can't drift
+        from the panel.
+        """
+        embed = discord.Embed(title="🔮 What I think", color=_COLOR_PANEL)
+        if prediction is not None:
+            where = habit_mod.describe_prediction(prediction)
+            why = habit_mod.explain(prediction)
+            body = f"I think you wash **{where}**"
+            body += f" — {why}." if why else "."
+            body += (
+                "\n\nThat's a guess from your own claims, and it never leaves "
+                "this message: nobody else sees it, on the week grid or "
+                "anywhere else."
+            )
+        elif not self.learn_habits:
+            body = (
+                "Day-learning is switched off for this channel, so I'm not "
+                "keeping any history and I've nothing to guess from."
+            )
+        elif not person["monitor"]:
+            body = (
+                "👁 Monitoring is off, so I'm not logging your loads and I "
+                "won't guess your days. Turn it back on from the panel if you "
+                "want me to."
+            )
+        elif not person["predict"]:
+            body = (
+                "Guessing is off — no ░ on your week, and I won't work out "
+                "your days. **Start guessing** puts it back; the loads I "
+                "already noted are still there."
+            )
+        else:
+            body = self._thin_data_text(user_id)
+        if note:
+            body = f"{note}\n\n{body}"
+        embed.description = body
+        embed.set_footer(
+            text="I only ever learn from real Claim taps and from this panel."
+        )
+        return embed
+
+    def _thin_data_text(self, user_id) -> str:
+        """Why there is no guess yet, in this person's own numbers.
+
+        Somebody who taps a button called *Fix a guess* and is told "nothing"
+        deserves to know whether that means *broken* or *give it a fortnight*,
+        and the three gates fail for genuinely different reasons (§7.2). Their
+        own two numbers — loads seen, weeks watched — plus the bar, is enough
+        to tell those apart without the panel pretending to a guess it doesn't
+        have. Both numbers are read scoped to this one id, like every read in
+        :mod:`habit`, so there is nothing here about anybody else.
+        """
+        now = self._now()
+        loads = habit_mod.load_count(self._history, user_id, now)
+        weeks = habit_mod.history_weeks(self._history, user_id, now)
+        if loads == 0:
+            seen = "I haven't seen you claim a load yet"
+        else:
+            seen = (
+                f"So far I've noted **{loads} "
+                f"{'load' if loads == 1 else 'loads'}** of yours over "
+                f"**{weeks:.0f} {'week' if round(weeks) == 1 else 'weeks'}**"
+            )
+        return (
+            "Nothing yet — and for the first few weeks that's the normal "
+            f"answer, not a fault.\n\n{seen}. Before I'll say anything I need "
+            f"**{habit_mod.MIN_OBSERVATIONS} loads in the same slot**, that "
+            f"slot to be at least **{habit_mod.MIN_SHARE_PERCENT}%** of your "
+            f"loads, and **{habit_mod.MIN_WEEKS} weeks** of history. Miss one "
+            "of those and I'd rather say nothing than guess at you."
+        )

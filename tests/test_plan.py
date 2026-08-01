@@ -40,6 +40,7 @@ cell_char = _plan.cell_char
 cell_key = _plan.cell_key
 describe_cells = _plan.describe_cells
 effective_week = _plan.effective_week
+expected_cells = _plan.expected_cells
 holders = _plan.holders
 is_mine = _plan.is_mine
 is_taken = _plan.is_taken
@@ -459,6 +460,97 @@ def test_the_legend_does_not_promise_a_state_nothing_produces() -> None:
     assert CELL_EXPECTED not in render_legend(personal=True)
     assert CELL_EXPECTED not in render_legend(personal=False)
     assert CELL_EXPECTED not in render_grid(week, 1)
+
+
+# --- predictions (design doc §7 / §11) --------------------------------------
+
+
+def test_a_prediction_draws_on_a_free_cell_for_its_own_viewer() -> None:
+    people = {"1": _person(THU_EVE)}
+    week = effective_week(people, {}, WEEK)
+    assert render_grid(week, 1, expected=[SUN_AM, "0-mid"]) == (
+        "      Mo Tu We Th Fr Sa Su\n"
+        "AM     ·  ·  ·  ·  ·  ·  ░\n"
+        "Mid    ░  ·  ·  ·  ·  ·  ·\n"
+        "PM     ·  ·  ·  ·  ·  ·  ·\n"
+        "Eve    ·  ·  ·  █  ·  ·  ·"
+    )
+    # The stored pair form works too — a cell key is a cell key wherever it
+    # came from — and the block stays exactly as wide as it was.
+    for line in render_grid(week, 1, expected=[[6, "am"]]).split("\n"):
+        assert len(line) == GRID_WIDTH
+
+
+def test_a_real_booking_always_beats_a_guess() -> None:
+    # The precedence rule, from both sides. A booking is something somebody
+    # said; a guess is arithmetic about their past. If the guess could cover
+    # the booking, the grid would answer "is Thursday evening spoken for?" with
+    # the bot's opinion instead of the house's plans.
+    people = {"1": _person(THU_EVE), "2": _person(SUN_AM)}
+    week = effective_week(people, {}, WEEK)
+    # Predicted onto a cell the viewer holds: still █, never ░.
+    assert cell_char(week, THU_EVE, 1, [THU_EVE]) == CELL_MINE
+    # Predicted onto a cell somebody *else* holds: still ▓. The guess loses,
+    # and the fact that it was made is not visible either.
+    assert cell_char(week, SUN_AM, 1, [SUN_AM]) == CELL_TAKEN
+    assert render_grid(week, 1, expected=[THU_EVE, SUN_AM]) == render_grid(week, 1)
+    # ...and only once the booking goes away does the guess get the cell.
+    freed = effective_week(people, {WEEK: {SUN_AM: []}}, WEEK)
+    assert cell_char(freed, SUN_AM, 1, [SUN_AM]) == CELL_EXPECTED
+
+
+def test_a_prediction_is_never_rendered_for_anybody_but_its_viewer() -> None:
+    # §11: a guess is a statement about one person's habits, and leaking it is
+    # worse than leaking a booking. The anonymous board has no viewer, so it
+    # must have no ░ — whatever it is handed.
+    week = effective_week({"1": _person(THU_EVE)}, {}, WEEK)
+    assert CELL_EXPECTED not in render_grid(week, None, expected=[SUN_AM])
+    assert CELL_EXPECTED not in render_grid(week, expected=[SUN_AM])
+    assert cell_char(week, SUN_AM, None, [SUN_AM]) == CELL_FREE
+    assert expected_cells([SUN_AM], None) == []
+    assert expected_cells([SUN_AM]) == []
+    # The shared board is byte-identical whether a guess exists or not.
+    assert render_grid(week, expected=[SUN_AM, "0-am"]) == render_grid(week)
+
+
+def test_expected_cells_are_normalised_deduped_and_ordered() -> None:
+    assert expected_cells([SUN_AM, [3, "eve"], "3-eve", "junk", None, 7], 1) == [
+        THU_EVE,
+        SUN_AM,
+    ]
+    assert expected_cells(None, 1) == []
+    assert expected_cells("3-eve", 1) == []  # a bare string is not a list
+    assert expected_cells((THU_EVE,), 1) == [THU_EVE]
+    # A junk guess renders as no guess rather than raising in a callback.
+    week = effective_week({}, {}, WEEK)
+    assert CELL_EXPECTED not in render_grid(week, 1, expected=["9-eve", "x"])
+
+
+def test_the_legend_gains_the_guess_only_when_one_is_on_the_grid() -> None:
+    assert render_legend(personal=True, expected=True) == (
+        f"{CELL_MINE} yours  {CELL_TAKEN} taken  "
+        f"{CELL_EXPECTED} expected  {CELL_FREE} free"
+    )
+    # No guess in play: unchanged, because an entry for a character that isn't
+    # on the block reads as a bug in the renderer.
+    assert render_legend(personal=True, expected=False) == (
+        f"{CELL_MINE} yours  {CELL_TAKEN} taken  {CELL_FREE} free"
+    )
+    # The anonymous board can never show one, so it never says it can — even
+    # when a caller gets the flag wrong.
+    assert render_legend(personal=False, expected=True) == (
+        f"{CELL_TAKEN} taken  {CELL_FREE} free"
+    )
+
+
+def test_a_predicted_grid_is_still_ascii_and_still_fits_a_phone() -> None:
+    week = effective_week({"1": _person(THU_EVE)}, {WEEK: {SUN_AM: ["2"]}}, WEEK)
+    rendered = render_grid(week, 1, expected=["0-am", "2-pm", "4-eve"])
+    allowed = set(" \n" + CELL_FREE + CELL_TAKEN + CELL_MINE + CELL_EXPECTED)
+    for char in rendered:
+        assert char.isascii() or char in allowed
+    for line in rendered.split("\n"):
+        assert len(line) == GRID_WIDTH
 
 
 def test_your_own_cells_can_be_listed_back_to_you() -> None:

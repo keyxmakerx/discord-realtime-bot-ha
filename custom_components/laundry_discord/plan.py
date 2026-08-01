@@ -22,7 +22,8 @@ wrong:
 * **The grid is anonymous** (design doc P5 / §11). Nothing rendered here can
   identify anybody: not a name, and not a count either, because in a house of
   seven "3 people want Thursday night" is one conversation away from naming
-  them. A cell is free, taken, or yours. That is the whole vocabulary.
+  them. A cell is free, taken, yours, or — only ever for the person looking at
+  it — expected. That is the whole vocabulary.
 * **Nothing is mutated.** Every function returns new data, like the other pure
   modules, so a rejected store write can't half-apply.
 
@@ -78,9 +79,12 @@ DAY_NAMES = (
 CELL_FREE = "·"
 CELL_TAKEN = "▓"
 CELL_MINE = "█"
-# Reserved for the Phase 4 model guess ("expected"). Nothing produces it yet,
-# so it is deliberately absent from :func:`render_legend`: a legend entry for a
-# state that can never appear reads as a bug in the renderer.
+# The habit model's guess ("expected"): the days :mod:`habit` thinks *the person
+# looking* usually washes. It sits below every real booking in the density ramp
+# and is the only cell state that is not a fact — see :func:`cell_char` for the
+# precedence rule, and :func:`expected_cells` for why it can only ever be the
+# viewer's own. It stays out of :func:`render_legend` unless a guess is actually
+# in play: a legend entry for a state that cannot appear reads as a renderer bug.
 CELL_EXPECTED = "░"
 
 # Every rendered line is exactly this wide. The cap that matters is ~30
@@ -428,22 +432,66 @@ def toggle_booking(people, overrides, week, cell, user_id):
 
 
 # --- rendering ---------------------------------------------------------------
-def cell_char(occupancy, cell, viewer_id=None) -> str:
+def expected_cells(expected, viewer_id=None) -> list[str]:
+    """The cells that may render as ``░`` for this viewer — normalised, ordered.
+
+    **Empty whenever there is no viewer**, and that is the important line in
+    this module. A prediction is a statement about one person's habits, and
+    §11's whole point is that nothing about one person is ever shown to the
+    house: a booking at least represents something they chose to publish, while
+    a guess is the bot telling six other people what it thinks somebody's week
+    looks like. Leaking it is strictly worse than leaking a booking.
+
+    Making the viewer-less case return ``[]`` here — rather than trusting every
+    call site to pass nothing for the shared board — is what makes that
+    structural. :func:`render_grid` with no ``viewer_id`` cannot produce a ``░``
+    no matter what it is handed, so the anonymous board has no path to one.
+
+    The caller supplies the cells (:func:`habit.predicted_cells` in practice);
+    this module has no history and does no arithmetic. Junk is dropped, dupes
+    collapse and the order is fixed, exactly as :func:`normalise_slots` does.
+    """
+    if viewer_id is None or not isinstance(expected, (list, tuple, set, frozenset)):
+        return []
+    keys: list[str] = []
+    for item in expected:
+        key = normalise_cell(item)
+        if key is not None and key not in keys:
+            keys.append(key)
+    keys.sort(key=_cell_order)
+    return keys
+
+
+def cell_char(occupancy, cell, viewer_id=None, expected=None) -> str:
     """The one character this cell renders as, for this viewer.
 
-    ``viewer_id=None`` is the shared board: no viewer, so no "yours" state, so
-    the same string for everybody. That is the *only* difference between the
-    private grid and the pinned one, which is what keeps them one renderer.
+    ``viewer_id=None`` is the shared board: no viewer, so no "yours" state and
+    no "expected" state, so the same string for everybody. That is the *only*
+    difference between the private grid and the pinned one, which is what keeps
+    them one renderer.
+
+    **Precedence: a real booking always beats a guess.** The order below is
+    holders first, prediction second, free last — so ``░`` can only ever appear
+    on a cell that is otherwise *free*, and can never cover a ``▓`` or a ``█``.
+    That is not a cosmetic choice. A booking is something a person actually
+    said; a prediction is the bot's arithmetic about somebody's past. If a guess
+    could hide a booking, the grid would answer "is Thursday evening spoken
+    for?" with the bot's opinion instead of the house's plans — and the one job
+    this display has is making real contention visible (§8). Being wrong the
+    other way costs nothing: a predicted cell that somebody then books simply
+    stops being a guess and starts being a fact.
     """
     held = holders(occupancy, cell)
-    if not held:
-        return CELL_FREE
-    if viewer_id is not None and str(viewer_id) in held:
-        return CELL_MINE
-    return CELL_TAKEN
+    if held:
+        if viewer_id is not None and str(viewer_id) in held:
+            return CELL_MINE
+        return CELL_TAKEN
+    if cell in expected_cells(expected, viewer_id):
+        return CELL_EXPECTED
+    return CELL_FREE
 
 
-def render_grid(occupancy, viewer_id=None) -> str:
+def render_grid(occupancy, viewer_id=None, expected=None) -> str:
     """The week, as a monospace block. Deterministic for a given input.
 
     Renders **per viewer** — your cells are ``█``, everybody else's are ``▓``,
@@ -452,32 +500,50 @@ def render_grid(occupancy, viewer_id=None) -> str:
     Rendering differently for each viewer is exactly why the interactive grid
     has to be ephemeral — one shared message can only have one rendering.
 
+    ``expected`` is the habit model's guess at **this viewer's own** usual days
+    (design doc §7), drawn as ``░`` on cells that are otherwise free. Passing
+    somebody else's cells here would be a §11 leak, so the guard is in
+    :func:`expected_cells` rather than in a comment: with no ``viewer_id`` there
+    is no prediction, full stop.
+
     ASCII and block characters only, and every line exactly
     :data:`GRID_WIDTH` (26) characters, comfortably inside the ~30 a phone
     shows before it wraps. The legend lives in :func:`render_legend` because it
     belongs *outside* the code block, where emoji would be legal.
     """
+    predicted = expected_cells(expected, viewer_id)
     lines = [" " * (_LABEL_WIDTH + 1) + " ".join(DAY_ABBRS)]
     for slot in SLOTS:
         row = SLOT_LABELS[slot].ljust(_LABEL_WIDTH)
         for weekday in range(7):
-            char = cell_char(occupancy, f"{weekday}-{slot}", viewer_id)
+            char = cell_char(occupancy, f"{weekday}-{slot}", viewer_id, predicted)
             row += char.rjust(_CELL_WIDTH)
         lines.append(row)
     return "\n".join(lines)
 
 
-def render_legend(personal: bool = True) -> str:
+def render_legend(personal: bool = True, expected: bool = False) -> str:
     """The key to the grid, for the line under the block.
 
     ``personal=False`` drops "yours", because a shared message has no single
-    viewer and can never contain that state. ``░ expected`` is missing from
-    both on purpose — nothing produces it until the habit model lands, and a
-    legend entry for a state you can never see is just confusing.
+    viewer and can never contain that state — and for the same reason it drops
+    ``░ expected`` unconditionally, whatever ``expected`` says. The anonymous
+    board cannot render a prediction (:func:`expected_cells`), so a legend
+    promising one would be describing a state that board can never show.
+
+    ``expected`` is likewise the *caller's* answer to "is a guess actually on
+    this grid right now", not "does this feature exist": with no confident
+    prediction there is no ``░`` on the block, and a legend entry for a
+    character that isn't there reads as a bug in the renderer.
     """
-    if personal:
-        return f"{CELL_MINE} yours  {CELL_TAKEN} taken  {CELL_FREE} free"
-    return f"{CELL_TAKEN} taken  {CELL_FREE} free"
+    if not personal:
+        return f"{CELL_TAKEN} taken  {CELL_FREE} free"
+    if expected:
+        return (
+            f"{CELL_MINE} yours  {CELL_TAKEN} taken  "
+            f"{CELL_EXPECTED} expected  {CELL_FREE} free"
+        )
+    return f"{CELL_MINE} yours  {CELL_TAKEN} taken  {CELL_FREE} free"
 
 
 def render_windows() -> str:

@@ -121,7 +121,8 @@ class LaundryCoordinator:
         # and the DM plumbing. The dependency runs one way — the coordinator
         # asks it to deliver a message or open a panel, and it never touches
         # session state — so a fault in there can't reach the state machine.
-        self.assistant = LaundryAssistant(hass, self.bot)
+        # It gets the entry to read its own options; it does not get `self`.
+        self.assistant = LaundryAssistant(hass, self.bot, entry)
 
         # Session state (persisted).
         self.stage: str = STAGE_IDLE
@@ -1092,6 +1093,11 @@ class LaundryCoordinator:
             self.waiting = False
         await self._async_save()
         self._notify_entities()
+        # A Claim tap is the habit model's only data point (design doc §7.1),
+        # and reporting it is the whole of the coordinator's involvement:
+        # consent, de-duplication, retention and whether any of it is ever
+        # rendered are the assistant's business. Never raises.
+        await self.assistant.async_note_claim(user_id)
         return True
 
     async def handle_unclaim(self) -> bool:

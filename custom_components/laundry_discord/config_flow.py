@@ -27,6 +27,7 @@ from .const import (
     CONF_ENERGY_LOAD_JUMP,
     CONF_HANDOFF_FALLBACK,
     CONF_JOB_STATE_ENTITY,
+    CONF_LEARN_HABITS,
     CONF_MACHINE_STATE_ENTITY,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_QUEUE_EXPIRY,
@@ -43,6 +44,7 @@ from .const import (
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_HANDOFF_FALLBACK,
+    DEFAULT_LEARN_HABITS,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_QUEUE_EXPIRY,
     DEFAULT_RUNNING_ENTITY,
@@ -173,6 +175,10 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Required(
                 CONF_SHOW_ASSISTANT,
                 default=defaults.get(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_LEARN_HABITS,
+                default=defaults.get(CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS),
             ): selector.BooleanSelector(),
         }
     )
@@ -320,6 +326,7 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     ),
                     CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
                     CONF_SHOW_ASSISTANT: user_input[CONF_SHOW_ASSISTANT],
+                    CONF_LEARN_HABITS: user_input[CONF_LEARN_HABITS],
                 }
             )
 

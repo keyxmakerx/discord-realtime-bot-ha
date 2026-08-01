@@ -412,6 +412,14 @@ def first_load_ts(history, user_id, moment=None) -> float | None:
     return rows[0]["ts"] if rows else None
 
 
+def _days_from_rows(rows: list[dict], moment) -> float:
+    """:func:`history_days` against rows already read. See :func:`_stats_from_rows`."""
+    now = moment_ts(moment)
+    if not rows or now is None:
+        return 0.0
+    return max(0.0, (now - rows[0]["ts"]) / SECONDS_PER_DAY)
+
+
 def history_days(history, user_id, moment) -> float:
     """How long the bot has been watching this person, in days.
 
@@ -421,11 +429,7 @@ def history_days(history, user_id, moment) -> float:
     counting distinct active weeks instead would quietly require eight weeks of
     a fortnightly washer before it said anything.
     """
-    first = first_load_ts(history, user_id, moment)
-    now = moment_ts(moment)
-    if first is None or now is None:
-        return 0.0
-    return max(0.0, (now - first) / SECONDS_PER_DAY)
+    return _days_from_rows(history_for(history, user_id, moment), moment)
 
 
 def history_weeks(history, user_id, moment) -> float:
@@ -568,16 +572,10 @@ def next_day_cell(cell) -> str | None:
 
 
 # --- prediction (design doc §7.2) -------------------------------------------
-def bucket_counts(history, user_id, corrections=None, moment=None) -> dict[str, int]:
-    """This person's ``cell -> loads`` histogram, corrections applied.
-
-    Only their own rows, only rows with a bucket, and only rows a "that's
-    wrong" hasn't retired. Cells they have never washed in are absent rather
-    than zero, so the caller can iterate the dict.
-    """
-    vetoes = _veto_map(corrections, user_id)
+def _counts_from_rows(rows: list[dict], vetoes: dict[str, float]) -> dict[str, int]:
+    """:func:`bucket_counts` against rows already read."""
     counts: dict[str, int] = {}
-    for row in history_for(history, user_id, moment):
+    for row in rows:
         cell = row["cell"]
         if cell is None:
             continue
@@ -588,25 +586,34 @@ def bucket_counts(history, user_id, corrections=None, moment=None) -> dict[str, 
     return counts
 
 
-def bucket_stats(history, user_id, cell, moment, corrections=None) -> dict:
-    """Everything behind one cell's verdict — the numbers *and* the gates.
+def bucket_counts(history, user_id, corrections=None, moment=None) -> dict[str, int]:
+    """This person's ``cell -> loads`` histogram, corrections applied.
 
-    P4 says the guesses are visible and correctable, which means the UI has to
-    be able to show the arithmetic ("5 of your last 8 loads") and, just as
-    usefully, why there is *no* guess: the gates come back individually so
-    "you've only washed twice on a Thursday" and "you wash whenever" are
-    distinguishable answers rather than one shrug.
+    Only their own rows, only rows with a bucket, and only rows a "that's
+    wrong" hasn't retired. Cells they have never washed in are absent rather
+    than zero, so the caller can iterate the dict.
+    """
+    return _counts_from_rows(
+        history_for(history, user_id, moment), _veto_map(corrections, user_id)
+    )
 
-    The share is deliberately a percentage of **all** their retained loads, not
-    of some recent window: a bucket is a habit when it dominates what they
-    actually do, and a denominator that quietly shrank would make anybody look
-    regular after a quiet fortnight.
+
+def _stats_from_rows(rows: list[dict], counts: dict[str, int], weeks, cell) -> dict:
+    """:func:`bucket_stats` against work already done — the arithmetic only.
+
+    The split exists because :func:`predictions` asks about every candidate
+    cell, and the three inputs (this person's rows, their histogram, their span
+    in weeks) are identical for all of them. Reading them per cell meant
+    :func:`normalise_history` rebuilding and re-sorting the *whole house's*
+    history ~84 times for one grid tap — a tenth of a second on x86 and close
+    to a second on a Pi, spent inside a Discord interaction callback on HA's
+    event loop. Nothing here is cached or remembered between calls: the
+    functions stay pure, the work just happens once per answer instead of once
+    per cell.
     """
     key = plan.normalise_cell(cell)
-    total = load_count(history, user_id, moment)
-    counts = bucket_counts(history, user_id, corrections, moment)
+    total = len(rows)
     count = counts.get(key, 0) if key else 0
-    weeks = history_weeks(history, user_id, moment)
     gates = {
         GATE_OBSERVATIONS: count >= MIN_OBSERVATIONS,
         # Integer maths on purpose: `count / total >= 0.30` is a float
@@ -629,6 +636,25 @@ def bucket_stats(history, user_id, cell, moment, corrections=None) -> dict:
     }
 
 
+def bucket_stats(history, user_id, cell, moment, corrections=None) -> dict:
+    """Everything behind one cell's verdict — the numbers *and* the gates.
+
+    P4 says the guesses are visible and correctable, which means the UI has to
+    be able to show the arithmetic ("5 of your last 8 loads") and, just as
+    usefully, why there is *no* guess: the gates come back individually so
+    "you've only washed twice on a Thursday" and "you wash whenever" are
+    distinguishable answers rather than one shrug.
+
+    The share is deliberately a percentage of **all** their retained loads, not
+    of some recent window: a bucket is a habit when it dominates what they
+    actually do, and a denominator that quietly shrank would make anybody look
+    regular after a quiet fortnight.
+    """
+    rows = history_for(history, user_id, moment)
+    counts = _counts_from_rows(rows, _veto_map(corrections, user_id))
+    return _stats_from_rows(rows, counts, _days_from_rows(rows, moment) / 7, cell)
+
+
 def predictions(history, user_id, moment, corrections=None) -> list[dict]:
     """Every bucket this person clears the gate on, most-washed first.
 
@@ -637,11 +663,16 @@ def predictions(history, user_id, moment, corrections=None) -> list[dict]:
     "prediction" from being a shrug that covers the whole week. Ties break on
     day-then-slot order so two equal buckets always come back the same way
     round.
+
+    This person's rows, their histogram and their span are read **once** and
+    reused across every candidate cell (see :func:`_stats_from_rows`); it is
+    the same answer :func:`bucket_stats` gives per cell, computed without
+    re-reading the store's whole history once per cell.
     """
-    stats = [
-        bucket_stats(history, user_id, cell, moment, corrections)
-        for cell in bucket_counts(history, user_id, corrections, moment)
-    ]
+    rows = history_for(history, user_id, moment)
+    counts = _counts_from_rows(rows, _veto_map(corrections, user_id))
+    weeks = _days_from_rows(rows, moment) / 7
+    stats = [_stats_from_rows(rows, counts, weeks, cell) for cell in counts]
     confident = [s for s in stats if s["confident"]]
     confident.sort(key=lambda s: (-s["count"], _cell_order(s["cell"])))
     return confident

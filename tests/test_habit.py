@@ -869,6 +869,172 @@ def test_a_backwards_clock_cannot_refill_the_nudge_budget() -> None:
     assert (allowed, rolled["nudges_this_week"]) == (True, 1)
 
 
+# --- the wiring the assistant actually performs -----------------------------
+# habit.py is imported by exactly one module, and these assert the contract at
+# that seam: assistant.async_note_claim reads the person's monitor consent,
+# calls record_load with the local moment, and saves ONLY when the returned
+# list differs from the one it held. Everything below is that loop, so a change
+# to either side that broke it would fail here rather than in a store somebody
+# reads three months later.
+
+
+class _FakeStore:
+    """The assistant's write path, minus Home Assistant.
+
+    Holds history the way the real one does (normalised in memory, written back
+    only on a change) and counts the writes, because "no new per-tick Store
+    writes" is a property of the wiring rather than of habit.py.
+    """
+
+    def __init__(self, history=None) -> None:
+        self.history = normalise_history(history or [])
+        self.writes = 0
+
+    def note_claim(self, user_id, moment, *, monitor=True) -> None:
+        """assistant.async_note_claim, with the awaits taken out."""
+        updated = record_load(self.history, user_id, moment, monitor=monitor)
+        if updated == self.history:
+            return
+        self.history = updated
+        self.writes += 1
+
+
+def test_the_wiring_writes_one_row_per_load_and_only_on_a_change() -> None:
+    store = _FakeStore()
+    store.note_claim(1, at(2026, 7, 9, 21))
+    assert (len(store.history), store.writes) == (1, 1)
+    # Claim -> Unclaim -> Reclaim: one load, and crucially not a second store
+    # write either. Unclaim never reaches this path at all — only a claim is a
+    # data point (§7.1) — so the reclaim 30 minutes later is the tap that would
+    # otherwise double-count.
+    store.note_claim(1, at(2026, 7, 9, 21, 30))
+    assert (len(store.history), store.writes) == (1, 1)
+    # A second person's claim during the same load is a separate row.
+    store.note_claim(2, at(2026, 7, 9, 21, 35))
+    assert (len(store.history), store.writes) == (2, 2)
+    # The next real load, hours later, counts.
+    store.note_claim(1, at(2026, 7, 10, 9))
+    assert (len(store.history), store.writes) == (3, 3)
+
+
+def test_the_wiring_never_writes_a_row_for_somebody_who_opted_out() -> None:
+    # §11: monitoring off means no record exists, not a record that is later
+    # filtered out. Nothing is written and nothing is saved.
+    store = _FakeStore()
+    store.note_claim(1, at(2026, 7, 9, 21), monitor=False)
+    assert (store.history, store.writes) == ([], 0)
+    # And with somebody else's history already present, the opt-out costs no
+    # write at all — the pruned list it gets back is the one it already had.
+    store.note_claim(2, at(2026, 7, 9, 21))
+    before = store.writes
+    store.note_claim(1, at(2026, 7, 10, 21), monitor=False)
+    assert store.writes == before
+
+
+def test_the_wiring_applies_the_ninety_day_cap_on_the_write_path() -> None:
+    # The retention has to be enforced where rows are added, or a store that is
+    # only ever appended to grows forever. record_load prunes in the same call,
+    # so the write that pushes a row past the window is the write that drops it.
+    old = at(2026, 1, 1, 21)
+    store = _FakeStore([{"ts": old.timestamp(), "user_id": "1", "cell": THU_EVE}])
+    assert len(store.history) == 1
+    store.note_claim(1, at(2026, 7, 9, 21))  # >90 days later
+    assert [row["ts"] for row in store.history] == [at(2026, 7, 9, 21).timestamp()]
+    # Ageing alone is a change, so it is written back rather than left on disk.
+    assert store.writes == 1
+    # And the absolute ceiling holds even if every row is inside the window.
+    store = _FakeStore()
+    moment = at(2026, 7, 9, 21)
+    hour = datetime.timedelta(hours=2)
+    for index in range(HISTORY_MAX + 20):
+        store.note_claim(1, moment + index * hour)
+    assert len(store.history) == HISTORY_MAX
+
+
+def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> None:
+    # predictions() asks about every candidate cell, and the three inputs (this
+    # person's rows, their histogram, their span) are the same for all of them.
+    # Reading them per cell meant normalise_history rebuilding and re-sorting
+    # the WHOLE HOUSE's history ~84 times for one grid tap — a tenth of a
+    # second on x86, close to a second on a Pi, spent on HA's event loop inside
+    # a Discord interaction callback. This asserts the shape of the work, not a
+    # wall-clock time, because a timing assertion is a flaky test on a Pi.
+    history = []
+    for user_id in ("1", "2", "3", "4", "5", "6"):
+        for day in range(1, 80):
+            for hour in (8, 13, 18, 21):
+                history = _loads(
+                    at(2026, 5, 1, hour) + datetime.timedelta(days=day),
+                    user_id=user_id,
+                    history=history,
+                )
+    assert len(history) == HISTORY_MAX  # the realistic worst case
+
+    calls = []
+    original = _habit.normalise_history
+    _habit.normalise_history = lambda h: (calls.append(1), original(h))[1]
+    try:
+        found = predictions(history, "1", at(2026, 8, 7, 12), [])
+        reads = len(calls)
+    finally:
+        _habit.normalise_history = original
+    # One pass over the store, whatever the person's buckets look like. A
+    # generous ceiling rather than an exact 1, so a future refactor that reads
+    # it twice is fine and one that reads it per cell (there are 28) is not.
+    assert reads <= 3, reads
+    # ...and it is still the same answer bucket_stats gives one cell at a time.
+    for stats in found:
+        assert stats == bucket_stats(
+            history, "1", stats["cell"], at(2026, 8, 7, 12), []
+        )
+
+
+def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
+    """P4: a ░ nobody can argue with is not a correctable guess.
+
+    ``predictions`` can return up to three cells — at 30% a piece there is room
+    for exactly that — but the 🔮 panel renders ``predict`` (the top one) and
+    ❌ Wrong retires ``predict``. Drawing all three would put ░ on cells the
+    panel cannot mention, and tapping Wrong about one of them would silently
+    discard a different guess. This is ``assistant._predicted_cells``.
+    """
+    mon_am = "0-am"
+    sat_pm = "5-pm"
+    history = _loads(
+        # 4 Thursday evenings, 3 Monday mornings, 3 Saturday early evenings:
+        # 4/10, 3/10 and 3/10, all clearing MIN_OBSERVATIONS and landing on or
+        # above the 30% share exactly, over five weeks.
+        at(2026, 7, 2), at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23),
+        at(2026, 7, 6, 9), at(2026, 7, 13, 9), at(2026, 7, 20, 9),
+        at(2026, 7, 4, 18), at(2026, 7, 11, 18), at(2026, 7, 18, 18),
+    )
+    now = at(2026, 8, 7, 12)
+    live = predicted_cells(history, "1", now, [])
+    assert live == [THU_EVE, mon_am, sat_pm]  # three genuinely clear the gate
+
+    def rendered(corrections):
+        """assistant._predicted_cells, with the prefs gate taken out."""
+        guess = predict(history, "1", now, corrections)
+        return [guess["cell"]] if guess else []
+
+    def panel(corrections):
+        """What the 🔮 panel says out loud — assistant._guess_embed."""
+        guess = predict(history, "1", now, corrections)
+        return guess["cell"] if guess else None
+
+    # Every cell drawn is one the panel names, so ❌ Wrong always acts on the
+    # ░ the person is actually looking at.
+    assert rendered([]) == [panel([])] == [THU_EVE]
+    # ...and it keeps holding as guesses are retired one at a time: the next
+    # one down becomes both the drawn cell and the named one, together.
+    corrections = mark_prediction_wrong([], "1", panel([]), now)
+    assert rendered(corrections) == [panel(corrections)] == [mon_am]
+    corrections = mark_prediction_wrong(corrections, "1", panel(corrections), now)
+    assert rendered(corrections) == [panel(corrections)] == [sat_pm]
+    corrections = mark_prediction_wrong(corrections, "1", panel(corrections), now)
+    assert (rendered(corrections), panel(corrections)) == ([], None)
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -23,6 +23,7 @@ CONF_ENERGY_LOAD_JUMP = "energy_load_jump"
 CONF_HANDOFF_FALLBACK = "handoff_fallback"
 CONF_QUEUE_EXPIRY = "queue_expiry"
 CONF_SHOW_ASSISTANT = "show_assistant"
+CONF_LEARN_HABITS = "learn_habits"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -103,6 +104,19 @@ MAX_QUEUE_EXPIRY = 72
 # and it is the only place a newcomer or a guest can find out what the buttons
 # do. Turning it off hides the button entirely — existing prefs are kept.
 DEFAULT_SHOW_ASSISTANT = True
+# Whether the habit model runs at all: logging a Claim tap to history, and
+# drawing ░ on somebody's own week where it thinks they usually wash.
+#
+# **Default off**, per design doc §14 rule 7 — every new behaviour is behind an
+# option and starts off, so anything misbehaving is one toggle away from gone.
+# The 🤖 panel is the documented exception ("inert when unused"); this is not
+# inert, because it writes to a store on every claim.
+#
+# Off means off at both ends: no history rows are written and no guess is
+# rendered, so a house that never turns it on never accumulates a byte of it.
+# Per-person consent is a *second*, independent gate on top of this one (the 👁
+# Monitoring toggle, §11) — the house switch can never override somebody's no.
+DEFAULT_LEARN_HABITS = False
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -162,6 +176,16 @@ GRID_SLOT_CUSTOM_IDS = {
     "pm": "laundry_discord_grid_pm",
     "eve": "laundry_discord_grid_eve",
 }
+# 🔮 Fix a guess (design doc §7.3) — the panel that shows what the habit model
+# thinks, and the three ways to answer it. Same registry rule again: all five
+# ids go into views handed to add_view, including the 🔮 button itself, which is
+# hidden while day-learning is off but must still dispatch the moment it is
+# switched on rather than waiting for the next restart.
+PANEL_GUESS_CUSTOM_ID = "laundry_discord_panel_guess"
+GUESS_RIGHT_CUSTOM_ID = "laundry_discord_guess_right"
+GUESS_WRONG_CUSTOM_ID = "laundry_discord_guess_wrong"
+GUESS_OFF_CUSTOM_ID = "laundry_discord_guess_off"
+GUESS_BACK_CUSTOM_ID = "laundry_discord_guess_back"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"

@@ -42,7 +42,8 @@
           "availability_grace": "Hold last ETA through a connection blip (minutes)",
           "handoff_fallback": "Handoff backstop — ping whoever's next this long after a load finishes when the claimant never tapped \"Emptied it\" (minutes, 0 disables)",
           "queue_expiry": "\"I'm next\" expiry — drop somebody from the line this long after they tapped it, so a stale line never strands a handoff (hours)",
-          "show_assistant": "Show the 🤖 assistant button on the card — opens a private panel with the first-time explainer and each person's ping settings (DM / channel / off). Off hides the button; anything already chosen in it keeps working."
+          "show_assistant": "Show the 🤖 assistant button on the card — opens a private panel with the first-time explainer and each person's ping settings (DM / channel / off). Off hides the button; anything already chosen in it keeps working.",
+          "learn_habits": "Learn the days each person washes — note the day and time of each 🧺 Claim, and mark the slots somebody usually uses as ░ on their own week grid. Off by default. Nothing is ever shown to the channel and nobody sees anyone else's guesses; each person can also switch themselves off with 👁 Monitoring in the 🤖 panel."
         }
       }
     }

@@ -231,15 +231,20 @@ How should I reach you when something's actually for you?
 🤖 Your laundry assistant
 
   Pings        💬 In the channel, with an @mention
-  Monitoring   👁 on — your loads can be logged
+  Monitoring   👁 on — when you tap Claim I note the day and time
+  Guessing     🔮 on — I'll mark your usual days as ░ on your week
 
-[ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ] [ 👁 Monitoring: on ]
+[ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ]
+[ 👁 Monitoring: on ] [ 📅 My week ] [ 🔮 Fix a guess ]
         Only you can see this
 ```
 
-Two settings, and deliberately only two — the week grid, day-guessing and slot
-trades are later phases of the [planner design](docs/rsvp-planner-design.md), and
-a button that does nothing yet is worse than no button:
+Everything on it is something that's actually true right now — a settings screen
+that lists a preference nothing reads stops being believed. So the **Guessing**
+line only appears when there's guessing to have an opinion about, and 🔮 is
+absent entirely while day-learning is off for the channel. Slot trades are a
+later phase of the [planner design](docs/rsvp-planner-design.md), and a button
+that does nothing yet is worse than no button:
 
 - **Pings** — where the messages that are **about you** go: your load finishing,
   and the "washer's free" handoff after you tapped 🔜. Nothing else moves.
@@ -252,11 +257,15 @@ a button that does nothing yet is worse than no button:
   - **🚫 No pings** — the message is still posted and you're still *named*, but
     push-silently and with the mention suppressed. It removes the buzz, not the
     information — the same trade 🌙 Quiet already makes on the card.
-- **Monitoring** — per-person consent to logging your loads, so a later phase can
-  learn the days you usually wash. Nothing is logged yet; this is your answer for
-  when it is, recorded now so the answer exists before the question does. **No
-  stats about anyone are ever shown to the household** — no streaks, no counts,
-  no "who does the most laundry."
+- **Monitoring** — per-person consent to logging your loads, which is what lets
+  the bot work out the days you usually wash (**The 🔮 day guesses**, below).
+  Off means your Claim taps are **never written down at all** — not written and
+  then filtered out. While the channel has day-learning switched off, nothing is
+  logged for anyone and this is simply your answer for if it's switched on.
+  **No stats about anyone are ever shown to the household** — no streaks, no
+  counts, no "who does the most laundry."
+- **📅 My week** and **🔮 Fix a guess** open the two displays below: the week
+  grid, and what the bot thinks your usual days are.
 
 #### When Discord won't let the bot DM you
 
@@ -340,6 +349,96 @@ possible even before it'd be unreadable on a phone. The block is kept to 26
 characters wide for the same reason, and everything decorative lives outside the
 code fence, since an emoji inside one breaks the column alignment the whole grid
 depends on.
+
+### The 🔮 day guesses (`░`)
+
+Turn on **Learn the days each person washes** in the options and the bot starts
+noticing something it has always had and never used: **every 🧺 Claim tap is a
+labelled data point** — this person ran a load, at this time, on this day. Six
+weeks of that is a per-person histogram of when you actually do laundry, for
+free, with nothing to fill in and nothing to ask.
+
+A fourth character then appears on **your own** grid:
+
+```
+      Mo Tu We Th Fr Sa Su
+AM     ·  ·  ▓  ·  ·  ▓  ·
+Mid    ·  ·  ·  ▓  ·  ·  ·
+PM     ▓  ·  ·  ▓  ·  ·  ▓
+Eve    ·  ▓  ·  ░  ·  ▓  ·
+
+█ yours  ▓ taken  ░ expected  · free
+```
+
+**`░` means "I think you usually wash then."** It is a guess from your own past
+loads — not a booking, not something anybody asked for, and not something you
+have to act on. It appears only where a slot is otherwise **free**: a real
+booking, yours or anyone else's, always wins, so a guess can never sit on top of
+`▓` or `█` and hide it. The grid's job is to show you what the house has
+actually planned; the bot's opinion is strictly the layer underneath.
+
+> **Your guesses are yours alone.** Nobody else ever sees them — not on their
+> grid, not on the pinned board (which has no viewer and therefore no `░` at
+> all), not in the channel, not in a DM to anyone. This is a stricter rule than
+> the one covering bookings, and deliberately so: a booking is something you
+> chose to put on a shared board, while a guess is the bot telling other people
+> what it reckons your week looks like. In a house of seven that's how a plan
+> board turns into a scoreboard.
+
+**Silence is the default, for about a month.** A slot is only ever guessed at
+when *all three* of these hold: at least **3 loads** in that same slot, that slot
+is at least **30%** of your loads, and there are at least **4 weeks** of history
+for you. Miss one and you get nothing — not a hedged "maybe Thursdays?", which is
+the sort of thing you stop believing after reading it once. For the first few
+weeks after switching this on, **no `░` anywhere is the correct behaviour.**
+
+#### Arguing with it
+
+**🔮 Fix a guess** on the assistant panel shows the guess and the arithmetic
+behind it:
+
+```
+🔮 What I think
+I think you wash Thursday evenings — 5 of your last 8 loads.
+
+[ ✅ That's right ] [ ❌ Wrong ] [ 🚫 Stop guessing ] [ ↩️ Back ]
+```
+
+- **✅ That's right** — acknowledged, and nothing is stored. The loads behind the
+  guess are already counted; a "confirm" row would just be the guess feeding
+  itself evidence with your tap laundering it.
+- **❌ Wrong** — the guess for that slot is retired. It isn't blacklisted
+  forever: the only thing that brings it back is you actually washing then
+  again. Being told "no" and then arguing from the same loads would be the model
+  learning from itself with extra steps.
+- **🚫 Stop guessing** — no more `░` for you, ever, and no guessing done on your
+  behalf. Tapping it again (**🔮 Start guessing**) puts it back; the loads
+  already noted are still there.
+
+And if there's no guess yet, it says so plainly, with your own numbers and the
+bar it hasn't cleared — never an invented one.
+
+#### Turning it off
+
+Three independent switches, any of which stops it:
+
+| Switch | Where | Effect |
+|--------|-------|--------|
+| **Learn the days each person washes** | integration options | The house-wide master. **Off by default.** Nothing is logged for anybody and no `░` is drawn. |
+| **👁 Monitoring** | 🤖 panel, per person | Your loads are never written to history at all — not written and then filtered, simply not written. Also stops any guessing about you, so switching it off makes the existing history stop being read too (it isn't deleted; a toggle you flipped to see what it does shouldn't destroy three months of data). |
+| **🔮 Stop guessing** | 🔮 panel, per person | Keeps logging, stops guessing. For somebody who's happy to feed a future reminder but doesn't want the grid marked up. |
+
+History lives in the same planner `Store` as the panel's preferences, **never
+leaves your Home Assistant instance**, and is **capped at 90 days** — the cap is
+applied every time a row is written, so it's bounded by the act of using it
+rather than by a cleanup job somebody has to remember. A row holds a timestamp,
+a user id and a slot; there is nowhere in it to put a name.
+
+> **Nothing in this version DMs you.** Predictions exist, are visible on your own
+> grid and can be argued with — and that's the whole of it. The reminders that
+> use them (the Sunday check-in and the day-of nudge, with a hard budget of 1 DM
+> a day and 2 a week) are the next phase, deliberately after this one, so the
+> guesses are correctable *before* anything reaches a phone.
 
 ### Entities it creates
 
@@ -511,10 +610,15 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   change, and a second permanent message has to earn its place in a channel
   whose whole premise is one card per load. Worth revisiting once the house has
   lived with the ephemeral grid for a week.
+- ~~A model of the days each person usually washes.~~ **Shipped** as the first
+  half of Phase 4 — 🔮 above: history from Claim taps, confidence-gated guesses
+  drawn as `░` on your own grid, and the corrections that train it.
 - The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
-  habit-based DM reminders on the days you usually wash (Phase 4) and a
-  double-blind slot trade broker (Phase 5). The 🔜 queue was Phase 1 and shipped
-  alone, because it's the only phase that touches the session machine.
+  the DM reminders those guesses are *for* — a Sunday check-in and an
+  event-driven nudge on the day, under a hard budget of 1 DM a day and 2 a week
+  (the second half of Phase 4) — and a double-blind slot trade broker (Phase 5).
+  The 🔜 queue was Phase 1 and shipped alone, because it's the only phase that
+  touches the session machine.
 
 ## License
 
