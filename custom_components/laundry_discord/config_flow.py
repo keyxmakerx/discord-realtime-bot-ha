@@ -37,6 +37,7 @@ from .const import (
     CONF_REMIND_DMS,
     CONF_RUNNING_ENTITY,
     CONF_SHOW_ASSISTANT,
+    CONF_TRADES,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
@@ -57,6 +58,7 @@ from .const import (
     DEFAULT_REMIND_DMS,
     DEFAULT_RUNNING_ENTITY,
     DEFAULT_SHOW_ASSISTANT,
+    DEFAULT_TRADES,
     DOMAIN,
     MAX_AVAILABILITY_GRACE,
     MAX_CONFIRM_DELAY,
@@ -229,6 +231,15 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
+            # The other switch that lets the bot start a conversation — this
+            # one on another housemate's behalf. Independent of the reminder
+            # DMs above: a house can want swaps without wanting the bot to
+            # guess anybody's days, and the two contact people for entirely
+            # different reasons. Off by default, like everything that can DM.
+            vol.Required(
+                CONF_TRADES,
+                default=defaults.get(CONF_TRADES, DEFAULT_TRADES),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -382,6 +393,7 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_PLAN_DM_WEEKDAY: int(user_input[CONF_PLAN_DM_WEEKDAY]),
                     CONF_PLAN_DM_TIME: str(user_input[CONF_PLAN_DM_TIME]),
                     CONF_NUDGE_LEAD: int(user_input[CONF_NUDGE_LEAD]),
+                    CONF_TRADES: user_input[CONF_TRADES],
                 }
             )
 

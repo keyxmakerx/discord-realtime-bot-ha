@@ -439,12 +439,13 @@ applied every time a row is written, so it's bounded by the act of using it
 rather than by a cleanup job somebody has to remember. A row holds a timestamp,
 a user id and a slot; there is nowhere in it to put a name.
 
-### The reminder DMs (the one thing here that messages you first)
+### The reminder DMs (the one thing here that messages you *first*)
 
-> **Read this bit even if you skim the rest.** Everything else in this
+> **Read this bit even if you skim the rest.** Almost everything else in this
 > integration *answers* something — a button, a meter, a finished load. This is
-> the only feature that decides on its own to put a message on your phone. It is
-> **off by default**, and turning it off again is one toggle:
+> the only feature that decides **on its own** to put a message on your phone.
+> (🔁 Swap requests below can also DM you, but a housemate is doing the asking,
+> not the bot.) It is **off by default**, and turning it off again is one toggle:
 > **Settings → Devices & Services → Laundry Discord Bot → Configure →
 > _Send reminder DMs_**. Off means off: with it off, nothing here is scheduled,
 > nothing is evaluated and nothing is sent.
@@ -544,6 +545,111 @@ Two deliberate choices worth stating plainly:
 - **A bounced DM still costs you a nudge from the budget.** Otherwise somebody
   with closed DMs gets retried at every single trigger, forever.
 
+### 🔁 Swap requests (the double-blind broker)
+
+> **The second — and last — feature here that can put a message on somebody's
+> phone unasked.** It is **off by default**
+> (**Configure → _Swap requests_**), and unlike the reminders above, the bot
+> isn't the one deciding to send it: a housemate is. Off means off — no 🔁
+> button, no request can be written, no DM can be produced.
+
+The week grid makes contention visible, and then you're staring at a Thursday
+evening somebody else is down for. Booking it anyway is allowed and always has
+been — a plan is information, not permission, and tapping a taken slot still
+books you in alongside them. This is the other option: **ask.**
+
+```
+📅 The week
+      Mo Tu We Th Fr Sa Su
+AM     ·  ·  ▓  ·  ·  ▓  ·
+Mid    ·  ·  ·  ▓  ·  ·  ·
+PM     ▓  ·  ·  ▓  ·  ·  ▓
+Eve    ·  █  ·  █  ·  ▓  ·
+
+🔁 Thursday Eve
+That one's spoken for. Want me to ask? You're down for it either way —
+this would ask whoever else is, anonymously, whether they'd swap.
+
+[ Pick a day ▾ ] [ AM ] [ Mid ] [ PM ] [ Eve ] [ ↩️ Back ] [ 🔁 Ask to swap ]
+```
+
+🔁 shows you exactly what would be sent before it sends anything, then the
+holder gets this — and **nothing else**:
+
+```
+🔁 Someone's asking about your slot
+Someone's asking about Thursday Eve. They'd offer you Wednesday Eve in
+return. I haven't told them whose slot it is, and I won't tell you whose
+ask it is unless you say yes.
+
+[ ✅ Trade ]  [ ❌ Pass ]  [ 🚫 Don't ask me again ]
+```
+
+- **✅ Trade** — the slots actually swap on the grid, and **both names are
+  revealed to both of you**. That's the point at which you have to coordinate,
+  and you live together.
+- **❌ Pass** — the asker is told *"they passed."* No name, no reason, nothing to
+  read into. Nothing to be awkward about at breakfast.
+- **🚫 Don't ask me again** — that person can never ask you again, permanently.
+  They're told the same thing a plain pass tells them, so a block is
+  indistinguishable from a no.
+- **Ignoring it** is a legitimate answer. The ask lapses after 48 hours and
+  nobody hears any more about it.
+
+#### Why anonymous
+
+Because a named version of this is a completely different feature. "Alex wants
+your Thursday" is a request from a specific person you have to live with, and
+saying no to it costs something; "someone's asking about Thursday Eve" costs
+nothing to refuse. The same logic that keeps names off the grid keeps them off
+this: in a house of seven, the moment a plan board can be used to work out who's
+being unreasonable, people stop putting anything on it.
+
+So **"someone" is the only word the bot uses** until an accept. Not the DM, not
+the grid, not an embed field, not a dropdown option, and not an error message —
+including the case where the bot *can't* ask. A refusal to ask reads identically
+whether that person blocked you, has their DMs shut, is paused, is already
+fielding somebody else's ask, or has had their one DM for the day: *"I can't ask
+about that one right now. Nothing to read into it."* If it said anything more
+specific, you could learn something about a person you can't even name.
+
+#### Every guardrail, spelled out
+
+A house of seven means a swap request is one step away from being a way to
+pester somebody. All of these are enforced in code, and each one blocks on its
+own:
+
+| Guardrail | What it means |
+|---|---|
+| **One ask per slot, per person, per week** | Whatever became of it — accepted, refused, or never answered. An ask nobody replied to still used up your ask; re-asking somebody who ignored you is the exact thing this stops. |
+| **A refused slot is shut to everybody** | If anyone is told no about Thursday Eve, nobody can ask about Thursday Eve again until next week. Otherwise "no" to one person is an invitation to the other five, and the holder can't even tell it apart — every ask is anonymous. |
+| **🚫 Don't ask me again is permanent** | Per requester-pair, stored on your own record, and there is no way for the asker to undo it. Everybody else is unaffected, and the blocked person is never told. |
+| **One ask in flight, in each direction** | At most one request waiting on you at a time, so you never open Discord to a queue of people wanting your Thursday. And at most **2** outstanding asks of your own. |
+| **You must have a slot to offer** | You can only ask if you've put something on the board yourself, and the offer has to be a slot you actually hold. A swap with nothing on the other side is just a request to give something up. |
+| **They have to be reachable** | Somebody with reminders 🚫 off, on the channel default, paused, with DMs closed, or who has never opened the 🤖 panel **cannot be asked at all**. Never opening the panel is not "unset", it's *not opted in*. |
+| **You have to be reachable too** | The answer comes back as a DM hours later and it's the only way you find out — so you need 📬 **DM me** on before you can ask. |
+| **The daily DM budget** | A swap request counts against the recipient's **1 DM per person per day** cap. Whatever else is true, this integration puts at most one unprompted message on your phone a day, swaps included. |
+| **Asks expire** | 48 hours, and then it's dead — it can't be answered, and a tap on the old DM does nothing. A week's plan is worthless a week later. Nothing sits in the store past the week it belongs to. |
+
+**On the weekly budget — a deliberate exception, argued rather than assumed.**
+The reminder DMs are capped at **2 per person per week** as well as 1 per day. A
+swap request spends the **daily** cap but **not** the weekly one. The reason:
+the weekly cap exists to bound how often *the bot's own arithmetic* starts a
+conversation with you — the Sunday check-in and the day-of nudge are the model
+deciding it has something to say about your habits. A swap request isn't the
+bot's idea; it's a housemate asking about a slot you put on a shared board, and
+it carries a question only you can answer. Charging it to the weekly allowance
+would mean one swap request silences, for the rest of the week, the reminders
+you actually opted into — the guardrail damaging the feature it isn't even
+about. And the anti-pestering job that cap would do here is already done, better,
+by the rules above, which know what a swap *is*: a shared counter can't tell six
+people asking once from one person asking six times, and those rules can. The
+daily cap is what keeps the ceiling honest, and it is not negotiable.
+
+Requests live in the same planner `Store` as everything else, are pruned to the
+current week, and hold two ids, two slots and a timestamp — there is nowhere in
+one to put a name.
+
 ### Entities it creates
 
 | Entity | Meaning |
@@ -626,9 +732,10 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | "I'm next" expiry *(options)* | `12` h | How long a 🔜 tap stays in the line before it ages out. |
 | Show the 🤖 assistant button *(options)* | `true` | Puts the 🤖 button on the card. It's inert until tapped — no pings, no channel lines, nothing stored — and it's the only place a newcomer finds out what the other buttons do. Turning it off hides the button; anything already chosen in the panel keeps working. |
 | Learn the days each person washes *(options)* | `false` | The habit model: logs each 🧺 Claim and draws `░` on that person's own grid. See [The 🔮 day guesses](#the--day-guesses-). |
-| **Send reminder DMs** *(options)* | `false` | **The only setting that lets the bot message somebody who didn't tap anything first.** Needs day-learning on as well, and only ever DMs a person who chose **📬 DM me** in 🤖. Max 1 DM per person per day, 2 per week. See [The reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first). |
+| **Send reminder DMs** *(options)* | `false` | **The only setting that lets the bot decide on its own to message somebody who didn't tap anything first.** Needs day-learning on as well, and only ever DMs a person who chose **📬 DM me** in 🤖. Max 1 DM per person per day, 2 per week. See [The reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first). |
 | Weekly plan DM — day / time *(options)* | Sunday, `18:00` | When the weekly check-in goes out. Ignored while reminder DMs are off. |
 | Day-of nudge backstop *(options)* | `60` min | How long before the **end of somebody's slot** to nudge them if the washer never came free during it. The nudge normally fires the moment the washer is actually free inside their slot; whichever happens first wins and only one is ever sent. |
+| **Swap requests** *(options)* | `false` | Lets one housemate ask another, **anonymously**, to trade slots — the other setting that can DM somebody unprompted, except here a person is doing the asking. Only an accept reveals the two names. One ask per slot per person per week, a refused slot shut to everyone for the week, a permanent per-pair 🚫, one ask in flight each way, a 48h expiry, and the recipient's 1-DM-a-day budget. See [🔁 Swap requests](#-swap-requests-the-double-blind-broker). |
 
 > **Ping note:** the only push per load is a *user* mention of the claimant, sent
 > as a small separate message when the load finishes. If nobody claimed it, no
@@ -664,13 +771,13 @@ this match.
 - **Persistent buttons.** Every button uses a persistent view (`timeout=None` +
   fixed `custom_id`) and the views re-registered on startup deliberately contain
   **every** `custom_id` — claim, unclaim, quiet, next, emptied, 🤖, the panel's
-  own controls and the reminder DMs' replies — not just the ones the current
-  card happens to show. An unregistered `custom_id` doesn't error, it silently
+  own controls, the reminder DMs' replies and the 🔁 swap request's three
+  answers — not just the ones the current card happens to show. An unregistered `custom_id` doesn't error, it silently
   stops dispatching, which looks exactly like a dead button. The 🤖 button is
   registered even when the option hides it, and the reminder replies even when
   reminders are off, so switching an option doesn't leave a dead button behind
   until the next restart — and a DM already sitting in an inbox can always still
-  say **🔕 Stop asking**.
+  say **🔕 Stop asking** or **🚫 Don't ask me again**.
 - **Restart-safe sessions.** The active message ID, stage, waiting flag,
   claimant, the 🔜 line and the "emptied" flag are persisted with HA's `Store`.
   On startup an in-progress session is restored — ETA edits resume and the
@@ -728,11 +835,13 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   washer actually coming free rather than on a clock, under a hard budget of 1 DM
   a day and 2 a week. Off by default, and the only feature here that starts a
   conversation.
-- The rest of the planner (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
-  a double-blind slot trade broker (Phase 5), then the optional extras — a PNG
-  grid renderer, an HA `calendar.laundry` mirror and a `/laundry` slash command
-  (Phase 6). The 🔜 queue was Phase 1 and shipped alone, because it's the only
-  phase that touches the session machine.
+- ~~A double-blind slot trade broker.~~ **Shipped** as Phase 5 — 🔁 above: an
+  anonymous ask, a pass that says nothing, an accept that names both of you, and
+  a stack of guardrails that are the actual feature. Off by default.
+- The optional extras (see [`docs/rsvp-planner-design.md`](docs/rsvp-planner-design.md)):
+  a PNG grid renderer, an HA `calendar.laundry` mirror and a `/laundry` slash
+  command (Phase 6). The 🔜 queue was Phase 1 and shipped alone, because it's the
+  only phase that touches the session machine.
 
 ## License
 

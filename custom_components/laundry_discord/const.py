@@ -28,6 +28,7 @@ CONF_REMIND_DMS = "remind_dms"
 CONF_PLAN_DM_WEEKDAY = "plan_dm_weekday"
 CONF_PLAN_DM_TIME = "plan_dm_time"
 CONF_NUDGE_LEAD = "nudge_lead"
+CONF_TRADES = "trades"
 
 # --- Defaults ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -150,6 +151,21 @@ DEFAULT_PLAN_DM_TIME = "18:00:00"
 DEFAULT_NUDGE_LEAD = 60
 MIN_NUDGE_LEAD = 5
 MAX_NUDGE_LEAD = 180
+# Whether somebody can ask for a slot another person has (design doc §9). The
+# second option in this integration that lets the bot contact somebody who
+# didn't tap anything first — and the only one where the *cause* is another
+# housemate rather than the bot's own arithmetic — so it is off by default
+# (§14 rule 7 / P7), and off means inert: no 🔁 button is rendered, no request
+# is ever written and no DM can be produced.
+#
+# It is not sufficient on its own either. A trade DM needs, on top of this: the
+# recipient to have chosen 📬 DM in the 🤖 panel and not be paused, the asker to
+# hold a slot of their own to offer, and every §9 guardrail to be clear — one
+# ask per slot per person per week, no re-asking a slot somebody was refused
+# that week, no pair that has used 🚫, one ask in flight per person either way,
+# and the recipient's 1-DM-a-day budget. Turning it on for a house where nobody
+# has opened the panel sends exactly nothing.
+DEFAULT_TRADES = False
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -256,6 +272,24 @@ PLAN_STOP_CUSTOM_ID = "laundry_discord_plan_stop"
 NUDGE_ON_IT_CUSTOM_ID = "laundry_discord_nudge_on_it"
 NUDGE_PUSH_CUSTOM_ID = "laundry_discord_nudge_push"
 NUDGE_SKIP_CUSTOM_ID = "laundry_discord_nudge_skip"
+# The trade broker (design doc §9). Same registry rule as everything else: all
+# seven ids go into views handed to add_view, registered unconditionally even
+# with trades switched off — a request DM already sitting in somebody's inbox
+# must still be answerable, and "🚫 Don't ask me again" is the last button in
+# this integration that should ever say "interaction failed".
+#
+# Nothing per-request can go in a custom_id: a per-request id cannot be a
+# persistent view, so the button would die at the next restart. Which request a
+# tap answers is resolved from the recipient plus the DM's own timestamp
+# (``trade.match_request``), which is why only one ask may be waiting on one
+# person at a time.
+TRADE_ASK_CUSTOM_ID = "laundry_discord_trade_ask"
+TRADE_OFFER_CUSTOM_ID = "laundry_discord_trade_offer"
+TRADE_SEND_CUSTOM_ID = "laundry_discord_trade_send"
+TRADE_BACK_CUSTOM_ID = "laundry_discord_trade_back"
+TRADE_ACCEPT_CUSTOM_ID = "laundry_discord_trade_accept"
+TRADE_PASS_CUSTOM_ID = "laundry_discord_trade_pass"
+TRADE_BLOCK_CUSTOM_ID = "laundry_discord_trade_block"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"

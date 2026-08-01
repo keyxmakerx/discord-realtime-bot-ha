@@ -14,7 +14,13 @@ from discord.utils import MISSING
 
 from homeassistant.core import HomeAssistant
 
-from .assistant import AssistantView, GridView, GuessView
+from .assistant import (
+    AssistantView,
+    GridView,
+    GuessView,
+    TradeAskView,
+    TradeRequestView,
+)
 from .const import (
     ASSISTANT_CUSTOM_ID,
     CLAIM_CUSTOM_ID,
@@ -394,6 +400,14 @@ class LaundryDiscordClient(discord.Client):
                 # button that should ever answer "interaction failed".
                 self.add_view(PlanDMView(self.coordinator.assistant))
                 self.add_view(NudgeView(self.coordinator.assistant))
+                # The trade broker's panel and its request DM. Registered
+                # whatever the trades option currently says, for the same
+                # reason as the reminder DMs: an ask already sitting in
+                # somebody's inbox has to keep working, and "🚫 Don't ask me
+                # again" is the last button here that should ever answer
+                # "interaction failed".
+                self.add_view(TradeAskView(self.coordinator.assistant))
+                self.add_view(TradeRequestView(self.coordinator.assistant))
                 self._view_registered = True
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to register persistent views")

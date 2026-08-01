@@ -829,11 +829,11 @@ def nudges_this_week(budget, moment) -> int:
     return account["nudges_this_week"]
 
 
-def check_nudge(budget, moment) -> str:
-    """Whether a DM is allowed right now, and if not, which cap said no.
+def _clock_verdict(budget, moment) -> str | None:
+    """:data:`BUDGET_UNREADABLE` when this moment cannot be counted, else None.
 
-    Returns :data:`BUDGET_OK` / :data:`BUDGET_DAY` / :data:`BUDGET_WEEK` /
-    :data:`BUDGET_UNREADABLE`. An unreadable moment denies: if we cannot tell
+    Shared by both caps so there is one answer to "is this a moment we may
+    charge a message against". An unreadable moment denies: if we cannot tell
     what day it is we cannot count, and the safe direction for a message budget
     is always "don't send" (P6 again — a missed nudge costs nothing, an
     uncounted one is how a cap silently stops existing).
@@ -848,10 +848,44 @@ def check_nudge(budget, moment) -> str:
     ts = moment_ts(moment)
     if last is not None and ts is not None and ts < last:
         return BUDGET_UNREADABLE
+    return None
+
+
+def check_nudge(budget, moment) -> str:
+    """Whether a DM is allowed right now, and if not, which cap said no.
+
+    Returns :data:`BUDGET_OK` / :data:`BUDGET_DAY` / :data:`BUDGET_WEEK` /
+    :data:`BUDGET_UNREADABLE`.
+    """
+    verdict = _clock_verdict(budget, moment)
+    if verdict is not None:
+        return verdict
     if nudges_today(budget, moment) >= MAX_NUDGES_PER_DAY:
         return BUDGET_DAY
     if nudges_this_week(budget, moment) >= MAX_NUDGES_PER_WEEK:
         return BUDGET_WEEK
+    return BUDGET_OK
+
+
+def check_daily_cap(budget, moment) -> str:
+    """The **day** cap alone — for a DM the weekly allowance does not fund.
+
+    :data:`MAX_NUDGES_PER_DAY` is the ceiling on unprompted DMs of every kind,
+    and nothing is allowed past it. :data:`MAX_NUDGES_PER_WEEK` is a different
+    promise: it bounds how often *the bot's own arithmetic* starts a
+    conversation with you, which is why the Sunday check-in and the day-of
+    nudge spend it. A message another housemate asked the bot to pass on
+    (:mod:`trade`) is not the bot's initiative, and letting one of those eat the
+    week's allowance would silence the reminders somebody actually opted into.
+
+    So this reads and reports only the day window. Callers that mean "a nudge"
+    want :func:`check_nudge`; there is no third answer.
+    """
+    verdict = _clock_verdict(budget, moment)
+    if verdict is not None:
+        return verdict
+    if nudges_today(budget, moment) >= MAX_NUDGES_PER_DAY:
+        return BUDGET_DAY
     return BUDGET_OK
 
 
@@ -877,6 +911,29 @@ def record_nudge(budget, moment) -> dict:
     return updated
 
 
+def record_daily_nudge(budget, moment) -> dict:
+    """Count one sent DM against the **day** window only.
+
+    The weekly counter is deliberately left exactly as it was — see
+    :func:`check_daily_cap` for why. ``last_nudge_ts`` *is* advanced, because it
+    is the record of when this person's phone last buzzed on our account, and
+    :func:`nudge.already_nudged_in_slot` reads it to keep two triggers from
+    talking about one evening twice. A trade DM at 20:30 therefore also stands
+    down the day-of nudge for that slot, which is the honest answer: the person
+    has already been messaged.
+    """
+    updated = normalise_budget(budget)
+    day = day_key(moment)
+    if day is None:
+        return updated
+    ts = moment_ts(moment)
+    if ts is not None:
+        updated["last_nudge_ts"] = ts
+    updated["nudges_today"] = nudges_today(budget, moment) + 1
+    updated["nudge_day"] = day
+    return updated
+
+
 def claim_nudge(budget, moment) -> tuple[bool, dict]:
     """Spend one nudge if there is one to spend.
 
@@ -894,8 +951,20 @@ def claim_nudge(budget, moment) -> tuple[bool, dict]:
     return (True, record_nudge(budget, moment))
 
 
-def claim_nudge_for(budgets, user_id, moment) -> tuple[bool, dict]:
-    """:func:`claim_nudge` against a whole mapping. Returns ``(allowed, all)``.
+def claim_daily_nudge(budget, moment) -> tuple[bool, dict]:
+    """Spend one **day**-capped DM if there is one to spend.
+
+    The trade broker's half of :func:`claim_nudge`, and deliberately the same
+    shape: deciding and recording are one call, over budget is dropped rather
+    than queued, and the denial path returns the accounting unchanged.
+    """
+    if check_daily_cap(budget, moment) != BUDGET_OK:
+        return (False, normalise_budget(budget))
+    return (True, record_daily_nudge(budget, moment))
+
+
+def _claim_for(budgets, user_id, moment, claim) -> tuple[bool, dict]:
+    """One person's claim, against a whole mapping. ``(allowed, all)``.
 
     The mapping comes back rebuilt with exactly one record for this person, so
     an int key left over from an in-memory write can never end up shadowing
@@ -903,7 +972,17 @@ def claim_nudge_for(budgets, user_id, moment) -> tuple[bool, dict]:
     two nudges a day.
     """
     key = str(user_id)
-    allowed, account = claim_nudge(budget_for(budgets, user_id), moment)
+    allowed, account = claim(budget_for(budgets, user_id), moment)
     updated = {k: v for k, v in normalise_budgets(budgets).items() if k != key}
     updated[key] = account
     return (allowed, updated)
+
+
+def claim_nudge_for(budgets, user_id, moment) -> tuple[bool, dict]:
+    """:func:`claim_nudge` against a whole mapping. Returns ``(allowed, all)``."""
+    return _claim_for(budgets, user_id, moment, claim_nudge)
+
+
+def claim_daily_nudge_for(budgets, user_id, moment) -> tuple[bool, dict]:
+    """:func:`claim_daily_nudge` against a whole mapping. ``(allowed, all)``."""
+    return _claim_for(budgets, user_id, moment, claim_daily_nudge)

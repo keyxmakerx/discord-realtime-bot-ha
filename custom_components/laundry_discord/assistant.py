@@ -48,6 +48,7 @@ stand:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -61,9 +62,12 @@ from homeassistant.util import dt as dt_util
 from . import habit as habit_mod
 from . import people as people_mod
 from . import plan as plan_mod
+from . import trade as trade_mod
 from .const import (
     CONF_LEARN_HABITS,
+    CONF_TRADES,
     DEFAULT_LEARN_HABITS,
+    DEFAULT_TRADES,
     GRID_BACK_CUSTOM_ID,
     GRID_DAY_CUSTOM_ID,
     GRID_SLOT_CUSTOM_IDS,
@@ -79,6 +83,13 @@ from .const import (
     PANEL_WEEK_CUSTOM_ID,
     PLANNER_STORAGE_KEY,
     PLANNER_STORAGE_VERSION,
+    TRADE_ACCEPT_CUSTOM_ID,
+    TRADE_ASK_CUSTOM_ID,
+    TRADE_BACK_CUSTOM_ID,
+    TRADE_BLOCK_CUSTOM_ID,
+    TRADE_OFFER_CUSTOM_ID,
+    TRADE_PASS_CUSTOM_ID,
+    TRADE_SEND_CUSTOM_ID,
 )
 
 if TYPE_CHECKING:
@@ -108,6 +119,22 @@ _MODE_LABELS = {
     people_mod.REMIND_CHANNEL: "💬 In the channel, with an @mention",
     people_mod.REMIND_OFF: "🚫 No pushes — you're still named in the channel",
 }
+
+# How long a swap request DM is allowed to take to leave the building. Same
+# reasoning as :data:`reminders._SEND_TIMEOUT`: ``async_dm_user`` starts with
+# ``wait_until_ready()``, so a send attempted while the gateway is down would
+# otherwise park there until it reconnects and deliver an ask about a slot that
+# has been and gone. A request that could not be sent is withdrawn, not queued.
+_TRADE_SEND_TIMEOUT = 30
+
+# What a tap on a swap DM says when the request behind it is gone — answered
+# already, or lapsed. Deliberately says nothing about who or why: a DM sits in
+# an inbox indefinitely, and the person tapping it a week late must not learn
+# anything from the fact that it no longer works.
+_TRADE_STALE = (
+    "That one's lapsed — nothing's been changed, and nobody's been told "
+    "anything either way."
+)
 
 
 class _ReminderButton(discord.ui.Button):
@@ -435,17 +462,47 @@ class _GridBackButton(discord.ui.Button):
             await self.assistant.async_report_error(interaction)
 
 
+class _TradeAskButton(discord.ui.Button):
+    """🔁 — offer to ask whoever is down for the slot you just tapped (§9).
+
+    Only ever added when the last tap landed on a cell somebody **else** holds,
+    which is the moment §9 describes: *"That one's spoken for. Want me to
+    ask?"*. It does not replace the booking — tapping a taken slot still books
+    you in alongside its holder, because a plan is information, not permission
+    (§8), and that stays true. This is the extra option, not a different one.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Ask to swap",
+            style=discord.ButtonStyle.primary,
+            emoji="🔁",
+            custom_id=TRADE_ASK_CUSTOM_ID,
+            row=2,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_open_ask(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to open the swap panel")
+            await self.assistant.async_report_error(interaction)
+
+
 class GridView(discord.ui.View):
     """The week grid's controls: day select, four slot toggles, back.
 
-    Three rows, six components — well inside the 5-row / 25-component ceiling,
-    with the select occupying a whole row of its own as Discord requires.
+    Three rows, six or seven components — well inside the 5-row /
+    25-component ceiling, with the select occupying a whole row of its own as
+    Discord requires.
 
     ``occupancy`` and ``day`` are used only to label and colour the buttons.
     Passing neither builds the neutral registration template for ``add_view``,
     which must carry **every** ``custom_id`` — one that was never registered
     doesn't error, it silently stops dispatching, and this integration has
-    already been bitten by that.
+    already been bitten by that. That is why 🔁 is added for the template even
+    though a template has no tapped cell to ask about.
     """
 
     def __init__(
@@ -455,6 +512,7 @@ class GridView(discord.ui.View):
         occupancy: dict | None = None,
         day: int = 0,
         viewer_id=None,
+        ask: bool = False,
     ) -> None:
         super().__init__(timeout=None)
         self.add_item(_GridDaySelect(assistant, day))
@@ -467,6 +525,187 @@ class GridView(discord.ui.View):
             )
             self.add_item(_GridSlotButton(assistant, slot, mine=mine))
         self.add_item(_GridBackButton(assistant))
+        if ask or occupancy is None:
+            self.add_item(_TradeAskButton(assistant))
+
+
+class _TradeOfferSelect(discord.ui.Select):
+    """Which of *your own* slots to put up in return.
+
+    Only your own cells for this week are listed, and the one you're asking for
+    is left out — a swap needs two different slots and something real on both
+    sides. Nothing in this list can identify anybody: every option is one of the
+    viewer's own bookings, described by day and slot.
+    """
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        offers: list[str] | None,
+        selected: str | None,
+    ) -> None:
+        # A select must carry at least one option, and the registration
+        # template (built with no offers) has none to carry — hence the inert
+        # placeholder. The template is never rendered to anybody; it exists so
+        # ``add_view`` learns this custom_id.
+        options = [
+            discord.SelectOption(
+                label=trade_mod.describe_cell(cell) or cell,
+                value=cell,
+                default=cell == selected,
+            )
+            for cell in (offers or [])[:25]
+        ] or [discord.SelectOption(label="—", value="none")]
+        super().__init__(
+            placeholder="What would you offer in return?",
+            custom_id=TRADE_OFFER_CUSTOM_ID,
+            min_values=1,
+            max_values=1,
+            row=0,
+            options=options,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_pick_offer(interaction, self.values[0])
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to choose a swap offer")
+            await self.assistant.async_report_error(interaction)
+
+
+class _TradeSendButton(discord.ui.Button):
+    """🔁 Ask — the one tap that puts a message on somebody else's phone."""
+
+    def __init__(self, assistant: "LaundryAssistant", *, ready: bool) -> None:
+        super().__init__(
+            label="Ask",
+            style=discord.ButtonStyle.primary,
+            emoji="🔁",
+            custom_id=TRADE_SEND_CUSTOM_ID,
+            row=1,
+            disabled=not ready,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_send_trade(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to send a swap request")
+            await self.assistant.async_report_error(interaction)
+
+
+class _TradeBackButton(discord.ui.Button):
+    """Back to the grid, having asked nobody anything."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="↩️",
+            custom_id=TRADE_BACK_CUSTOM_ID,
+            row=1,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_back_to_grid(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to return to the week grid")
+            await self.assistant.async_report_error(interaction)
+
+
+class TradeAskView(discord.ui.View):
+    """The "shall I ask?" panel: pick an offer, then ask — or back out.
+
+    Built with no arguments for ``add_view``; that template carries all three
+    ``custom_id``s including the select's, which is why the select falls back to
+    a placeholder option rather than being left out.
+    """
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        *,
+        offers: list[str] | None = None,
+        selected: str | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_TradeOfferSelect(assistant, offers, selected))
+        self.add_item(_TradeSendButton(assistant, ready=bool(offers and selected)))
+        self.add_item(_TradeBackButton(assistant))
+
+
+class _TradeAnswerButton(discord.ui.Button):
+    """One of the three answers on an incoming swap DM (§9 step 2)."""
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        action: str,
+        label: str,
+        emoji: str,
+        custom_id: str,
+        style: discord.ButtonStyle,
+    ) -> None:
+        super().__init__(
+            label=label, style=style, emoji=emoji, custom_id=custom_id, row=0
+        )
+        self.assistant = assistant
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_answer_trade(interaction, self.action)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to answer a swap request")
+            await self.assistant.async_report_error(interaction)
+
+
+class TradeRequestView(discord.ui.View):
+    """The anonymous request DM's three answers.
+
+    Nothing per-request lives in these ``custom_id``s — a per-request id cannot
+    be a persistent view, so the buttons would die at the next restart. Which
+    request a tap answers is resolved from the recipient and the DM's own
+    timestamp (:func:`trade.match_request`), which is why only one ask may ever
+    be waiting on one person.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            _TradeAnswerButton(
+                assistant,
+                trade_mod.ACTION_ACCEPT,
+                "Trade",
+                "✅",
+                TRADE_ACCEPT_CUSTOM_ID,
+                discord.ButtonStyle.success,
+            )
+        )
+        self.add_item(
+            _TradeAnswerButton(
+                assistant,
+                trade_mod.ACTION_PASS,
+                "Pass",
+                "❌",
+                TRADE_PASS_CUSTOM_ID,
+                discord.ButtonStyle.secondary,
+            )
+        )
+        self.add_item(
+            _TradeAnswerButton(
+                assistant,
+                trade_mod.ACTION_BLOCK,
+                "Don't ask me again",
+                "🚫",
+                TRADE_BLOCK_CUSTOM_ID,
+                discord.ButtonStyle.secondary,
+            )
+        )
 
 
 class AssistantView(discord.ui.View):
@@ -588,6 +827,14 @@ class LaundryAssistant:
         # just means the grid reopens on today — which is where it should start
         # anyway. Keyed by the string form of the id, like everything else here.
         self._grid_day: dict[str, int] = {}
+        # Which cell each person's open grid last tapped that somebody *else*
+        # holds, and what they've picked to offer for it. Memory only, like
+        # ``_grid_day`` and for the same reason: it is view state, not a
+        # preference, and losing it on a restart costs one tap. Nothing here is
+        # a request — a request only exists once ``async_send_trade`` writes
+        # one.
+        self._ask_cell: dict[str, str] = {}
+        self._ask_offer: dict[str, str] = {}
         # The habit model's two stores (design doc §12), both lists of rows
         # carrying an id and a timestamp and nowhere to put a name. They live
         # in *this* Store alongside people and overrides — one planner store,
@@ -603,8 +850,29 @@ class LaundryAssistant:
         # everything else, which is what makes a restart not refill anybody's
         # allowance: the counters are loaded, not reset.
         self._budgets: dict[str, dict] = {}
+        # The trade broker's requests (design doc §9 / §12). In the planner
+        # Store like everything else — a request is a fact about the week, and
+        # a week is what this store is for. Bounded by the rules that write it
+        # and pruned to the current week on load and on every write; expiry is
+        # arithmetic at read time, so nothing has to run on a tick to age one
+        # out and nothing is written to make an old request stop working.
+        self._trades: list[dict] = []
 
     # ------------------------------------------------------------------ config
+    @property
+    def trades_enabled(self) -> bool:
+        """Whether one housemate may ask another for a slot at all (§9).
+
+        Off by default (§14 rule 7), and off means **inert**: no 🔁 button is
+        rendered, ``async_open_ask`` refuses, and no request can be written — so
+        a house that never turns it on never produces a byte of trade state or a
+        single DM.
+        """
+        if self._entry is None:
+            return DEFAULT_TRADES
+        merged = {**self._entry.data, **self._entry.options}
+        return bool(merged.get(CONF_TRADES, DEFAULT_TRADES))
+
     @property
     def learn_habits(self) -> bool:
         """Whether the house has day-learning switched on at all.
@@ -653,6 +921,13 @@ class LaundryAssistant:
         # is a comparison rather than something anybody has to remember to do.
         raw_budgets = data.get("budgets") if isinstance(data, dict) else None
         self._budgets = habit_mod.normalise_budgets(raw_budgets)
+        # Pruned in memory on the way in, like history and corrections, and not
+        # written back: startup is the definition of "nothing changed". A
+        # request from a week that has already happened is dead weight — the
+        # once-a-week rules it gates only ever ask about the week that is
+        # running.
+        raw_trades = data.get("trades") if isinstance(data, dict) else None
+        self._trades = trade_mod.prune_requests(raw_trades, self._current_week())
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
@@ -664,6 +939,7 @@ class LaundryAssistant:
                     "history": self._history,
                     "corrections": self._corrections,
                     "budgets": self._budgets,
+                    "trades": self._trades,
                 }
             )
         except Exception:  # noqa: BLE001
@@ -1128,6 +1404,7 @@ class LaundryAssistant:
         """
         user_id = interaction.user.id
         self._grid_day[str(user_id)] = self._today()
+        self._clear_ask(user_id)
         await self._async_render_grid(interaction, edit=True)
 
     async def async_pick_day(
@@ -1141,6 +1418,11 @@ class LaundryAssistant:
         if not plan_mod.is_weekday(day):
             day = self._today()
         self._grid_day[str(interaction.user.id)] = day
+        # 🔁 always refers to the cell that was last *tapped*, so changing day
+        # must retire it: a swap button pointing at a Thursday while the buttons
+        # underneath say Monday is the one way this could ask about a slot
+        # somebody didn't mean.
+        self._clear_ask(interaction.user.id)
         await self._async_render_grid(interaction, edit=True)
 
     async def async_toggle_cell(
@@ -1157,6 +1439,11 @@ class LaundryAssistant:
         self._overrides, _booked = plan_mod.toggle_booking(
             self._people, self._overrides, week, cell, user_id
         )
+        # A tap that lands on somebody else's slot books you in alongside them —
+        # unchanged, and §8 requires it — and *also* arms 🔁. That is the whole
+        # of §9 step 1: the booking is the information, the offer to ask is the
+        # extra option, and neither one is a veto over the other.
+        self._note_ask(user_id, cell, week)
         # Booking a slot enrols them. Not because the grid needs it — a
         # booking stores the raw id in the override, so it renders as theirs
         # whether or not a prefs record exists — but because deliberately
@@ -1175,19 +1462,73 @@ class LaundryAssistant:
         """Return from the grid to the settings panel."""
         await self._async_rerender(interaction)
 
+    def _clear_ask(self, user_id) -> None:
+        """Forget which cell 🔁 was pointing at, and what was offered for it."""
+        key = str(user_id)
+        self._ask_cell.pop(key, None)
+        self._ask_offer.pop(key, None)
+
+    def _note_ask(self, user_id, cell, week) -> None:
+        """Arm 🔁 if this tap landed on a cell somebody else holds.
+
+        Purely view state — nothing is written, nobody is contacted, and with
+        trades switched off it never arms at all. It is the difference between
+        "that one's spoken for" being a fact on the grid and being an offer to
+        do something about it.
+        """
+        self._clear_ask(user_id)
+        if not self.trades_enabled or not week:
+            return
+        occupancy = plan_mod.effective_week(self._people, self._overrides, week)
+        if plan_mod.is_taken_by_other(occupancy, cell, user_id):
+            self._ask_cell[str(user_id)] = cell
+
+    def _offer_cells(self, user_id, want, week) -> list[str]:
+        """The viewer's own cells they could put up in return, ordered.
+
+        Their own bookings for this week, minus the one they're asking for. A
+        list of the viewer's own slots leaks nothing: it is the same set the
+        grid already draws back to them as ``█``.
+        """
+        return [
+            cell
+            for cell in sorted(
+                self.booked_cells(user_id, week),
+                key=lambda c: (plan_mod.parse_cell(c) or (9, "")),
+            )
+            if cell != want
+        ]
+
     async def _async_render_grid(
-        self, interaction: discord.Interaction, *, edit: bool
+        self, interaction: discord.Interaction, *, edit: bool, note: str | None = None
     ) -> None:
         """Draw the grid for this viewer, in place where possible."""
         user_id = interaction.user.id
         day = self._grid_day.get(str(user_id), self._today())
         week = self._current_week()
         occupancy = plan_mod.effective_week(self._people, self._overrides, week)
-        embed = self._grid_embed(occupancy, user_id, day)
-        view = GridView(self, occupancy=occupancy, day=day, viewer_id=user_id)
+        ask_cell = self._ask_cell.get(str(user_id))
+        embed = self._grid_embed(
+            occupancy, user_id, day, ask_cell=ask_cell, note=note
+        )
+        view = GridView(
+            self,
+            occupancy=occupancy,
+            day=day,
+            viewer_id=user_id,
+            ask=ask_cell is not None,
+        )
         await self._async_respond(interaction, embed, view, edit=edit)
 
-    def _grid_embed(self, occupancy, user_id, day: int) -> discord.Embed:
+    def _grid_embed(
+        self,
+        occupancy,
+        user_id,
+        day: int,
+        *,
+        ask_cell: str | None = None,
+        note: str | None = None,
+    ) -> discord.Embed:
         """The week as a monospace block, plus this person's own cells.
 
         The block is fenced so Discord renders it monospace — without that the
@@ -1209,7 +1550,8 @@ class LaundryAssistant:
         embed = discord.Embed(
             title="📅 The week",
             description=(
-                f"```\n{grid}\n```\n"
+                (f"{note}\n\n" if note else "")
+                + f"```\n{grid}\n```\n"
                 + plan_mod.render_legend(expected=guessed)
                 + f"\n-# {plan_mod.render_windows()}"
             ),
@@ -1239,10 +1581,391 @@ class LaundryAssistant:
             ),
             inline=False,
         )
+        if ask_cell is not None:
+            # No name and no count, exactly like the grid itself: "spoken for"
+            # is the whole of what anybody learns from this. The slot named here
+            # is the one the viewer just tapped, so it tells them nothing they
+            # did not already do.
+            embed.add_field(
+                name=f"🔁 {trade_mod.describe_cell(ask_cell)}",
+                value=(
+                    f"{trade_mod.ASK_PROMPT} You're down for it either way — "
+                    "this would ask whoever else is, anonymously, whether "
+                    "they'd swap."
+                ),
+                inline=False,
+            )
         embed.set_footer(
             text="Nobody sees who booked what — only that a slot is taken."
         )
         return embed
+
+    # ------------------------------------------------------- the trade broker
+    # §9. Everything that *decides* lives in :mod:`trade`; this half delivers
+    # and renders. The one rule to hold on to while reading it: **before an
+    # accept, no string produced here may contain a name or an id.** That is
+    # enforced structurally on the other side — the pre-accept text functions in
+    # :mod:`trade` take cells and nothing else — so the job here is simply never
+    # to add one, and the only two places an identity appears at all are the
+    # two reveal messages after ✅ Trade.
+
+    async def async_open_ask(self, interaction: discord.Interaction) -> None:
+        """🔁 — open the "shall I ask?" panel for the cell just tapped."""
+        if not self.trades_enabled:
+            await self._async_render_grid(
+                interaction,
+                edit=True,
+                note=trade_mod.refusal_text(trade_mod.REASON_TRADES_OFF),
+            )
+            return
+        await self._async_render_ask(interaction)
+
+    async def async_pick_offer(
+        self, interaction: discord.Interaction, value
+    ) -> None:
+        """Choose which of your own slots to put up in return."""
+        cell = plan_mod.normalise_cell(value)
+        if cell is not None:
+            self._ask_offer[str(interaction.user.id)] = cell
+        await self._async_render_ask(interaction)
+
+    async def async_back_to_grid(self, interaction: discord.Interaction) -> None:
+        """Back out of the ask panel. 🔁 stays armed; nothing has been sent."""
+        await self._async_render_grid(interaction, edit=True)
+
+    async def async_send_trade(self, interaction: discord.Interaction) -> None:
+        """The one tap that puts a message on another housemate's phone.
+
+        The order here is deliberate and is the same discipline
+        :mod:`reminders` uses:
+
+        1. **Decide and claim in one call** (:func:`trade.claim_request`) — the
+           verdict, the chosen holder, the DM budget and the new row all come
+           back together, so there is no gap in which a check could pass and a
+           send happen anyway.
+        2. **Persist before sending.** A DM that bounces has still been
+           attempted; refunding it would retry somebody with closed DMs at every
+           tap forever.
+        3. **Answer the interaction before the network call.** Discord's ack
+           window is 3 seconds and a DM is a round trip — responding first is
+           what stops a successfully-sent ask from showing the asker
+           "interaction failed".
+        4. **Withdraw what could not be delivered.** An open request nobody ever
+           saw would block that slot and that person for the rest of the week
+           (:func:`trade.withdraw` lapses it without recording a refusal, which
+           would be a lie about the holder).
+        """
+        user_id = interaction.user.id
+        key = str(user_id)
+        want = self._ask_cell.get(key)
+        week = self._current_week()
+        if not self.trades_enabled or want is None or not week:
+            await self._async_render_grid(interaction, edit=True)
+            return
+        occupancy = plan_mod.effective_week(self._people, self._overrides, week)
+        reason, request, requests, budgets = trade_mod.claim_request(
+            self._people,
+            self._trades,
+            self._budgets,
+            user_id,
+            plan_mod.holders(occupancy, want),
+            want,
+            self._ask_offer.get(key),
+            week,
+            self._now(),
+            mine=self.booked_cells(user_id, week),
+        )
+        if reason == trade_mod.REASON_SILENT and request is not None:
+            # The holder-side rules said no. The ask is still recorded (already
+            # lapsed) and the asker is told exactly what a delivered ask is
+            # told, because "did a DM go out?" is itself a fact about the
+            # holder — see :func:`trade.claim_request`. Nothing is sent.
+            self._trades = requests
+            await self._async_save()
+            self._clear_ask(user_id)
+            await self._async_render_grid(
+                interaction, edit=True, note=trade_mod.sent_text(want)
+            )
+            _LOGGER.debug("Swap request recorded without a send")
+            return
+        if reason != trade_mod.REASON_OK or request is None:
+            # One sentence per reason, and every holder-side reason shares the
+            # same one — the asker cannot see who holds the cell and must not be
+            # able to work it out from how the bot says no.
+            await self._async_render_ask(
+                interaction, note=trade_mod.refusal_text(reason)
+            )
+            return
+        self._trades = requests
+        self._budgets = budgets
+        await self._async_save()
+        self._clear_ask(user_id)
+        await self._async_render_grid(
+            interaction, edit=True, note=trade_mod.sent_text(want)
+        )
+        if await self._async_deliver_request(request):
+            # A decision taken, and deliberately with no ids in it: the log is
+            # local, but "who asked whom" is the one fact this feature exists to
+            # keep, and there is no reason for it to be recoverable from a debug
+            # line either.
+            _LOGGER.debug("Swap request sent")
+            return
+        self._trades = trade_mod.withdraw(
+            self._trades, request["id"], self._now()
+        )
+        await self._async_save()
+        try:
+            await interaction.followup.send(
+                trade_mod.refusal_text(trade_mod.REASON_UNDELIVERED),
+                ephemeral=True,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not report an undelivered swap request",
+                          exc_info=True)
+
+    async def _async_deliver_request(self, request: dict) -> bool:
+        """Send the anonymous ask. Returns whether it actually went out."""
+        text = trade_mod.request_dm_text(request["want"], request["offer"])
+        if text is None:
+            return False
+        try:
+            async with asyncio.timeout(_TRADE_SEND_TIMEOUT):
+                return await self.async_send_dm(
+                    request["to"], text, TradeRequestView(self)
+                )
+        except TimeoutError:
+            # Only the timeout. A CancelledError from outside is HA shutting
+            # down and has to keep travelling.
+            _LOGGER.debug("Swap request not delivered in time")
+            return False
+
+    def _dm_sent_ts(self, interaction: discord.Interaction, now) -> float | None:
+        """When the tapped DM was sent, expressed on **this box's** clock.
+
+        Discord stamps a message from its own clock (the snowflake) and a
+        request row is stamped from ours, so comparing the two directly makes
+        every trade in the house depend on the HA host's clock being within
+        :data:`trade.MATCH_WINDOW_SECONDS` of Discord's. An RPi with no RTC that
+        has not re-synced NTP would answer nothing, ever, and say "that one's
+        lapsed" — 🚫 included. So the DM's *age* is measured on Discord's clock
+        alone, from the tap's own timestamp, and :func:`trade.dm_sent_ts` puts
+        it back on ours; any constant offset between the two cancels.
+        """
+        message = getattr(interaction, "message", None)
+        try:
+            sent = getattr(message, "created_at", None)
+            tapped = getattr(interaction, "created_at", None)
+            if sent is None or tapped is None:
+                return None
+            return trade_mod.dm_sent_ts(
+                now, float(sent.timestamp()), float(tapped.timestamp())
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    async def _async_block_lapsed(
+        self, interaction: discord.Interaction, holder_id, sent_ts
+    ) -> bool:
+        """Record 🚫 on a request that can no longer be answered. Did it stick?
+
+        A block is not an answer to the ask — it is a standing decision about a
+        person, and it has to outlive the 48-hour window (§9: *permanent, per
+        requester-pair*). The lapsed request itself is left exactly as it is: an
+        ask nobody answered must not become a decline, which would shut that
+        slot to the whole house on the strength of a tap that said nothing about
+        it. Nothing is sent to the requester either — they were never going to
+        hear about a request that lapsed, and a block is not something they get
+        told about (:func:`trade.block_ack_text`).
+        """
+        row = trade_mod.match_any_request(self._trades, holder_id, sent_ts)
+        if row is None:
+            return False
+        self._people = people_mod.set_person(
+            self._people,
+            holder_id,
+            no_trade_from=trade_mod.with_block(
+                self._people, row["from"], holder_id
+            ),
+        )
+        await self._async_save()
+        _LOGGER.debug("Swap block recorded on a request that had lapsed")
+        await self._async_close_dm(interaction, trade_mod.block_ack_text())
+        return True
+
+    async def async_answer_trade(
+        self, interaction: discord.Interaction, action: str
+    ) -> None:
+        """✅ Trade / ❌ Pass / 🚫 Don't ask me again, from the request DM.
+
+        Which request this is resolved from the recipient plus **the DM's own
+        timestamp**, never from the ``custom_id`` (a per-request id cannot be a
+        persistent view, so the buttons would die at the next restart). A tap on
+        a DM whose request has lapsed answers nothing at all — the state change
+        and the reply both hang off :func:`trade.answer` returning OK.
+        """
+        holder_id = interaction.user.id
+        now = self._now()
+        sent_ts = self._dm_sent_ts(interaction, now)
+        found = trade_mod.match_request(self._trades, holder_id, now, sent_ts)
+        reason, answered, rows = trade_mod.answer(
+            self._trades, found["id"] if found else None, action, now
+        )
+        if reason != trade_mod.REASON_OK or answered is None:
+            if action == trade_mod.ACTION_BLOCK and await self._async_block_lapsed(
+                interaction, holder_id, sent_ts
+            ):
+                return
+            await self._async_close_dm(interaction, _TRADE_STALE)
+            return
+        self._trades = rows
+        if action == trade_mod.ACTION_BLOCK:
+            # Permanent, per pair, and stored on the *holder's* own record so it
+            # outlives every request and every week.
+            self._people = people_mod.set_person(
+                self._people,
+                holder_id,
+                no_trade_from=trade_mod.with_block(
+                    self._people, answered["from"], holder_id
+                ),
+            )
+        if action == trade_mod.ACTION_ACCEPT:
+            self._overrides = trade_mod.apply_swap(
+                self._people, self._overrides, answered
+            )
+        await self._async_save()
+        # The state only — no ids, for the reason in :meth:`async_send_trade`.
+        _LOGGER.debug("Swap request answered: %s", answered["state"])
+        note, reply = self._trade_replies(action, answered, holder_id)
+        await self._async_close_dm(interaction, note)
+        if reply:
+            # Deliberately **not** budgeted. Every other unprompted DM in this
+            # integration is the bot deciding to talk to somebody; this one is
+            # the answer to a question that person asked, and it is the only way
+            # they ever find out. Charging it could silently swallow the reply
+            # to your own ask, which is both useless and unkind. It cannot be
+            # used to pester either: exactly one arrives per ask, and the number
+            # of asks is capped in several directions.
+            await self.async_send_dm(answered["from"], reply)
+
+    def _trade_replies(
+        self, action: str, answered: dict, holder_id
+    ) -> tuple[str, str | None]:
+        """What each side is told: ``(to the holder, to the asker)``.
+
+        The only place in this module where an identity reaches a string, and
+        only down the accept branch — §9 step 3: an accept reveals both names to
+        both parties, because from that moment they have to coordinate and they
+        live together. ❌ Pass and 🚫 tell the asker exactly the same thing as
+        each other, and it contains no name and no reason (§9 step 4), so a
+        block is indistinguishable from an ordinary no.
+        """
+        want, offer = answered["want"], answered["offer"]
+        if action == trade_mod.ACTION_ACCEPT:
+            return (
+                trade_mod.accepted_text_for_holder(
+                    f"<@{answered['from']}>", want, offer
+                )
+                or _TRADE_STALE,
+                trade_mod.accepted_text_for_requester(
+                    f"<@{holder_id}>", want, offer
+                ),
+            )
+        ack = (
+            trade_mod.block_ack_text()
+            if action == trade_mod.ACTION_BLOCK
+            else trade_mod.pass_ack_text()
+        )
+        return (ack, trade_mod.passed_text(want))
+
+    async def _async_render_ask(
+        self, interaction: discord.Interaction, *, note: str | None = None
+    ) -> None:
+        """Draw the "shall I ask?" panel, in place where possible."""
+        user_id = interaction.user.id
+        key = str(user_id)
+        want = self._ask_cell.get(key)
+        week = self._current_week()
+        if want is None or not week:
+            await self._async_render_grid(interaction, edit=True)
+            return
+        offers = self._offer_cells(user_id, want, week)
+        selected = self._ask_offer.get(key)
+        if selected not in offers:
+            selected = offers[0] if offers else None
+            if selected is None:
+                self._ask_offer.pop(key, None)
+            else:
+                self._ask_offer[key] = selected
+        embed = self._ask_embed(want, selected, note=note)
+        view = TradeAskView(self, offers=offers, selected=selected)
+        await self._async_respond(interaction, embed, view, edit=True)
+
+    def _ask_embed(
+        self, want: str, offer: str | None, *, note: str | None
+    ) -> discord.Embed:
+        """The panel that shows exactly what would be sent, before it is sent.
+
+        Quoting the DM back verbatim is the point: the whole feature rests on
+        people believing the ask is anonymous, and the way to believe that is to
+        read the words first. Nothing on this panel names anybody, because
+        nothing on this side *knows* anybody — who holds the cell is resolved at
+        send time and never rendered.
+        """
+        embed = discord.Embed(
+            title="🔁 Ask to swap",
+            description=(
+                (f"{note}\n\n" if note else "")
+                + (trade_mod.ask_panel_text(want, offer) or trade_mod.ASK_PROMPT)
+            ),
+            color=_COLOR_PANEL,
+        )
+        preview = trade_mod.request_dm_text(want, offer)
+        if preview:
+            embed.add_field(
+                name="What they'll get, word for word",
+                value=preview,
+                inline=False,
+            )
+        embed.add_field(
+            name="How this goes",
+            value=(
+                "✅ **they say yes** — the slots swap and you're both named to "
+                "each other, because from there you have to sort it out "
+                "between you.\n"
+                "❌ **they pass** — I'll tell you they passed. No name, no "
+                "reason, and that slot's shut for the rest of the week.\n"
+                "🤐 **they ignore it** — it lapses on its own and nobody hears "
+                "any more about it."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="One ask per slot per week, and never twice at the same person."
+        )
+        return embed
+
+    async def _async_close_dm(
+        self, interaction: discord.Interaction, note: str
+    ) -> None:
+        """Answer a swap DM by rewriting it and dropping its buttons.
+
+        Taking the buttons away matters more here than anywhere else: a DM sits
+        in an inbox indefinitely, and a second ✅ tapped a week later must not
+        try to swap anything. Never raises — the state change already happened
+        before we got here, so a failed edit is cosmetic.
+        """
+        try:
+            await interaction.response.edit_message(content=note, view=None)
+            return
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not edit a swap DM in place", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(note)
+            else:
+                await interaction.response.send_message(note)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not acknowledge a swap reply", exc_info=True)
 
     async def _async_rerender(self, interaction: discord.Interaction) -> None:
         """Redraw the panel in place after a setting changed."""
