@@ -202,6 +202,35 @@ The queue is **session state** — it lives in the same store as the claimant an
 resets with the session — and it is **inert when unused**: no taps, no line, no
 field on the card, no extra messages.
 
+#### The tap tells you what it did
+
+A 🔜 tap edits the **shared** card, which is right — the whole house reads it —
+but on its own that makes a working button look broken. Joining and leaving
+produce the same card, and on a phone scrolled away from the card you see
+nothing at all. So the tap also answers **you**, privately:
+
+- joining → *"You're **2nd** in line — I'll ping you when the washer's actually
+  free."* First in line is told **next**, plus the reminder that done isn't
+  empty.
+- leaving → *"You're **out of the line** — no ping coming."*
+
+Discord allows exactly **one response per interaction** and the card edit spends
+it, so the private line is a **followup** on the same token — the same mechanism
+the "your DMs are closed" explainer already uses. It can't cost you the tap: if
+the followup fails, it's swallowed and the card edit still stands.
+
+#### The handoff doesn't make you vanish
+
+Being pinged **pops you off** the line, which means "Next up" loses you at the
+exact moment you were told the machine is yours — to everyone else the card then
+reads as though you were never waiting. The done card therefore keeps a
+**Handed over** field, and it preserves the distinction the pings already make:
+
+| Path | Field |
+|---|---|
+| ✅ **Emptied it**, or an unclaimed load finishing | `🔜 Sam — told the washer's free.` |
+| The hedged **backstop** (nobody confirmed) | `🔜 Sam — nudged that it's probably free (nobody confirmed).` |
+
 ### The 🤖 assistant panel
 
 Rightmost on every card is a single **🤖** button. It opens a message that
@@ -667,7 +696,7 @@ one to put a name.
 | Entity | Meaning |
 |--------|---------|
 | `sensor.laundry_claimed_by` | Current claimant's display name, or `Unclaimed`. |
-| `sensor.laundry_stage` | `Idle` / `Washing` / `Drying` / `Done — waiting` / `Done — claimed`. |
+| `sensor.laundry_stage` | `Idle` / `Washing` / `Drying` / `Done — waiting` / `Done — claimed`. Carries the 🔜 line as attributes — `queue_count`, `queue` (names, in order) and `next_up` — so a dashboard can show who's waiting without opening Discord. Deliberately **nothing derived from the clock**: an attribute that recomputed on the 5-minute tick would write ~288 recorder rows a day (see `minutes_since_last_drop` below, which had exactly that bug). These change on a 🔜 tap and at no other time. |
 | `binary_sensor.laundry_waiting` | `on` when a finished load is unclaimed. |
 | `sensor.laundry_connection_health` | Diagnostic: number of cloud-connection drops in the last 24h (with `last_drop` + `minutes_since_last_drop`). Great for a dashboard chip and for judging a wifi/AP change. |
 

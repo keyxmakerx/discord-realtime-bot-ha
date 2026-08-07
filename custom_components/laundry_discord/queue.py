@@ -175,3 +175,107 @@ def format_queue(queue: list[dict], *, limit: int = 3) -> str | None:
     if extra > 0:
         text += f" (+{extra} more)"
     return text
+
+
+def names(queue: list[dict]) -> list[str]:
+    """Every display name, in order — the shape a state attribute wants.
+
+    Deliberately *only* the names: no timestamps, and nothing derived from
+    them. An attribute that answers "how long have they waited" would change
+    on every refresh tick, and the recorder writes a history row each time an
+    attribute changes — the bug the connection-health sensor already had to be
+    fixed for. This changes when somebody taps 🔜, and not otherwise.
+    """
+    return [entry_name(e) for e in queue]
+
+
+def attributes(
+    queue: list[dict], now: float, expiry: float, claimant_id
+) -> dict:
+    """The state-attribute view of the line — the line that would *act*.
+
+    The stored line is only ever pruned when something happens to it (a tap,
+    a session start, a handoff), so read at any other moment it can still hold
+    entries that have aged past ``expiry``. Publishing that raw list would have
+    a dashboard naming somebody the handoff would provably skip, so the same
+    rules the handoff uses are applied here on read.
+
+    ``queue``/``queue_count`` are the pruned line, matching what the Discord
+    card shows; ``next_up`` additionally drops the claimant, because it is a
+    claim about who gets the machine and :func:`select_handoff` never hands it
+    to whoever is running it. (The two differ only in the odd case of someone
+    tapping 🔜 *after* claiming — a claim already takes them out of the line.)
+
+    Still churn-safe: nothing here is a clock-derived *value*. ``now`` only
+    decides membership, so an expiry produces one attribute change per entry —
+    bounded by taps, not by the 5-minute refresh tick.
+    """
+    pruned = prune(queue, now, expiry)
+    head, _ = select_handoff(pruned, now, expiry, claimant_id)
+    return {
+        "queue_count": len(pruned),
+        "queue": names(pruned),
+        "next_up": entry_name(head) if head is not None else None,
+    }
+
+
+def ordinal(n: int) -> str:
+    """1 → "1st", 2 → "2nd", 3 → "3rd", 4 → "4th".
+
+    The line caps at :data:`QUEUE_CAP`, so this only ever sees small numbers —
+    but the 11/12/13 exception is written in anyway rather than left as a trap
+    for whoever raises the cap.
+    """
+    if 10 <= (n % 100) <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def tap_notice(result: str, place: int | None) -> str | None:
+    """The private word owed to whoever just tapped 🔜, or None.
+
+    A successful tap spends its one interaction *response* on the shared card,
+    which is right — the whole house reads it — but it means the person who
+    tapped gets nothing addressed to them, and on a phone scrolled away from
+    the card they see nothing at all. Worse, joining and leaving look
+    identical, which is how a working button reads as a broken one.
+
+    Returns None for the two failure results: those answer the tap directly
+    with their own ephemeral, and a second one would say it twice.
+    """
+    if result == TOGGLE_ADDED:
+        if place is None:
+            # Shouldn't happen — we were just added — but a confirmation that
+            # can't name a place is still far better than silence.
+            return "You're in the line — I'll ping you when the washer's free."
+        if place == 1:
+            return (
+                "You're **next** — I'll ping you when the washer's actually "
+                "free. Done isn't empty: somebody still has to clear the drum."
+            )
+        return (
+            f"You're **{ordinal(place)}** in line — I'll ping you when the "
+            "washer's actually free."
+        )
+    if result == TOGGLE_REMOVED:
+        return "You're **out of the line** — no ping coming. Tap 🔜 to rejoin."
+    return None
+
+
+def handoff_line(name: str | None, *, hedged: bool) -> str:
+    """The done card's record that the line moved, for the person told.
+
+    The handoff *pops* the head off the queue, so "Next up" loses them at the
+    exact moment they were told — to the rest of the house it reads as though
+    they were never waiting at all. Naming them here is consistent with the
+    live card, which already names the claimant and the line; the anonymity
+    rule (design doc §11 P5) is about the forward plan, not this card.
+
+    The two paths stay worded apart. At the backstop nobody confirmed
+    anything, and a card that claims otherwise is how the ping stops being
+    trusted.
+    """
+    who = name or "someone"
+    if hedged:
+        return f"🔜 {who} — nudged that it's probably free (nobody confirmed)."
+    return f"🔜 {who} — told the washer's free."

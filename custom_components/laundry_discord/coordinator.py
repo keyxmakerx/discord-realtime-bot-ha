@@ -142,6 +142,13 @@ class LaundryCoordinator:
         # washer is not an *empty* one — their clothes are still in it — so the
         # handoff to whoever is next waits for this, not for completion.
         self.emptied: bool = False
+        # Who this load's handoff ping went to, and whether it was the hedged
+        # backstop rather than a confirmed one. Recorded because the handoff
+        # *pops* the head off the line: without it the "Next up" field simply
+        # disappears at the moment that person was told, and to everybody else
+        # the card reads as though they were never waiting at all.
+        self.handoff_name: str | None = None
+        self.handoff_hedged: bool = False
         self.message_id: int | None = None
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
@@ -438,6 +445,8 @@ class LaundryCoordinator:
         # neither key, and an upgrade must not KeyError on the first load.
         self.queue = list(data.get("queue") or [])
         self.emptied = data.get("emptied", False)
+        self.handoff_name = data.get("handoff_name")
+        self.handoff_hedged = data.get("handoff_hedged", False)
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
         self.paused = data.get("paused", False)
@@ -474,6 +483,8 @@ class LaundryCoordinator:
                 "quiet": self.quiet,
                 "queue": self.queue,
                 "emptied": self.emptied,
+                "handoff_name": self.handoff_name,
+                "handoff_hedged": self.handoff_hedged,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
                 "paused": self.paused,
@@ -1023,6 +1034,11 @@ class LaundryCoordinator:
                 float(self.queue_expiry),
             )
             self.emptied = False
+            # ...and so did its handoff record. Reset wherever `emptied` is:
+            # the two describe the same finished load, and a stale name here
+            # would have the new card announcing the last load's handoff.
+            self.handoff_name = None
+            self.handoff_hedged = False
             self.cancelled = False  # belonged to the load this one supersedes
             # Any pending handoff belonged to the load this one supersedes.
             self._cancel_handoff_timer()
@@ -1130,8 +1146,11 @@ class LaundryCoordinator:
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
             # Done is not empty: this load's clothes are still in the drum until
-            # somebody says otherwise, so every completion starts un-emptied.
+            # somebody says otherwise, so every completion starts un-emptied,
+            # and with nobody yet told the machine is theirs.
             self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
             # A cancel is not a wash (design doc §2). A claim made *during* the
             # wash has already written its history row, so the row is retracted
             # here — inside the transition that decided this load never
@@ -1431,6 +1450,12 @@ class LaundryCoordinator:
         )
         if head is None:
             return  # nobody waiting — the line being empty is the normal case
+        # Recorded *here*, next to the pop that causes the problem, and before
+        # the ping rather than after it: the line has already lost them either
+        # way, so a ping that fails and gets logged must still leave the card
+        # saying who it was for. The card render below picks this up.
+        self.handoff_name = queue.entry_name(head)
+        self.handoff_hedged = hedged
         if hedged:
             body = (
                 "🔜 The washer's been done a while and nobody's checked in — "
@@ -1552,6 +1577,8 @@ class LaundryCoordinator:
             self.claimed_by_id = None
             self.quiet = False
             self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
             self.paused = False
             self.cancelled = False
             self.catch_up = False
@@ -1599,6 +1626,8 @@ class LaundryCoordinator:
             # ping the head of the line for a load that no longer exists and
             # overwrite the sample message with the live embed.
             self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
             self._cancel_handoff_timer()
             embed = self.build_embed(test=True)
             try:
@@ -1824,6 +1853,7 @@ class LaundryCoordinator:
             if usage:
                 embed.add_field(name="This load used", value=usage, inline=False)
             self._add_queue(embed)
+            self._add_handoff(embed)
             if self._offline_unverified:
                 embed.add_field(
                     name="⚠️ Unverified",
@@ -1873,6 +1903,27 @@ class LaundryCoordinator:
             # Set the expectation: the washer being done doesn't make it free.
             value += f" — you're up once {self.claimed_by} clears it"
         embed.add_field(name="Next up", value=value, inline=False)
+
+    def _add_handoff(self, embed: discord.Embed) -> None:
+        """Show that the line moved, once the head has been taken off it.
+
+        Without this the handoff is a disappearance: the ping pops whoever was
+        first, so "Next up" loses them at the exact moment they were told, and
+        to everyone else the card reads as though they never tapped 🔜 at all.
+        Done-waiting only — it is the one stage in which a handoff can have
+        happened for the load the card is describing.
+
+        Named, like "Claimed by" and "Next up" above it. This is the live card,
+        where the house can already see who is doing what; §11's anonymity rule
+        governs the forward plan, not this.
+        """
+        if not self.handoff_name:
+            return
+        embed.add_field(
+            name="Handed over",
+            value=queue.handoff_line(self.handoff_name, hedged=self.handoff_hedged),
+            inline=False,
+        )
 
     def _add_offline_notice(self, embed: discord.Embed) -> None:
         """Warn on the live card when the washer has been offline a while."""
