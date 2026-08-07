@@ -68,6 +68,7 @@ describe_bucket = _habit.describe_bucket
 describe_prediction = _habit.describe_prediction
 explain = _habit.explain
 first_load_ts = _habit.first_load_ts
+forget_load = _habit.forget_load
 forget_person = _habit.forget_person
 history_days = _habit.history_days
 history_for = _habit.history_for
@@ -268,6 +269,96 @@ def test_a_junk_history_normalises_to_nothing() -> None:
         {"ts": 10, "user_id": "1", "cell": THU_EVE},
     ]
     assert [row["ts"] for row in normalise_history(out_of_order)] == [10.0, 20.0]
+
+
+# --- retracting a load that turned out not to be one -------------------------
+
+
+def test_a_stopped_load_is_removed_from_history() -> None:
+    # A Claim tap is logged the moment it happens, so a load stopped on the
+    # machine an hour later already has its row. A cancel is not a wash, and
+    # leaving it in would drag this person's predicted times toward a load
+    # they never ran.
+    claimed = at(2026, 8, 6, 21)
+    history = _loads(at(2026, 7, 30), claimed)
+    assert load_count(history, "1") == 2
+    kept = forget_load(history, "1", claimed.timestamp() - 60, claimed.timestamp() + 7200)
+    assert load_count(kept, "1") == 1
+    assert [row["ts"] for row in kept] == [at(2026, 7, 30).timestamp()]
+
+
+def test_retracting_a_load_cannot_reach_an_earlier_real_one() -> None:
+    # The window is the whole safety of this: it is the stopped load's own
+    # session, so last Thursday's real wash — and one from earlier the same
+    # evening — are outside it and survive.
+    earlier = at(2026, 8, 6, 19)
+    claimed = at(2026, 8, 6, 21)
+    history = _loads(at(2026, 7, 30), earlier, claimed)
+    kept = forget_load(history, "1", claimed.timestamp(), claimed.timestamp() + 3600)
+    assert [row["ts"] for row in kept] == [
+        at(2026, 7, 30).timestamp(),
+        earlier.timestamp(),
+    ]
+
+
+def test_retracting_a_load_touches_nobody_else() -> None:
+    moment = at(2026, 8, 6, 21)
+    history = _loads(moment)
+    history = record_load(history, "2", moment, monitor=True)
+    kept = forget_load(history, "1", moment.timestamp(), moment.timestamp() + 3600)
+    assert [row["user_id"] for row in kept] == ["2"]
+    # The int/str id hazard again: the coordinator hands over the int.
+    assert forget_load(history, 2, moment.timestamp(), moment.timestamp() + 1) == [
+        row for row in normalise_history(history) if row["user_id"] == "1"
+    ]
+
+
+def test_the_window_is_inclusive_at_both_ends() -> None:
+    # A load claimed the instant the card appears lands on the same second as
+    # the session start.
+    moment = at(2026, 8, 6, 21)
+    history = _loads(moment)
+    assert forget_load(history, "1", moment.timestamp(), moment.timestamp()) == []
+    assert forget_load(
+        history, "1", moment.timestamp() + 1, moment.timestamp() + 60
+    ) == normalise_history(history)
+
+
+def test_an_unusable_retraction_removes_nothing() -> None:
+    # The dangerous direction is deleting real history because of a bad
+    # argument, so anything unreadable is a no-op — not a guess.
+    history = _regular()
+    normalised = normalise_history(history)
+    now = NOW.timestamp()
+    assert forget_load(history, None, 0, now) == normalised
+    assert forget_load(history, "", 0, now) == normalised
+    assert forget_load(history, True, 0, now) == normalised
+    assert forget_load(history, "1", None, now) == normalised
+    assert forget_load(history, "1", 0, None) == normalised
+    assert forget_load(history, "1", "junk", now) == normalised
+    assert forget_load(history, "1", now, 0) == normalised  # backwards window
+    assert forget_load(None, "1", 0, now) == []
+
+
+def test_a_retraction_that_matches_nothing_changes_nothing() -> None:
+    # The caller compares before saving, so "no row was in that window" has to
+    # come back equal — otherwise every cancel would cost a Store write.
+    history = _regular()
+    assert forget_load(history, "9", 0, NOW.timestamp()) == history
+    assert forget_load(history, "1", NOW.timestamp(), NOW.timestamp() + 3600) == history
+
+
+def test_a_retracted_load_stops_voting_on_the_prediction() -> None:
+    # The point of all of this: the model that drives every nudge must not
+    # learn a time from a cycle somebody cancelled.
+    history = _regular()
+    stopped = at(2026, 8, 13, 9)  # a Thursday morning that never actually ran
+    history = record_load(history, "1", stopped, monitor=True)
+    later = at(2026, 8, 14, 12)
+    assert load_count(history, "1", later) == 9
+    kept = forget_load(history, "1", stopped.timestamp() - 300, stopped.timestamp() + 300)
+    assert load_count(kept, "1", later) == 8
+    assert bucket_counts(kept, "1", moment=later).get("3-am", 0) == 0
 
 
 # --- the JSON string/int id hazard ------------------------------------------

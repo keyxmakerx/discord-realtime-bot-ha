@@ -293,6 +293,11 @@ TRADE_BLOCK_CUSTOM_ID = "laundry_discord_trade_block"
 
 # --- Services ---
 SERVICE_TEST_POST = "test_post"
+# The manual escape hatch: force-close a session the bot has got stuck on and
+# return it to idle. Detection ends a load on its own in every case it knows
+# about, and the absolute net is MAX_SESSION_MINUTES above — 12 hours, which is
+# not a recovery plan for the failure nobody predicted.
+SERVICE_RESET_SESSION = "reset_session"
 
 # --- Session stages ---
 STAGE_IDLE = "idle"

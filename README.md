@@ -84,13 +84,25 @@ are ignored while a wash is already running.
 > - **Mid-cycle catch-up:** if the bot joins a load already in progress, a real
 >   phase + a meter that has moved since idle starts it (a phase *frozen* at the
 >   last completion reading is ignored as a stale leftover).
+> - **Stopped on the machine:** none of the above catches somebody pressing stop
+>   on the washer itself — `job_state` goes to `none` rather than `finish` and
+>   `completion_time` keeps the *planned* finish, so the load used to sit there
+>   until the 12-hour cap. A confirmed `machine_state = stop` (or the running
+>   sensor going **off**) during a tracked load now ends it, debounced by the
+>   same `confirm_delay` and ignoring any value arriving from `unavailable`, so
+>   the hourly cloud drop can't kill a live wash. The card says **"🛑 Stopped
+>   early"** rather than "done" — the bot doesn't claim a cycle finished when it
+>   knows it didn't — and a stopped load is **never** logged to the habit model.
+>   If the washer's own estimate has already passed (or `job_state` reached
+>   `finish`), the same stop is read as an ordinary completion and worded that
+>   way.
 >
 > Because completion is timed off the reliable `drying`/`finish` transitions (not
 > the flaky meter), the failure modes that plagued earlier versions are gone:
 > back-to-back loads each get their own card, and a frozen or dead energy meter
 > can no longer fire a false "done" mid-cycle. The `running`/`machine_state`
-> sensors are used only for the **"⏸ Paused"** display and prompt self-clean end.
-> A new cycle supersedes a finished-but-unclaimed message.
+> sensors otherwise drive only the **"⏸ Paused"** display and prompt self-clean
+> end. A new cycle supersedes a finished-but-unclaimed message.
 
 > **Offline loads:** if the washer's cloud is offline for a whole cycle,
 > `job_state` never reports a phase — but the meter jumps in one batch when the
@@ -755,6 +767,10 @@ Collected in the UI config flow (options can be changed later without re-adding)
    drying and finished edits.
    - *(Manually set states are temporary and get overwritten by the real device
      on its next update.)*
+3. If a card ever gets stuck — the bot thinks a load is running when it isn't —
+   call `laundry_discord.reset_session`. It force-closes the card and returns to
+   idle without announcing anything or pinging anybody, and the next real load
+   posts a fresh card. Harmless when nothing is being tracked.
 
 ## 5. Releasing for HACS
 

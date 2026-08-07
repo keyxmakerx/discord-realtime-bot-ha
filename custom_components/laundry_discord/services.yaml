@@ -4,3 +4,11 @@ test_post:
     Post a sample embed with a working Claim button to the configured Discord
     channel, so the whole Discord path (post + claim + sensor write-back) can be
     tested without running a real wash.
+
+reset_session:
+  name: Reset session
+  description: >-
+    Force-close the load the bot thinks is running and go back to idle, closing
+    its card in Discord. The escape hatch for a session that has wedged: it
+    announces nothing and pings nobody, and the next real load posts a fresh
+    card. Harmless when nothing is being tracked.

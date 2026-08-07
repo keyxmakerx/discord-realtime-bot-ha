@@ -354,6 +354,45 @@ def record_load(history, user_id, moment, *, monitor: bool) -> list[dict]:
     return _cap([*rows, record])
 
 
+def forget_load(history, user_id, since, until) -> list[dict]:
+    """Drop one person's rows inside one window — a load that wasn't a wash.
+
+    The counterpart to :func:`record_load`, and the reason the cancel path can
+    be *structurally* incapable of feeding the model rather than merely
+    documented as not doing so. A Claim tap is logged the moment it happens, so
+    by the time the washer reports that somebody stopped the cycle on the
+    machine, the row already exists — and a cancel is not a wash. Leaving it in
+    would move this person's predicted times toward a load they never ran, and
+    those predictions drive every nudge in the system.
+
+    The window is what keeps this from being destructive. ``since`` is the start
+    of the load being retracted and ``until`` its end, so the only rows that can
+    match are ones written *during* it: an earlier, real load of theirs that
+    same evening is outside the window and survives. Inclusive at both ends —
+    the claim can land on the same second as the session start on a load claimed
+    the instant the card appears.
+
+    Anything unreadable — no id, an unparseable bound, a window that runs
+    backwards — removes **nothing**. The dangerous direction here is deleting
+    somebody's real history because of a bad argument, so an unusable call is a
+    no-op rather than a guess, exactly as :func:`prune_history` refuses to age
+    rows off an unreadable clock.
+    """
+    rows = normalise_history(history)
+    if user_id is None or isinstance(user_id, bool):
+        return rows
+    key = str(user_id)
+    start = _timestamp(since)
+    end = _timestamp(until)
+    if not key or start is None or end is None or end < start:
+        return rows
+    return [
+        row
+        for row in rows
+        if not (row["user_id"] == key and start <= row["ts"] <= end)
+    ]
+
+
 def forget_person(records, user_id) -> list:
     """Every row that is **not** this person's, for history or corrections.
 

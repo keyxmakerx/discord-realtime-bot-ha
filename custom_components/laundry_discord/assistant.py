@@ -1010,6 +1010,41 @@ class LaundryAssistant:
         except Exception:  # noqa: BLE001 - never raise into a card callback
             _LOGGER.exception("Failed to log a load for the habit model")
 
+    async def async_forget_load(self, user_id, since_ts, until_ts) -> None:
+        """That load was stopped on the machine, so it was never a wash.
+
+        The coordinator calls this from the cancel path and, as with
+        :meth:`async_note_claim`, knows nothing else about the model. A claim
+        made *during* the wash has already written its row by then, so "a
+        cancelled load must not feed the habit model" cannot be a rule anybody
+        remembers to apply at read time — it is this call, inside the same
+        transition that ended the load, plus the coordinator refusing to log a
+        claim tapped on a card it has already marked stopped. Between them there
+        is no path by which a stopped cycle becomes evidence.
+
+        ``since_ts``/``until_ts`` bound the retraction to that load's own
+        session (see :func:`habit.forget_load`), so an earlier real wash of
+        theirs cannot be caught by it.
+
+        No consent gate here, deliberately: this only ever *removes*. Running it
+        with day-learning off simply finds nothing, and the comparison below
+        means finding nothing costs no store write.
+
+        Never raises — it runs inside the completion transition, and failing to
+        un-log a load must not leave the card unfinished.
+        """
+        try:
+            updated = habit_mod.forget_load(self._history, user_id, since_ts, until_ts)
+            if updated == self._history:
+                return
+            self._history = updated
+            await self._async_save()
+            # A decision actually taken (a row that existed is gone), not a
+            # per-evaluation trace: the no-match path returns above.
+            _LOGGER.debug("Dropped a stopped load from history for %s", user_id)
+        except Exception:  # noqa: BLE001 - never raise into the session machine
+            _LOGGER.exception("Failed to drop a stopped load from the habit model")
+
     def _predicts_for(self, user_id) -> bool:
         """Whether this person's guesses may be computed or shown at all.
 
