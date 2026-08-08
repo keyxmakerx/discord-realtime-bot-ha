@@ -18,6 +18,7 @@ from .assistant import (
     AssistantView,
     GridView,
     GuessView,
+    NotifyView,
     TradeAskView,
     TradeRequestView,
 )
@@ -432,6 +433,13 @@ class LaundryDiscordClient(discord.Client):
                 # including the ones a given render leaves out.
                 self.add_view(GridView(self.coordinator.assistant))
                 self.add_view(GuessView(self.coordinator.assistant))
+                # And the 🔔 sub-panel's four toggles, quiet-hours select and
+                # back. Built with no person, which is the template form. It
+                # matters most of all here: a toggle that never registered
+                # still *looks* like it saved — the label only changes on the
+                # re-render a dispatched tap would have caused, so the panel
+                # goes on saying "on" about a message somebody switched off.
+                self.add_view(NotifyView(self.coordinator.assistant))
                 # The reminder DMs' replies. Registered whatever the reminder
                 # option currently says: a DM already sitting in somebody's
                 # inbox has to keep working, and "🔕 Stop asking" is the last

@@ -654,6 +654,14 @@ class LaundryReminders:
                 # does no work at all: reading a prediction means scanning that
                 # person's history, and there is no point doing it for somebody
                 # who cannot be messaged whatever it says.
+                #
+                # Deliberately **no kind**, even though this loop sends exactly
+                # one and knows which. A pre-filter is allowed to be broader
+                # than the decision it precedes and never narrower: 📅 and the
+                # quiet window are re-asked inside :func:`nudge.claim_plan_dm`,
+                # which is where the budget and the reason string come from, so
+                # asking here as well would only mean two places to keep in step
+                # for a check that costs a dict read.
                 if nudge_mod.eligible(people_map, user_id, now) != (
                     nudge_mod.REASON_OK
                 ):
@@ -710,6 +718,16 @@ class LaundryReminders:
                 people_map = self._assistant.people_map
                 # Same reasoning as the plan DM: the preference check is a dict
                 # read, and everything after it is not.
+                #
+                # Kind-agnostic, and here it is load-bearing rather than merely
+                # tidy. This pass does not yet know which message it would send
+                # — :func:`nudge.select` decides that from a booking, a
+                # prediction and the occupancy, none of which have been read
+                # yet — so there is no kind to pass. Naming one anyway would
+                # mean picking ⏰ or 💡 before the branch that chooses between
+                # them, and somebody who switched off only the one we guessed
+                # would be dropped here, never reaching the branch that would
+                # have sent them the other.
                 if nudge_mod.eligible(people_map, user_id, now) != (
                     nudge_mod.REASON_OK
                 ):

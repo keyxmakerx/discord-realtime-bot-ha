@@ -141,13 +141,17 @@ DEFAULT_REMIND_DMS = False
 # buzz. One trigger, once a week, per person.
 DEFAULT_PLAN_DM_WEEKDAY = 6
 DEFAULT_PLAN_DM_TIME = "18:00:00"
-# How long before the END of somebody's slot the day-of backstop fires (§10.4
-# trigger b), in minutes. Not a fixed clock time: a single 18:00 reminder cannot
-# be "near the end of that slot" for four different slots, and it is useless to
-# the person who washes on Saturday mornings. One time per slot is derived from
-# this — with the default that is 11:00, 15:00, 19:00 and 23:00 — and each one
-# lands inside the window it belongs to, which is what lets the backstop and the
-# washer-freed event be the same decision asked twice.
+# How long before the START of somebody's booked slot the heads-up fires, in
+# minutes. Not a fixed clock time: a single 18:00 reminder cannot be an hour
+# before four different slots, and it is useless to the person who washes on
+# Saturday mornings. One time per slot is derived from this — with the default
+# that is 05:00, 11:00, 15:00 and 19:00.
+#
+# This used to be a lead before the slot's *end*, and that was the single line
+# that made a reservation worthless: booking Thursday Eve bought nothing until
+# you were already standing inside it, far too late to put a load on. The
+# default was 60 then and is 60 now, so nobody's stored option changes meaning
+# by more than the fix they wanted.
 DEFAULT_NUDGE_LEAD = 60
 MIN_NUDGE_LEAD = 5
 MAX_NUDGE_LEAD = 180
@@ -264,6 +268,33 @@ GUESS_RIGHT_CUSTOM_ID = "laundry_discord_guess_right"
 GUESS_WRONG_CUSTOM_ID = "laundry_discord_guess_wrong"
 GUESS_OFF_CUSTOM_ID = "laundry_discord_guess_off"
 GUESS_BACK_CUSTOM_ID = "laundry_discord_guess_back"
+# 🔔 What I send you — the sub-panel behind row 1's 🔔 button, where each kind of
+# *unprompted* message gets its own switch and the overnight quiet window is
+# picked. Seven ids: the opener, one per kind in ``people.KINDS``, the
+# quiet-hours select, and this panel's own Back.
+#
+# The mapping is keyed by the kind names ``people.KINDS`` declares, spelled out
+# as literals rather than imported: this module imports nothing, and a key that
+# stopped matching raises ``KeyError`` while ``NotifyView``'s registration
+# template is being built — at startup, in ``on_ready``, rather than a fortnight
+# later inside one person's panel. Same trick as GRID_SLOT_CUSTOM_IDS above.
+#
+# All seven go into a view handed to add_view, unconditionally. That rule is
+# restated on every block of this page because it was learned twice: a
+# ``custom_id`` that was never registered does not raise and does not log, it
+# silently stops dispatching. It costs more here than anywhere else in the file,
+# because a dead *toggle* reads as a setting that saved — the label only changes
+# on the re-render a dispatched tap would have caused, so the button still says
+# "on", the person believes they switched it off, and the DMs keep arriving.
+PANEL_NOTIFY_CUSTOM_ID = "laundry_discord_panel_notify"
+NOTIFY_KIND_CUSTOM_IDS = {
+    "checkin": "laundry_discord_notify_checkin",
+    "slot": "laundry_discord_notify_slot",
+    "opportunity": "laundry_discord_notify_opportunity",
+    "trades": "laundry_discord_notify_trades",
+}
+NOTIFY_QUIET_CUSTOM_ID = "laundry_discord_notify_quiet"
+NOTIFY_BACK_CUSTOM_ID = "laundry_discord_notify_back"
 # The reminder DMs' own buttons (design doc §10.2 / §10.3). A DM is a normal
 # message, so its components dispatch through the same persistent-view registry
 # as everything else — and these are the ids most likely to be tapped hours

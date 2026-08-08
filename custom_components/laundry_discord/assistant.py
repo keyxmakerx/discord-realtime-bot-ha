@@ -76,10 +76,14 @@ from .const import (
     GUESS_OFF_CUSTOM_ID,
     GUESS_RIGHT_CUSTOM_ID,
     GUESS_WRONG_CUSTOM_ID,
+    NOTIFY_BACK_CUSTOM_ID,
+    NOTIFY_KIND_CUSTOM_IDS,
+    NOTIFY_QUIET_CUSTOM_ID,
     PANEL_CHANNEL_CUSTOM_ID,
     PANEL_DM_CUSTOM_ID,
     PANEL_GUESS_CUSTOM_ID,
     PANEL_MONITOR_CUSTOM_ID,
+    PANEL_NOTIFY_CUSTOM_ID,
     PANEL_OFF_CUSTOM_ID,
     PANEL_WEEK_CUSTOM_ID,
     PLANNER_STORAGE_KEY,
@@ -109,6 +113,11 @@ _COLOR_WELCOME = 0xFEE75C  # yellow — 👋 the one panel you see exactly once
 _COLOR_GRID = 0x57F287  # green — 📅 the week
 _COLOR_TRADE = 0xEB459E  # fuchsia — 🔁 the only panel that messages a person
 _COLOR_GUESS = 0xC77DFF  # violet — 🔮 the model's opinion, not a fact
+# Amber, and specifically *not* Discord's brand red, which is the one palette
+# entry left. Red already means something in this integration — ``danger`` on a
+# slot button is "somebody else has this" — and on an embed it reads as an
+# error, which a settings panel is not. Amber is what a bell is drawn in.
+_COLOR_NOTIFY = 0xFAA61A  # amber — 🔔 the only panel where every control mutes
 
 # The §10.5 explainer, shown once at the top of the panel after a refused DM.
 # Both settings are listed because either one can be the culprit and neither is
@@ -130,6 +139,91 @@ _MODE_LABELS = {
     people_mod.REMIND_CHANNEL: "💬 In the channel, with an @mention",
     people_mod.REMIND_OFF: "🚫 No pushes — you're still named in the channel",
 }
+
+# The four 🔔 switches: ``(emoji, button label, what the message actually is)``.
+# Keyed by :data:`people.KINDS`, which is the one home for those names — see the
+# comment there for why they live in a module that imports nothing. The third
+# element is the panel's own sentence about that kind, kept beside its label so
+# the button and the line explaining it cannot drift into describing two
+# different messages.
+#
+# The check-in is "weekly" here and *not* "Sunday", which is what the design doc
+# and the README both call it: the day is an integration option
+# (``plan_dm_weekday``), read in :mod:`reminders`, and a panel that names a day
+# the house has changed is a settings screen caught lying about something the
+# reader can check in one tap.
+_NOTIFY_KINDS = {
+    people_mod.KIND_CHECKIN: (
+        "📅",
+        "Check-in",
+        "the weekly DM about the week ahead",
+    ),
+    people_mod.KIND_SLOT: (
+        "⏰",
+        "Heads-up",
+        "an hour before a slot you booked, so it doesn't lapse unused",
+    ),
+    people_mod.KIND_OPPORTUNITY: (
+        "💡",
+        "Spare slot",
+        "when the washer's clear and you're overdue by your own usual gap",
+    ),
+    people_mod.KIND_TRADES: (
+        "🔁",
+        "Swaps",
+        "a housemate asking whether they can have one of your slots",
+    ),
+}
+
+# The quiet-hours presets, as ``(start, end)`` local hours — start inclusive,
+# end exclusive, wrapping midnight — with None for "no quiet hours" first,
+# because the way *out* of a setting must never be harder to find than the way
+# in (P7).
+#
+# Overnight only, and only five of them. That is not a limitation, it is the
+# actual complaint: :data:`plan.SLOT_WINDOWS` opens AM at 06:00 and the heads-up
+# runs an hour ahead of a slot, so 05:00 is the earliest thing this integration
+# can put on a phone and the only one that can wake somebody. A midday window
+# would be a setting nobody picks, and every unused setting is one more line a
+# newcomer reads past to reach the one they came for.
+_QUIET_PRESETS = (None, (22, 8), (23, 9), (0, 7), (21, 9))
+
+
+def _quiet_label(window) -> str:
+    """A quiet window as the panel says it out loud."""
+    if window is None:
+        return "No quiet hours"
+    return f"{window[0]:02d}:00–{window[1]:02d}:00"
+
+
+def _quiet_value(window) -> str:
+    """A preset as a select value: ``"none"``, or ``"22-8"``.
+
+    Deliberately the two hours and nothing else. A value carrying an index into
+    :data:`_QUIET_PRESETS` would be read by a tap on a panel that was rendered
+    before an upgrade reordered the list, and would then set a window nobody
+    picked — the select is persistent, so its values outlive the render.
+    """
+    return "none" if window is None else f"{window[0]}-{window[1]}"
+
+
+def _parse_quiet(value) -> tuple[int | None, int | None]:
+    """A select value back to ``(start, end)`` hours; anything odd clears it.
+
+    Clearing is the only safe direction for something unreadable. The failure
+    mode of guessing is somebody silenced past a morning that never arrives,
+    where the failure mode of clearing is one setting they can put back in a
+    tap. :func:`people.set_quiet_hours` re-checks both hours anyway, so a pair
+    out of range lands in the same place rather than storing a 25th hour.
+    """
+    parts = str(value).split("-")
+    if len(parts) != 2:
+        return (None, None)
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return (None, None)
+
 
 # How long a swap request DM is allowed to take to leave the building. Same
 # reasoning as :data:`reminders._SEND_TIMEOUT`: ``async_dm_user`` starts with
@@ -254,6 +348,40 @@ class _GuessButton(discord.ui.Button):
             await self.assistant.async_open_guess(interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to open the guess panel")
+            await self.assistant.async_report_error(interaction)
+
+
+class _PanelNotifyButton(discord.ui.Button):
+    """Open the 🔔 "what I send you" sub-panel.
+
+    A sub-panel rather than four more buttons on the main one, and that is a
+    space decision with a reason behind it: row 1 had two free slots when this
+    arrived, the controls need six, and a settings panel you have to read past
+    to find *how should I reach you* has stopped being the onboarding surface
+    it exists to be. So the one button that fits opens the five that don't.
+
+    Shown to anybody onboarded, including somebody whose **Pings** are set to
+    the channel — where none of these switches currently change anything. That
+    is deliberate: hiding a setting because another setting makes it inert is
+    how somebody concludes the bot cannot be told to stop, and the panel behind
+    this says plainly what is and isn't reaching them.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="What I send you",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔔",
+            custom_id=PANEL_NOTIFY_CUSTOM_ID,
+            row=1,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_open_notify(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to open the notification panel")
             await self.assistant.async_report_error(interaction)
 
 
@@ -384,6 +512,175 @@ class GuessView(discord.ui.View):
             self.add_item(_GuessWrongButton(assistant))
         self.add_item(_GuessOffButton(assistant, predicting=predicting))
         self.add_item(_GuessBackButton(assistant))
+
+
+class _NotifyKindButton(discord.ui.Button):
+    """One kind of unprompted message, labelled with the state it is in.
+
+    Labelled and tapped exactly like 👁 Monitoring, and for the same reason: the
+    label *is* the setting, so reading the panel and changing it are one gesture
+    and there is no separate save to forget. ``enabled=None`` is the
+    registration template, which has no person and so no state to report.
+
+    The labels are short — "Heads-up", not "Slot heads-up" — because four of
+    these share one row and Discord truncates a label from the **right**, which
+    is exactly where the ``: on`` lives. A switch that has lost its state is a
+    switch you have to tap to read, and tapping it is what changes it. The full
+    sentence for every kind is in the embed above, where there is room.
+    """
+
+    def __init__(
+        self,
+        assistant: "LaundryAssistant",
+        kind: str,
+        label: str,
+        emoji: str,
+        *,
+        enabled: bool | None,
+    ) -> None:
+        super().__init__(
+            label=(
+                label
+                if enabled is None
+                else f"{label}: {'on' if enabled else 'off'}"
+            ),
+            style=discord.ButtonStyle.secondary,
+            emoji=emoji,
+            custom_id=NOTIFY_KIND_CUSTOM_IDS[kind],
+            row=0,
+        )
+        self.assistant = assistant
+        self.kind = kind
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_toggle_dm_kind(interaction, self.kind)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to toggle a notification kind")
+            await self.assistant.async_report_error(interaction)
+
+
+class _NotifyQuietSelect(discord.ui.Select):
+    """The overnight quiet window, as a short list of presets.
+
+    A select rather than a time picker because Discord has no time input at
+    all, and the alternative is parsing "10ish" out of a modal — a text box that
+    can be wrong in more ways than it can be right, on a setting whose failure
+    mode is silence.
+
+    The stored window is named in the placeholder *as well as* marked ``default``
+    on its own option, which is not belt-and-braces: Discord shows the
+    placeholder only when no option is default, and that is exactly the case
+    where somebody's record holds a window these presets don't contain — a
+    hand-edited store, or a preset a later version dropped. The panel then still
+    says what is actually in force, instead of showing an empty box that reads
+    as "no quiet hours" about somebody who has some.
+    """
+
+    def __init__(
+        self, assistant: "LaundryAssistant", window: tuple[int, int] | None
+    ) -> None:
+        super().__init__(
+            placeholder=f"Quiet hours: {_quiet_label(window)}",
+            custom_id=NOTIFY_QUIET_CUSTOM_ID,
+            min_values=1,
+            max_values=1,
+            row=1,
+            options=[
+                discord.SelectOption(
+                    label=_quiet_label(preset),
+                    value=_quiet_value(preset),
+                    default=preset == window,
+                )
+                for preset in _QUIET_PRESETS
+            ],
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_set_quiet_hours(
+                interaction, self.values[0]
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to set quiet hours")
+            await self.assistant.async_report_error(interaction)
+
+
+class _NotifyBackButton(discord.ui.Button):
+    """Back to the settings panel.
+
+    Its own ``custom_id`` rather than 🔮's or the grid's, though all three do the
+    same thing: ``add_view`` keys the persistent registry by id, so two views
+    sharing one means the second registration quietly wins for both.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            emoji="↩️",
+            custom_id=NOTIFY_BACK_CUSTOM_ID,
+            row=2,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_back_to_panel(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to return to the panel")
+            await self.assistant.async_report_error(interaction)
+
+
+class NotifyView(discord.ui.View):
+    """The 🔔 panel: four kind toggles, the quiet-hours select, and back.
+
+    Three rows, six components. The four toggles share row 0 because they are
+    one question asked four times; the select takes a whole row as Discord
+    requires, and Back sits under both.
+
+    ``person`` is the record being rendered for, used only to label the toggles
+    and pre-select the window. ``None`` is the neutral registration template
+    handed to ``add_view``. Unlike :class:`GuessView` there is nothing
+    conditional to leave out here, so the template differs from a real render
+    only in what the labels say — but it is still the template that must carry
+    every id, because one that was never registered doesn't error, it silently
+    stops dispatching.
+
+    Iterating :data:`people.KINDS` rather than a list of its own is what keeps
+    that honest: a kind added there without a row in :data:`_NOTIFY_KINDS` or an
+    id in :data:`const.NOTIFY_KIND_CUSTOM_IDS` raises ``KeyError`` right here,
+    and "here" is startup — ``on_ready`` builds this template — rather than the
+    first time somebody opens the panel.
+    """
+
+    def __init__(
+        self, assistant: "LaundryAssistant", *, person: dict | None = None
+    ) -> None:
+        super().__init__(timeout=None)
+        for kind in people_mod.KINDS:
+            emoji, label, _what = _NOTIFY_KINDS[kind]
+            self.add_item(
+                _NotifyKindButton(
+                    assistant,
+                    kind,
+                    label,
+                    emoji,
+                    enabled=(
+                        people_mod.wants_kind(person, kind)
+                        if person is not None
+                        else None
+                    ),
+                )
+            )
+        self.add_item(
+            _NotifyQuietSelect(
+                assistant,
+                people_mod.quiet_hours(person) if person is not None else None,
+            )
+        )
+        self.add_item(_NotifyBackButton(assistant))
 
 
 class _GridDaySelect(discord.ui.Select):
@@ -820,9 +1117,12 @@ class AssistantView(discord.ui.View):
     silently stops dispatching — a dead button, and a bug class this
     integration has already been bitten by.
 
-    Five components at most, in two rows: the three reminder modes on row 0,
-    and 👁 / 📅 / 🔮 on row 1. Discord allows 5 per row and 25 per message, so
-    row 1 has two slots left before anything has to move.
+    Seven components at most, in two rows: the three reminder modes on row 0,
+    and 👁 / 📅 / 🔔 / 🔮 on row 1. Discord allows 5 per row and 25 per message,
+    so row 1 has one slot left before anything has to move — which is the whole
+    reason 🔔 opens a sub-panel instead of putting four toggles and a select
+    here, where they would not fit and would bury the one question this panel
+    exists to ask.
     """
 
     def __init__(
@@ -881,6 +1181,13 @@ class AssistantView(discord.ui.View):
             # be reached, not invited to plan their week. Row 1 keeps it clear
             # of the three reminder-mode buttons on row 0.
             self.add_item(_WeekButton(assistant))
+            # 🔔 hides on the first-time panel for the same reason again, and
+            # more sharply: it is a panel of four ways to hear *less*, shown to
+            # somebody who has not yet agreed to hear anything. It answers a
+            # question they haven't been asked yet, and the answer they'd give
+            # to "how should I reach you" is the one that decides whether any
+            # of it matters.
+            self.add_item(_PanelNotifyButton(assistant))
         # 🔮 only exists while the house has day-learning on: with the option
         # off there is no history, so the panel behind it could only ever say
         # "nothing to show", and a button that can't do anything is worse than
@@ -1588,6 +1895,77 @@ class LaundryAssistant:
         )
         await self._async_save()
         await self._async_rerender(interaction)
+
+    # --------------------------------------------------------- what I send you
+    async def async_open_notify(self, interaction: discord.Interaction) -> None:
+        """Answer 🔔 with every message the bot starts, and its switch."""
+        await self._async_render_notify(interaction)
+
+    async def async_toggle_dm_kind(
+        self, interaction: discord.Interaction, kind: str
+    ) -> None:
+        """🔔 button: flip one kind of unprompted message, then re-render.
+
+        The current value is read at tap time rather than carried on the button
+        from the render, for the reason :meth:`async_reject_guess` re-reads its
+        cell: a panel opened before a restart is still tapped after one, and
+        *toggle* has to mean the state as it is now rather than the state this
+        process last drew. Getting that wrong on a switch is worse than on a
+        correction — the tap would set the value the button already showed, so
+        nothing would appear to happen, twice.
+        """
+        user_id = interaction.user.id
+        person = people_mod.get_person(self._people, user_id)
+        self._people = people_mod.set_dm_kind(
+            self._people,
+            user_id,
+            kind,
+            not people_mod.wants_kind(person, kind),
+            name=interaction.user.display_name,
+        )
+        await self._async_save()
+        await self._async_render_notify(interaction)
+
+    async def async_set_quiet_hours(
+        self, interaction: discord.Interaction, value
+    ) -> None:
+        """🔔 select: choose — or with "No quiet hours" clear — the window.
+
+        The only control in this file where choosing the value that is already
+        set is an ordinary gesture: Discord renders the current window as the
+        selected option, so re-picking it is one stray tap away, where every
+        button here flips something by definition. So this is also the only one
+        that checks before writing, which is the panel's standing rule (a store
+        write only when something actually changed) applied where it can finally
+        bite. Comparing the rebuilt mapping is exact rather than approximate —
+        every record in it has been through ``normalise_person``, so equal
+        content compares equal and a re-pick costs nothing at all.
+        """
+        user_id = interaction.user.id
+        start, end = _parse_quiet(value)
+        updated = people_mod.set_quiet_hours(
+            self._people,
+            user_id,
+            start,
+            end,
+            name=interaction.user.display_name,
+        )
+        if updated != self._people:
+            self._people = updated
+            await self._async_save()
+        await self._async_render_notify(interaction)
+
+    async def _async_render_notify(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """Draw the 🔔 panel for this viewer, in place where possible."""
+        person = people_mod.get_person(self._people, interaction.user.id)
+        await self._async_respond(
+            interaction,
+            self._notify_embed(person),
+            NotifyView(self, person=person),
+            edit=True,
+        )
 
     # ------------------------------------------------------------- the guess
     async def async_open_guess(self, interaction: discord.Interaction) -> None:
@@ -2538,9 +2916,11 @@ class LaundryAssistant:
             title="🤖 Your laundry assistant",
             description=(
                 (_DM_NOTICE if notice else "")
-                + "Settings for the messages that are **about you** — your load "
-                "finishing, or the washer coming free after you tapped 🔜. The "
-                "card itself is unaffected."
+                + "**Pings** is how I reach you about **your own** laundry — "
+                "your load finishing, or the washer coming free after you "
+                "tapped 🔜. 🔔 **What I send you** is everything else: the "
+                "messages I start on my own, one switch each. The card itself "
+                "is unaffected by either."
             ),
             color=_COLOR_PANEL,
         )
@@ -2564,6 +2944,11 @@ class LaundryAssistant:
         else:
             monitoring = "🚫 off — I won't log your loads at all"
         embed.add_field(name="Monitoring", value=monitoring, inline=False)
+        embed.add_field(
+            name="What I send you",
+            value=self._notify_summary(person),
+            inline=False,
+        )
         if learning and person["monitor"]:
             embed.add_field(
                 name="Guessing",
@@ -2577,6 +2962,115 @@ class LaundryAssistant:
                 inline=False,
             )
         embed.set_footer(text="No stats about you are ever shown to the house.")
+        return embed
+
+    def _notify_summary(self, person: dict) -> str:
+        """The 🔔 settings in one line, for the main panel.
+
+        Names what is **off** rather than what is on, which is the shorter list
+        in every case that matters and the only one worth a glance: four kinds
+        all on is the default and needs no reading, whereas somebody who
+        switched the heads-up off a month ago and is wondering why nothing
+        arrives before their slot needs to see it without opening anything.
+        """
+        off = [
+            f"{_NOTIFY_KINDS[kind][0]} {_NOTIFY_KINDS[kind][1]}"
+            for kind in people_mod.KINDS
+            if not people_mod.wants_kind(person, kind)
+        ]
+        window = people_mod.quiet_hours(person)
+        kinds = "🔔 all four on" if not off else "🔕 off: " + ", ".join(off)
+        quiet = (
+            "no quiet hours"
+            if window is None
+            else f"quiet {_quiet_label(window)}"
+        )
+        return f"{kinds} · {quiet}"
+
+    def _notify_embed(self, person: dict) -> discord.Embed:
+        """The 🔔 panel — everything the bot starts, and the switch for each.
+
+        The second paragraph is what stops this reading as a mute button for the
+        whole integration, and it is the design's line rather than a hedge:
+        these switches govern messages the **bot or a housemate** starts, never
+        a reply to something you did. "Your load is done" answers 🧺 Claim and
+        "the washer's yours" answers 🔜, and both are time-critical — a handoff
+        held until 08:00 tells somebody the washer was free eight hours ago,
+        which is worse than not sending it at all. Those stay under **Pings**,
+        where "how do you want to be reached about your own laundry" lives.
+
+        What this deliberately does **not** say is that anything switched on
+        here will definitely arrive: the house's own reminder option gates all
+        three of the bot's messages, and that rule lives in :mod:`reminders`.
+        Restating it here would be a second copy to keep in step, and a settings
+        screen that contradicts another screen is worse than one that is merely
+        modest. So every line is worded as what the switch *allows*, which is
+        true whatever the house has turned on — and the two facts this module
+        does own, a delivery route that isn't a DM and swaps switched off for
+        the channel, are stated outright, because both make a switch below inert
+        and neither is discoverable from anywhere else.
+        """
+        # Prepended rather than added as a field, like the §10.5 notice: a
+        # caveat that changes what everything under it means has to be read
+        # first, and Discord renders fields *after* the description.
+        if person["reminders"] != people_mod.REMIND_DM:
+            route = (
+                "⚠️ None of these can reach you at the moment — **Pings** is "
+                "set to something other than 📬 **DM me**, and every message "
+                "below is a DM. Your answers here are kept for when you change "
+                "it back.\n\n"
+            )
+        elif person["dm_ok"] is False:
+            route = (
+                "⚠️ Your DMs are closed, so none of these are getting through. "
+                "Open 🤖 for the two settings that fix it.\n\n"
+            )
+        else:
+            route = ""
+        embed = discord.Embed(
+            title="🔔 What I send you",
+            description=(
+                route
+                + "These are the messages **I** start — on a schedule, or "
+                "because a housemate asked me to. Switching one off means I "
+                "won't send it.\n\n"
+                "Nothing here touches the messages that answer something *you* "
+                "did: 🧺 **Claim** still tells you your load is done, and 🔜 "
+                "still tells you when the washer is actually yours. Those are "
+                "under **Pings** on the main panel."
+            ),
+            color=_COLOR_NOTIFY,
+        )
+        lines = []
+        for kind in people_mod.KINDS:
+            emoji, label, what = _NOTIFY_KINDS[kind]
+            state = "on" if people_mod.wants_kind(person, kind) else "off"
+            line = f"{emoji} **{label}: {state}** — {what}"
+            # The house switch for swaps is the one that can make a line here
+            # untrue on its own, and unlike the reminder option it is read in
+            # this module already — so saying so costs no second copy of
+            # anybody's rule. Somebody who leaves 🔁 on in a house that has
+            # trades off should not conclude the switch did nothing.
+            if kind == people_mod.KIND_TRADES and not self.trades_enabled:
+                line += "\n(swaps are off for this channel, so nobody can ask)"
+            lines.append(line)
+        embed.add_field(name="Messages", value="\n".join(lines), inline=False)
+        window = people_mod.quiet_hours(person)
+        embed.add_field(
+            name="Quiet hours",
+            value=(
+                f"🌙 **{_quiet_label(window)}** — anything above that would "
+                "land inside it is **dropped**, not saved up for the morning. "
+                "A heads-up delivered at 08:00 is about a slot that has gone."
+                if window
+                else "🌙 **None** — the earliest I'd reach you is 05:00, an "
+                "hour before an AM slot you booked."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="Nothing here can make me send you more than I already do."
+        )
         return embed
 
     def _guess_embed(
