@@ -593,38 +593,43 @@ Look right?
   a confirmation isn't evidence, and the loads behind the guess are already
   counted).
 - **📅 Change** — opens your week grid, right there in the DM.
-- **🔕 Stop asking** — permanent. No check-in, no day-of nudge, no `?`. **🔮 Start
+- **🔕 Stop asking** — permanent. No check-in, no heads-up, no `?`. **🔮 Start
   guessing** in the panel is the way back if you change your mind.
 
 **If the bot isn't confident about your days, you get no check-in at all** — not
 a message saying it doesn't know yet. For the first month, silence is the whole
 feature.
 
-**The day-of nudge** is the interesting one, because a fixed "6pm reminder" is a
-guess and *the washer actually being free* is a fact:
+**The slot heads-up** is the interesting one, because a fixed "6pm reminder" is
+a guess and *the washer actually being free* is a fact:
 
 ```
-🧺 Laundry day
-I've got you down for tonight (5 of your last 8 loads), and the washer's
-free right now.
+🧺 You're down for tonight
+Your slot starts in about 60 minutes and the washer's free. Still want it?
 
-[ 👍 On it ]  [ ⏭ Push to tomorrow ]  [ 🚫 Skip this week ]
+[ 👍 On it ]  [ 🆓 Free it up ]  [ ⏭ Push to tomorrow ]
 ```
+
+**It arrives before your slot opens, not during it.** That sounds like a detail
+and it was the whole bug: the old nudge fired on a lead before the slot *ended*,
+so booking Thursday Eve bought you nothing until you were already standing in
+it — too late to put a load on. A reservation is the strongest signal anybody
+can give this bot, and it was producing the weakest response in the system.
 
 It fires on **whichever comes first**:
 
-- **the washer actually coming free during your slot** — the same moment the 🔜
-  line gets handed off, not a second opinion about it: somebody tapping **✅
-  Emptied it**, the handoff backstop, or a load nobody claimed finishing. If
-  that machine went to somebody in the 🔜 line, it isn't free and nothing is
-  sent — two people are never told the same washer is theirs. And if it came
-  from the backstop, where nobody actually confirmed anything, the nudge only
-  goes out if the load was emptied or nobody had claimed it: "done" is not
-  "empty", and somebody else's wet clothes are not a free washer; or
-- **a backstop near the end of your slot**, if the washer never came free during
-  it — one time per slot, derived from that slot's own end, so it's 11:00 for
-  people who wash in the morning and 23:00 for people who wash at night. A
-  single evening reminder would be useless to the first group.
+- **the washer actually coming free** — the same moment the 🔜 line gets handed
+  off, not a second opinion about it: somebody tapping **✅ Emptied it**, the
+  handoff backstop, or a load nobody claimed finishing. If that machine went to
+  somebody in the 🔜 line, it isn't free and nothing is sent — two people are
+  never told the same washer is theirs. And if it came from the backstop, where
+  nobody actually confirmed anything, the message only goes out if the load was
+  emptied or nobody had claimed it: "done" is not "empty", and somebody else's
+  wet clothes are not a free washer; or
+- **an hour before your slot opens** — one time per slot, off that slot's own
+  start, so it's 05:00 for people who wash in the morning and 19:00 for people
+  who wash at night. A single evening reminder would be useless to the first
+  group.
 
 Whichever one gets there first sends; the other is dropped. You never get two
 about one evening. And **if you've already run a load today you get nothing** —
@@ -633,10 +638,58 @@ arriving while you're folding is the fastest way to get a bot muted.
 
 - **👍 On it** — marks the slot taken on the anonymous board, so nobody plans on
   top of you. Still no names — just a full cell.
-- **⏭ Push to tomorrow** — books the same slot tomorrow, so the nudge follows
+- **🆓 Free it up** — hands the slot back. This is the one button here that
+  serves *the house* rather than you, and it's why the message is worded as a
+  question instead of a reminder: a reservation about to lapse unused is exactly
+  the capacity the grid exists to reclaim. A message you were going to ignore
+  still does something useful. (A standing ♻️ slot comes back next week as
+  normal — this frees *this* week only.)
+- **⏭ Push to tomorrow** — books the same slot tomorrow, so the message follows
   you. This is explicitly **not** the guess being wrong; it's you being busy,
   and it won't change what the bot thinks your usual days are.
-- **🚫 Skip this week** — quiet until Monday. It expires on its own.
+
+**The opportunity nudge** is the only message that isn't about something you
+said, so it has to earn its place by carrying *only* what you can't see from
+your bedroom:
+
+```
+🧺 Tonight is wide open
+Nobody's booked tonight and the washer's free (5 of your last 8 loads).
+It's been about 8 days.
+
+[ 👍 On it ]  [ 🚫 Not this week ]
+```
+
+It needs **all** of: you're past your own usual gap between washes, nobody has
+booked the slot you normally use, and the machine is free. That gap is *learned
+per person and taken as a median*, which matters more than it sounds: a mean
+would let one fortnight away drag your "usual" past ten days and go quiet for a
+week and a half. The median ignores the holiday. So the housemate who washes
+twice a week and the one who washes fortnightly are both left alone until
+**they** are overdue, and a fixed number of days would have been wrong for at
+least one of them.
+
+#### One message, chosen — not four triggers racing
+
+The rule the whole thing is built on: **the bot may only speak when its own
+private information is the point.**
+
+| It knows | You don't | Worth saying? |
+|---|---|---|
+| the machine is free right now | ✅ | yes |
+| nobody has booked your usual slot | ✅ | yes |
+| your booked slot is about to pass unused | ✅ | yes |
+| you have dirty clothes, or a free evening | ❌ | **never assume** |
+
+So at most **one** message is chosen per person per moment, in one place, rather
+than four independent triggers each deciding for themselves and spending from
+the same budget. A booking beats a guess — the same precedence the grid draws
+with, and for the same reason: saying the second while ignoring the first
+answers a question you didn't ask.
+
+Everything is dropped rather than queued: the machine is busy, you washed today,
+you've already heard from the bot, you said "not this week", or the model simply
+has no confident opinion — which, for the first month, is everybody.
 
 #### What has to be true before anything is sent
 
@@ -760,7 +813,7 @@ own:
 The reminder DMs are capped at **2 per person per week** as well as 1 per day. A
 swap request spends the **daily** cap but **not** the weekly one. The reason:
 the weekly cap exists to bound how often *the bot's own arithmetic* starts a
-conversation with you — the Sunday check-in and the day-of nudge are the model
+conversation with you — the Sunday check-in and the slot heads-up are the model
 deciding it has something to say about your habits. A swap request isn't the
 bot's idea; it's a housemate asking about a slot you put on a shared board, and
 it carries a question only you can answer. Charging it to the weekly allowance
@@ -859,7 +912,7 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Learn the days each person washes *(options)* | `false` | The habit model: logs each 🧺 Claim and draws `?` on that person's own grid. See [The 🔮 day guesses](#the--day-guesses-). |
 | **Send reminder DMs** *(options)* | `false` | **The only setting that lets the bot decide on its own to message somebody who didn't tap anything first.** Needs day-learning on as well, and only ever DMs a person who chose **📬 DM me** in 🤖. Max 1 DM per person per day, 2 per week. See [The reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first). |
 | Weekly plan DM — day / time *(options)* | Sunday, `18:00` | When the weekly check-in goes out. Ignored while reminder DMs are off. |
-| Day-of nudge backstop *(options)* | `60` min | How long before the **end of somebody's slot** to nudge them if the washer never came free during it. The nudge normally fires the moment the washer is actually free inside their slot; whichever happens first wins and only one is ever sent. |
+| Slot heads-up lead *(options)* | `60` min | How long before the **start of a slot somebody booked** to ask whether they still want it. It also fires the moment the washer is actually free; whichever happens first wins and only one message is ever sent. |
 | **Swap requests** *(options)* | `false` | Lets one housemate ask another, **anonymously**, to trade slots — the other setting that can DM somebody unprompted, except here a person is doing the asking. Only an accept reveals the two names. One ask per slot per person per week, a refused slot shut to everyone for the week, a permanent per-pair 🚫, one ask in flight each way, a 48h expiry, and the recipient's 1-DM-a-day budget. See [🔁 Swap requests](#-swap-requests-the-double-blind-broker). |
 
 > **Ping note:** the only push per load is a *user* mention of the claimant, sent
@@ -960,7 +1013,7 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   half of Phase 4 — 🔮 above: history from Claim taps, confidence-gated guesses
   drawn as `?` on your own grid, and the corrections that train it.
 - ~~The DM reminders those guesses are *for*.~~ **Shipped** as the second half of
-  Phase 4 — 📬 above: a weekly check-in, and a day-of nudge that fires on the
+  Phase 4 — 📬 above: a weekly check-in, and a slot heads-up that fires on the
   washer actually coming free rather than on a clock, under a hard budget of 1 DM
   a day and 2 a week. Off by default, and the only feature here that starts a
   conversation.

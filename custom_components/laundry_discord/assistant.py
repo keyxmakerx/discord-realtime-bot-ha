@@ -938,6 +938,10 @@ class LaundryAssistant:
         # ♻ needs the opposite case — a cell of your own — so it needs its own
         # note. View state, memory only, like the two above.
         self._last_cell: dict[str, str] = {}
+        # Which cell the last reminder DM to each person was about. See
+        # :meth:`note_nudge_cell` — the heads-up lands before its slot opens, so
+        # the message's own timestamp can no longer identify it unambiguously.
+        self._nudge_cell: dict[str, str] = {}
         # The live load's window, pushed by the coordinator (never pulled: the
         # dependency runs one way, §14 rule 5). Two floats, memory only, and
         # deliberately *not* the cells themselves — those are worked out on
@@ -1278,6 +1282,40 @@ class LaundryAssistant:
             for row in habit_mod.history_for(self._history, user_id, self._now())
         ]
 
+    def typical_gap(self, user_id) -> float | None:
+        """How many days this person usually leaves between loads, or None.
+
+        Gated the same way :meth:`prediction_for` is, and for the same reason:
+        it is arithmetic about somebody's own history, so 👁 Monitoring off must
+        stop it being *read* as well as written. Otherwise turning monitoring
+        off would keep producing timing claims from rows already stored, which
+        is precisely what somebody was switching off.
+        """
+        if not self._predicts_for(user_id):
+            return None
+        return habit_mod.typical_gap(self._history, user_id, self._now())
+
+    def is_due(self, user_id) -> bool:
+        """Whether this person is past **their own** usual gap between washes.
+
+        The gate on the opportunity nudge. False whenever the cadence is not
+        known yet, which is the common early answer and the quiet one.
+        """
+        if not self._predicts_for(user_id):
+            return False
+        return habit_mod.is_due(self._history, user_id, self._now())
+
+    def occupancy(self) -> dict:
+        """This week's reconciled occupancy — what the grid draws from.
+
+        The reminder loop needs it to answer "has somebody else booked the slot
+        this person usually uses", which is the fact that makes an opportunity
+        nudge worth sending rather than a guess about their laundry.
+        """
+        return plan_mod.effective_week(
+            self._people, self._overrides, self._current_week()
+        )
+
     def booked_cells(self, user_id, week=None) -> list[str]:
         """The cells this person has actually booked in a week (§6.4).
 
@@ -1354,6 +1392,61 @@ class LaundryAssistant:
         )
         await self._async_save()
         return True
+
+    async def async_free_cell(self, user_id, cell, week=None) -> bool:
+        """🆓 Free it up — give a booked slot back to the house.
+
+        The mirror of :meth:`async_book_cell` and idempotent in the same way: a
+        second tap must not re-book what the first released. Returns False when
+        there was nothing of theirs to release, so the reply can say so rather
+        than claiming to have freed a slot that was never taken.
+
+        It removes **only this person** from the cell. Two people can hold one
+        slot (§8), and releasing yours has no business evicting somebody else
+        from a booking you never made.
+
+        Whether the standing slot should go too is deliberately *not* asked
+        here. This button answers "not this week"; ♻ on the grid is where "not
+        every week" lives, and conflating them would turn one tap on one
+        Thursday into a permanent change nobody asked for. Because
+        :func:`plan.toggle_booking` writes the reconciled holder list into this
+        week's override, a recurring slot released here is released for this
+        week only and returns next week — which is exactly what a standing
+        booking means.
+        """
+        key = plan_mod.normalise_cell(cell)
+        target = week if isinstance(week, str) and week else self._current_week()
+        if key is None or not target:
+            return False
+        if key not in self.booked_cells(user_id, target):
+            return False  # not theirs — nothing to give back
+        self._overrides, _booked = plan_mod.toggle_booking(
+            self._people, self._overrides, target, key, user_id
+        )
+        await self._async_save()
+        return True
+
+    def note_nudge_cell(self, user_id, cell) -> None:
+        """Remember which cell the DM we are about to send is about.
+
+        The heads-up arrives *before* its slot opens, which breaks the trick the
+        day-of nudge used to identify itself: at 19:00 both PM (16:00-20:00) is
+        running and Eve starts within the hour, so a cell inferred from the
+        message's own timestamp is genuinely ambiguous, and the wrong answer
+        books a slot nobody chose on the whole household's grid.
+
+        Memory only, so a restart loses it — and :func:`reminders._dm_cell`
+        falls back to the timestamp reading rather than refusing the tap. That
+        is strictly better than the old behaviour, not worse: exact whenever we
+        know, and the previous best guess whenever we don't.
+        """
+        key = plan_mod.normalise_cell(cell)
+        if key is not None:
+            self._nudge_cell[str(user_id)] = key
+
+    def nudge_cell(self, user_id) -> str | None:
+        """The cell the last nudge DM to this person was about, if remembered."""
+        return self._nudge_cell.get(str(user_id))
 
     async def async_record_push(self, user_id, cell) -> None:
         """⏭ Push to tomorrow — a correction that is **not** a wrong guess.

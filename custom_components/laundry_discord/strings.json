@@ -48,7 +48,7 @@
           "plan_dm_weekday": "Weekly plan DM — which day to ask people whether next week's guess looks right (nothing is sent to anyone the model isn't confident about)",
           "plan_dm_time": "Weekly plan DM — what time of day to send it",
           "trades": "Swap requests — let people ask each other for a slot. Tap a slot on 📅 your week that somebody else is down for and 🔁 asks them, anonymously, whether they'd trade it for one of yours. Off by default. The DM never says who is asking and never says whose slot it is; only ✅ accepting reveals the two names, and only to each other. Every guardrail is on: one ask per slot per person per week, a slot somebody was refused is shut to everyone until next week, 🚫 Don't ask me again is permanent for that pair, one ask in flight per person in each direction, you must hold a slot of your own to offer, unanswered asks lapse after 48h, and the recipient must have chosen 📬 DM in the 🤖 panel — all inside their 1-DM-a-day budget.",
-          "nudge_lead": "Day-of nudge backstop — how long before the END of somebody's usual slot to nudge them if the washer never came free during it. The nudge normally fires the moment the washer is actually free inside their slot; whichever happens first wins, and only one is ever sent (minutes)"
+          "nudge_lead": "Slot heads-up lead — how long before the START of a slot somebody booked to ask whether they still want it. The message carries “Free it up”, so a slot that is about to lapse unused goes back to the house instead of blocking it. Only one message is ever sent per person per day, whichever trigger gets there first (minutes)"
         }
       }
     }

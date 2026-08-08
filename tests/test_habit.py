@@ -1126,6 +1126,91 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
     assert (rendered(corrections), panel(corrections)) == ([], None)
 
 
+# --- how often somebody washes (live-use design §3) --------------------------
+def _at(days: float) -> datetime.datetime:
+    """A moment ``days`` after a fixed Saturday, for cadence arithmetic."""
+    return at(2026, 8, 1, 10) + datetime.timedelta(days=days)
+
+
+
+def test_the_usual_gap_is_a_median_so_one_holiday_cannot_silence_a_month():
+    # A mean is the obvious choice and the wrong one. One fortnight away drags
+    # it past ten days, and the opportunity nudge then goes quiet for a week
+    # and a half for somebody who washes every Sunday.
+    history = []
+    for day in (0, 7, 14, 35, 42, 49):  # weekly, with one 21-day holiday
+        history = _habit.record_load(history, "1", _at(day), monitor=True)
+    now = _at(56)
+    gaps = _habit.gaps_for(history, "1", now)
+    assert gaps == [7.0, 7.0, 21.0, 7.0, 7.0]
+    assert sum(gaps) / len(gaps) > 9  # what a mean would have said
+    assert _habit.typical_gap(history, "1", now) == 7.0
+    # An even number of gaps averages the middle two rather than picking one.
+    trimmed = _habit.record_load([], "1", _at(0), monitor=True)
+    for day in (2, 8):
+        trimmed = _habit.record_load(trimmed, "1", _at(day), monitor=True)
+    assert _habit.typical_gap(trimmed, "1", now) == 4.0  # (2 + 6) / 2
+
+
+def test_a_cadence_guessed_from_too_little_is_no_cadence_at_all() -> None:
+    # Two gaps means three loads, the same evidence bar the day prediction
+    # uses. Below it the honest answer is None, and None sends nothing (P6).
+    now = _at(30)
+    assert _habit.typical_gap([], "1", now) is None
+    one = _habit.record_load([], "1", _at(0), monitor=True)
+    assert _habit.typical_gap(one, "1", now) is None
+    two = _habit.record_load(one, "1", _at(7), monitor=True)
+    assert _habit.typical_gap(two, "1", now) is None  # one gap is not a habit
+    three = _habit.record_load(two, "1", _at(14), monitor=True)
+    assert _habit.typical_gap(three, "1", now) == 7.0
+    assert _habit.MIN_GAPS == 2
+
+
+def test_a_wash_and_its_dry_are_one_trip_not_two() -> None:
+    # At 4-5 hours a cycle, a wash claimed at 17:00 and its dry at 22:00 is one
+    # evening's laundry. Counting that five-hour gap as an interval would drag
+    # the median toward a few hours and leave everybody permanently "due".
+    history = []
+    for hours in (0, 5, 24 * 7, 24 * 7 + 5, 24 * 14):
+        history = _habit.record_load(
+            history, "1", _at(hours / 24), monitor=True
+        )
+    assert len(history) == 5  # all five rows are kept; only the *gaps* filter
+    gaps = _habit.gaps_for(history, "1", _at(20))
+    # Only the two genuine week-long intervals survive; the two five-hour ones
+    # are gone, so the answer is "about a week" rather than "about five hours".
+    assert len(gaps) == 2
+    assert all(gap >= _habit.MIN_GAP_DAYS for gap in gaps), gaps
+    assert 6.5 < _habit.typical_gap(history, "1", _at(20)) < 7.0
+    # The one-hour dedupe is a different rule about a different thing: it drops
+    # a *duplicate row* from unclaim-then-reclaim, before any of this is asked.
+    twice = _habit.record_load(
+        _habit.record_load([], "1", _at(0), monitor=True),
+        "1", _at(0.02), monitor=True,
+    )
+    assert len(twice) == 1
+
+
+def test_being_due_is_measured_against_your_own_gap_and_nobody_elses() -> None:
+    # The whole point: the twice-a-week washer and the fortnightly one are both
+    # left alone until *they* are overdue, and a fixed threshold would be wrong
+    # for at least one of them.
+    weekly, fortnightly = [], []
+    for day in (0, 7, 14, 21):
+        weekly = _habit.record_load(weekly, "1", _at(day), monitor=True)
+    for day in (0, 14, 28, 42):
+        fortnightly = _habit.record_load(fortnightly, "2", _at(day), monitor=True)
+    both = weekly + fortnightly
+    # Day 28: the weekly washer is a week overdue, the other is bang on time.
+    assert _habit.days_since_load(both, "1", _at(28)) == 7.0
+    assert _habit.is_due(both, "1", _at(28)) is True
+    assert _habit.is_due(both, "2", _at(49)) is False  # 7 days into a 14 gap
+    assert _habit.is_due(both, "2", _at(56)) is True
+    # No cadence, no claim — the common early answer, and the quiet one.
+    assert _habit.is_due([], "9", _at(28)) is False
+    assert _habit.days_since_load([], "9", _at(28)) is None
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

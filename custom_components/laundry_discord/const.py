@@ -277,6 +277,12 @@ PLAN_STOP_CUSTOM_ID = "laundry_discord_plan_stop"
 NUDGE_ON_IT_CUSTOM_ID = "laundry_discord_nudge_on_it"
 NUDGE_PUSH_CUSTOM_ID = "laundry_discord_nudge_push"
 NUDGE_SKIP_CUSTOM_ID = "laundry_discord_nudge_skip"
+# 🆓 Free it up — the reply that serves the *house* rather than the person, on
+# the heads-up for a slot they booked and now don't want. It is the reason the
+# heads-up is worded as a question: a reservation about to lapse unused is
+# exactly the capacity the grid exists to reclaim, so a message you were going
+# to ignore still does something useful.
+NUDGE_FREE_CUSTOM_ID = "laundry_discord_nudge_free"
 # The trade broker (design doc §9). Same registry rule as everything else: all
 # seven ids go into views handed to add_view, registered unconditionally even
 # with trades switched off — a request DM already sitting in somebody's inbox

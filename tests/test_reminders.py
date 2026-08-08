@@ -74,18 +74,25 @@ REASON_PREDICT_OFF = _nudge.REASON_PREDICT_OFF
 REASON_REMINDERS_OFF = _nudge.REASON_REMINDERS_OFF
 REASON_WASHER_BUSY = _nudge.REASON_WASHER_BUSY
 BUDGET_REASONS = _nudge.BUDGET_REASONS
-claim_day_nudge = _nudge.claim_day_nudge
+MSG_NONE = _nudge.MSG_NONE
+MSG_OPPORTUNITY = _nudge.MSG_OPPORTUNITY
+MSG_SLOT = _nudge.MSG_SLOT
+REASON_NOT_DUE = _nudge.REASON_NOT_DUE
 claim_plan_dm = _nudge.claim_plan_dm
-current_cell = _nudge.current_cell
-day_nudge = _nudge.day_nudge
-day_nudge_text = _nudge.day_nudge_text
+claim_select = _nudge.claim_select
 eligible = _nudge.eligible
-fallback_clock = _nudge.fallback_clock
+heads_up_clock = _nudge.heads_up_clock
+heads_up_text = _nudge.heads_up_text
 is_booked = _nudge.is_booked
 is_paused = _nudge.is_paused
+opportunity_cell = _nudge.opportunity_cell
+opportunity_text = _nudge.opportunity_text
 parse_clock = _nudge.parse_clock
 plan_dm = _nudge.plan_dm
 plan_dm_text = _nudge.plan_dm_text
+select = _nudge.select
+slot_ended = _nudge.slot_ended
+slot_soon = _nudge.slot_soon
 slot_start_ts = _nudge.slot_start_ts
 
 THU_EVE = "3-eve"
@@ -102,10 +109,30 @@ def at(year, month, day, hour=21, minute=0) -> datetime.datetime:
 
 
 # 2026-08-06 is a Thursday. THU is that Thursday evening, inside the Eve slot
-# (20:00-24:00); FALLBACK is the backstop time for that same slot at the
-# default lead.
+# (20:00-24:00). HEADS_UP and LATE are both inside the hour *before* it opens,
+# which is when a message about that slot is now sent — the retired day-of
+# nudge fired near the slot's end, too late to act on.
 THU = at(2026, 8, 6, 20, 30)
-FALLBACK = at(2026, 8, 6, 23, 0)
+HEADS_UP = at(2026, 8, 6, 19, 30)
+LATE = at(2026, 8, 6, 19, 55)
+
+
+def lead(day, slot_hour, minutes=30):
+    """A moment ``minutes`` before a slot opens, i.e. inside the heads-up lead."""
+    return at(2026, 8, day, slot_hour - 1, 60 - minutes)
+
+
+def _claim(prefs, budgets, user_id, cell, moment, **kw):
+    """The reminder loop's own call, in the shape these tests assert on.
+
+    :func:`nudge.claim_select` returns the chosen message as well as the
+    verdict; most of what is checked here is the verdict and the accounting, so
+    the two are unpacked once rather than in twenty places.
+    """
+    _kind, _cell, reason, updated = claim_select(
+        prefs, budgets, user_id, moment, booked=[cell] if cell else (), **kw
+    )
+    return reason, updated
 
 
 def _person(**changes) -> dict:
@@ -226,49 +253,59 @@ def test_the_sunday_dm_quotes_the_model_rather_than_a_new_sentence() -> None:
 # --- the day-of nudge (§10.3 / §10.4) ---------------------------------------
 
 
-def test_the_nudge_only_fires_inside_the_slot_it_is_about() -> None:
-    # The washer coming free at 5pm says nothing about somebody's evening, so
-    # "what are you down for" is asked about *this moment*, not about today.
-    prefs, guess = _person(), _guess()
-    assert current_cell([], guess, THU) == THU_EVE
-    assert current_cell([], guess, at(2026, 8, 6, 17)) is None  # their day, PM
-    assert current_cell([], guess, at(2026, 8, 5, 21)) is None  # Wednesday
-    assert current_cell([], guess, at(2026, 8, 6, 3)) is None  # in no slot
-    # Nothing on right now is the common answer, and it sends nothing.
-    assert (
-        day_nudge(prefs, {}, "1", None, at(2026, 8, 6, 17), washer_free=True)
-        == REASON_NOTHING_TODAY
-    )
-    # A cell handed in from elsewhere still has to be the one that is running.
-    assert (
-        day_nudge(prefs, {}, "1", THU_EVE, at(2026, 8, 6, 17), washer_free=True)
-        == REASON_OUTSIDE_SLOT
-    )
-    assert day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True) == REASON_OK
+def test_the_heads_up_arrives_before_the_slot_rather_than_inside_it() -> None:
+    # The single line that made a reservation worthless: the old nudge fired on
+    # a lead before the slot *ended*, so booking Thursday Eve bought nothing
+    # until you were already standing inside it. This fires before it opens.
+    prefs = _person()
+    assert slot_soon([THU_EVE], HEADS_UP) == THU_EVE  # 19:30, Eve opens at 20
+    assert slot_soon([THU_EVE], at(2026, 8, 6, 18)) is None  # too early
+    assert slot_soon([THU_EVE], THU) is None  # already open: now, not soon
+    assert slot_soon([THU_EVE], at(2026, 8, 5, 19, 30)) is None  # Wednesday
+    assert slot_soon([[3, "eve"]], HEADS_UP) == THU_EVE  # the §12 stored form
+    assert slot_soon([], HEADS_UP) is None
+    # Ties go to the slot they can act on first.
+    assert slot_soon(["3-am", THU_EVE], at(2026, 8, 6, 5, 30)) == "3-am"
+    # Nothing booked and no reason to think they're overdue sends nothing,
+    # which is the overwhelmingly common answer.
+    kind, cell, reason = select(prefs, {}, "1", HEADS_UP)
+    assert (kind, cell, reason) == (MSG_NONE, None, REASON_NOT_DUE)
+    kind, cell, reason = select(prefs, {}, "1", HEADS_UP, booked=[THU_EVE])
+    assert (kind, cell, reason) == (MSG_SLOT, THU_EVE, REASON_OK)
 
 
-def test_a_booking_beats_a_guess_and_is_worded_as_one() -> None:
+def test_a_booking_beats_a_guess_and_the_two_are_worded_apart() -> None:
     # Same precedence the grid draws in: a booking is something the person
-    # said, a prediction is arithmetic about their past (P4). The distinction
-    # is invisible except in the wording, which is exactly where it matters.
-    assert current_cell([THU_EVE], None, THU) == THU_EVE
+    # said, a prediction is arithmetic about their past (P4). Saying the second
+    # while ignoring the first answers a question they didn't ask.
+    prefs, guess = _person(), _guess()
+    kind, cell, reason = select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], prediction=guess, due=True
+    )
+    assert (kind, cell, reason) == (MSG_SLOT, THU_EVE, REASON_OK)
     assert is_booked([THU_EVE], THU_EVE) is True
     assert is_booked([[3, "eve"]], THU_EVE) is True  # the §12 stored form
     assert is_booked([], THU_EVE) is False
-    booked_text = day_nudge_text(THU_EVE, None)
-    guess_text = day_nudge_text(THU_EVE, _guess())
-    assert "You're down for **tonight**" in booked_text
-    assert "I've got you down for **tonight**" in guess_text
-    assert _habit.explain(_guess()) in guess_text  # the arithmetic comes along
-    assert booked_text.endswith("the washer's free right now.")
+    booked_text = heads_up_text(THU_EVE, 60)
+    assert "You're down for tonight" in booked_text
+    assert "in about 60 minutes" in booked_text
+    assert booked_text.endswith("Still want it?")  # a question, not an order
+    assert "in about" not in heads_up_text(THU_EVE, None)
+    # The opportunity carries only what they cannot see for themselves: that
+    # nobody has booked it, and how the timing was worked out.
+    chance = opportunity_text(THU_EVE, guess, 7)
+    assert "Tonight is wide open" in chance
+    assert "Nobody's booked tonight" in chance
+    assert _habit.explain(guess) in chance  # the arithmetic comes along
+    assert "about 7 days" in chance
+    assert "7 days" not in opportunity_text(THU_EVE, guess, None)
     # Every slot has a today-relative phrase, and PM and Eve stay apart so
     # somebody down for 16:00-20:00 isn't told to go and wash at ten.
-    phrases = {
-        slot: day_nudge_text(f"3-{slot}", None) for slot in _plan.SLOTS
-    }
-    assert len({text for text in phrases.values()}) == len(_plan.SLOTS)
+    phrases = {slot: heads_up_text(f"3-{slot}", 60) for slot in _plan.SLOTS}
+    assert len(set(phrases.values())) == len(_plan.SLOTS)
     assert "this evening" in phrases["pm"] and "tonight" in phrases["eve"]
-    assert day_nudge_text("nonsense") is None
+    assert heads_up_text("nonsense", 60) is None
+    assert opportunity_text("nonsense") is None
 
 
 def test_the_nudge_says_the_washer_is_free_so_it_needs_it_to_be() -> None:
@@ -276,11 +313,11 @@ def test_the_nudge_says_the_washer_is_free_so_it_needs_it_to_be() -> None:
     # A message that says "and the washer's free right now" while somebody
     # else's load is spinning is the one that stops the rest being believed.
     prefs = _person()
-    assert day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=False) == (
-        REASON_WASHER_BUSY
-    )
-    reason, budgets = claim_day_nudge(
-        prefs, {}, "1", THU_EVE, THU, washer_free=False
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=False
+    )[2] == REASON_WASHER_BUSY
+    reason, budgets = _claim(
+        prefs, {}, "1", THU_EVE, HEADS_UP, washer_free=False
     )
     assert reason == REASON_WASHER_BUSY
     # ...and a washer that was busy costs nobody their allowance.
@@ -292,27 +329,31 @@ def test_whichever_trigger_comes_first_wins_and_the_other_is_dropped() -> None:
     # get there sends, and the second must be a no-op rather than a second DM
     # about one evening.
     prefs = _person()
-    first, budgets = claim_day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True)
+    first, budgets = _claim(prefs, {}, "1", THU_EVE, HEADS_UP, washer_free=True)
     assert first == REASON_OK
-    second, budgets = claim_day_nudge(
-        prefs, budgets, "1", THU_EVE, FALLBACK, washer_free=True
-    )
+    second, budgets = _claim(prefs, budgets, "1", THU_EVE, LATE, washer_free=True)
     assert second == REASON_ALREADY
-    # ...and it holds the other way round: the backstop fires at 23:00, then
-    # somebody empties the washer at 23:30.
-    reason, budgets = claim_day_nudge(prefs, {}, "1", THU_EVE, FALLBACK, washer_free=True)
+    # ...and it holds the other way round: the washer is emptied at 19:55, then
+    # the heads-up tick would have fired.
+    reason, budgets = _claim(prefs, {}, "1", THU_EVE, LATE, washer_free=True)
     assert reason == REASON_OK
-    reason, budgets = claim_day_nudge(
-        prefs, budgets, "1", THU_EVE, at(2026, 8, 6, 23, 30), washer_free=True
-    )
+    reason, budgets = _claim(prefs, budgets, "1", THU_EVE, HEADS_UP, washer_free=True)
     assert reason == REASON_ALREADY
     # This is deliberately NOT just the day cap doing the work. The cap would
     # give the same answer today because it happens to be 1; the rule is one
-    # nudge per slot, so it is checked against the slot's own start.
+    # message per slot, so it is checked against the slot's own window.
     assert slot_start_ts(THU_EVE, THU) == at(2026, 8, 6, 20, 0).timestamp()
-    assert _nudge.already_nudged_in_slot(budgets, "1", THU_EVE, FALLBACK) is True
-    # A nudge sent in the afternoon does not block the evening's slot.
-    assert _nudge.already_nudged_in_slot(budgets, "1", "3-pm", FALLBACK) is False
+    # ...and the window it is checked against reaches back over the lead,
+    # because both triggers for an evening slot land before 20:00. Measuring
+    # from the slot's own start would put every heads-up outside the window it
+    # was about, and the second trigger would send a second DM.
+    assert _nudge.already_nudged_in_slot(budgets, "1", THU_EVE, THU, 60) is True
+    assert _nudge.already_nudged_in_slot(budgets, "1", THU_EVE, THU) is False
+    # A different slot is still a different window: this evening's message does
+    # not retire this morning's. (Eve's lead does overlap PM's window, since
+    # 19:30 is inside 16:00-20:00 — which is the right answer anyway, because
+    # somebody who has just been messaged should not be messaged again.)
+    assert _nudge.already_nudged_in_slot(budgets, "1", "3-am", THU, 60) is False
 
 
 # --- the budget (P2) ---------------------------------------------------------
@@ -333,24 +374,24 @@ def test_over_budget_is_dropped_not_queued() -> None:
     # is charged to the week that is ending — it does not eat into the two the
     # week it's about gets. That falls out of habit.py reusing plan's ISO key
     # rather than inventing week maths, and it is the right way round.
-    reason, budgets = claim_day_nudge(
-        prefs, budgets, "1", THU_EVE, THU, washer_free=True
+    reason, budgets = _claim(
+        prefs, budgets, "1", THU_EVE, HEADS_UP, washer_free=True
     )
     assert reason == REASON_OK  # Thursday: the first of the new week
-    reason, budgets = claim_day_nudge(
-        prefs, budgets, "1", "4-eve", at(2026, 8, 7, 21), washer_free=True
+    reason, budgets = _claim(
+        prefs, budgets, "1", "4-eve", lead(7, 20), washer_free=True
     )
     assert reason == REASON_OK  # Friday: the second, and the last
     # A third in that week is over the weekly cap, and the reason says which
     # cap said no — the two are very different answers to "is this working".
-    reason, budgets = claim_day_nudge(
-        prefs, budgets, "1", "5-eve", at(2026, 8, 8, 21), washer_free=True
+    reason, budgets = _claim(
+        prefs, budgets, "1", "5-eve", lead(8, 20), washer_free=True
     )
     assert reason == REASON_BUDGET_WEEK
     assert reason in BUDGET_REASONS  # the only reasons worth a log line
     # The next ISO week starts a fresh allowance, without anybody resetting it.
-    reason, budgets = claim_day_nudge(
-        prefs, budgets, "1", "0-eve", at(2026, 8, 10, 21), washer_free=True
+    reason, budgets = _claim(
+        prefs, budgets, "1", "0-eve", lead(10, 20), washer_free=True
     )
     assert reason == REASON_OK
 
@@ -366,7 +407,7 @@ def test_a_bounced_dm_still_costs_a_nudge() -> None:
     def _attempt(prefs, cell, moment, *, bounce):
         """The reminder loop's exact order of operations, in miniature."""
         nonlocal stored
-        reason, budgets = claim_day_nudge(
+        reason, budgets = _claim(
             prefs, stored, "1", cell, moment, washer_free=True
         )
         stored = budgets  # persisted BEFORE the send, never after
@@ -380,15 +421,15 @@ def test_a_bounced_dm_still_costs_a_nudge() -> None:
     prefs = _person()
     # The washer comes free during their Thursday afternoon slot; the DM
     # bounces off their privacy settings and nobody hears anything.
-    assert _attempt(prefs, "3-mid", at(2026, 8, 6, 13), bounce=True) == "forbidden"
+    assert _attempt(prefs, "3-mid", lead(6, 12), bounce=True) == "forbidden"
     assert sent == []
-    # The nudge is spent even though nothing arrived, so the backstop for that
-    # same slot finds it already used...
-    assert _attempt(prefs, "3-mid", at(2026, 8, 6, 15), bounce=False) == (
+    # The nudge is spent even though nothing arrived, so a second trigger for
+    # that same slot finds it already used...
+    assert _attempt(prefs, "3-mid", lead(6, 12, 5), bounce=False) == (
         REASON_ALREADY
     )
     # ...and so does the evening, on the day cap rather than the slot rule.
-    assert _attempt(prefs, THU_EVE, THU, bounce=False) == REASON_BUDGET_DAY
+    assert _attempt(prefs, THU_EVE, HEADS_UP, bounce=False) == REASON_BUDGET_DAY
     assert sent == []
     # And the person themselves is now marked closed, so eligibility refuses
     # them before the budget is even consulted next time.
@@ -400,21 +441,21 @@ def test_the_accounting_survives_a_restart() -> None:
     # that handed everybody a fresh allowance would turn "1 DM a day" into "1
     # DM per restart", which is the same feature with the cap removed.
     prefs = _person()
-    reason, budgets = claim_day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True)
+    reason, budgets = _claim(prefs, {}, "1", THU_EVE, HEADS_UP, washer_free=True)
     assert reason == REASON_OK
     reloaded = json.loads(json.dumps(budgets))
-    assert check_nudge(budget_for(reloaded, "1"), FALLBACK) == BUDGET_DAY
-    reason, _budgets = claim_day_nudge(
-        prefs, reloaded, "1", THU_EVE, FALLBACK, washer_free=True
+    assert check_nudge(budget_for(reloaded, "1"), LATE) == BUDGET_DAY
+    reason, _budgets = _claim(
+        prefs, reloaded, "1", THU_EVE, LATE, washer_free=True
     )
     assert reason == REASON_ALREADY
     # The id survives the trip too: an int key written in memory and a string
     # key read back off disk must not be two allowances for one human.
-    reason, budgets = claim_day_nudge(prefs, {}, 1, THU_EVE, THU, washer_free=True)
+    reason, budgets = _claim(prefs, {}, 1, THU_EVE, HEADS_UP, washer_free=True)
     assert reason == REASON_OK
     assert list(json.loads(json.dumps(budgets))) == ["1"]
-    reason, _budgets = claim_day_nudge(
-        prefs, json.loads(json.dumps(budgets)), "1", THU_EVE, FALLBACK,
+    reason, _budgets = _claim(
+        prefs, json.loads(json.dumps(budgets)), "1", THU_EVE, LATE,
         washer_free=True,
     )
     assert reason == REASON_ALREADY
@@ -423,26 +464,26 @@ def test_the_accounting_survives_a_restart() -> None:
 # --- the backstop's timing ---------------------------------------------------
 
 
-def test_the_backstop_lands_near_the_end_of_the_slot_it_belongs_to() -> None:
-    # §10.4 trigger (b) is "a fallback time near the end of *that* slot", which
-    # a single clock time cannot be for four different slots — and the person
-    # who washes on Saturday mornings is exactly the one a fixed evening
-    # reminder never reaches.
-    assert fallback_clock("am", 60) == (11, 0)
-    assert fallback_clock("mid", 60) == (15, 0)
-    assert fallback_clock("pm", 60) == (19, 0)
-    assert fallback_clock("eve", 60) == (23, 0)
-    # Whatever the lead, the time lands inside the window it belongs to — which
-    # is what lets the backstop and the washer-freed event be the same decision
-    # asked twice, with no special case for either.
+def test_the_heads_up_lands_an_hour_before_the_slot_it_belongs_to() -> None:
+    # One trigger per slot, off that slot's own START. A single clock time
+    # cannot be an hour before four different slots — and the person who washes
+    # on Saturday mornings is exactly the one a fixed evening reminder misses.
+    assert heads_up_clock("am", 60) == (5, 0)
+    assert heads_up_clock("mid", 60) == (11, 0)
+    assert heads_up_clock("pm", 60) == (15, 0)
+    assert heads_up_clock("eve", 60) == (19, 0)
+    # Whatever the lead, the answer stays on the slot's own day and strictly
+    # before it opens. AM opens at 06:00, so an over-long lead is clamped
+    # rather than wrapping into yesterday and announcing an open window.
     for slot in _plan.SLOTS:
-        for lead in (1, 5, 60, 120, 179, 180, 5000, -30, "60", None):
-            clock = fallback_clock(slot, lead)
+        start = _plan.SLOT_WINDOWS[slot][0]
+        for minutes in (1, 5, 60, 120, 600, 5000, -30, "60", None):
+            clock = heads_up_clock(slot, minutes)
             if clock is None:
-                assert lead is None
+                assert minutes is None
                 continue
-            assert _plan.slot_for_hour(clock[0]) == slot, (slot, lead, clock)
-    assert fallback_clock("nonsense", 60) is None
+            assert 0 <= clock[0] < start, (slot, minutes, clock)
+    assert heads_up_clock("nonsense", 60) is None
 
 
 def test_a_configured_time_is_read_defensively() -> None:
@@ -464,12 +505,11 @@ def test_nobody_is_told_to_do_the_laundry_they_just_did() -> None:
     # why this is asked about the whole day and not about the slot: checking
     # only the Eve window would miss exactly the case that fires most.
     loads = [at(2026, 8, 6, 16, 5).timestamp()]
-    assert (
-        day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True, loads=loads)
-        == _nudge.REASON_ALREADY_WASHED
-    )
-    reason, budgets = claim_day_nudge(
-        prefs, {}, "1", THU_EVE, THU, washer_free=True, loads=loads
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True, loads=loads
+    )[2] == _nudge.REASON_ALREADY_WASHED
+    reason, budgets = _claim(
+        prefs, {}, "1", THU_EVE, HEADS_UP, washer_free=True, loads=loads
     )
     assert reason == _nudge.REASON_ALREADY_WASHED
     assert check_nudge(budget_for(budgets, "1"), THU) == BUDGET_OK  # costs nothing
@@ -478,7 +518,9 @@ def test_nobody_is_told_to_do_the_laundry_they_just_did() -> None:
     assert _nudge.washed_today([at(2026, 8, 6, 23).timestamp()], THU) is False
     assert _nudge.washed_today([], THU) is False
     assert _nudge.washed_today(["junk", None], THU) is False
-    assert day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True) == REASON_OK
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True
+    )[2] == REASON_OK
 
 
 def test_the_person_who_just_emptied_it_is_never_the_one_nudged() -> None:
@@ -490,29 +532,26 @@ def test_the_person_who_just_emptied_it_is_never_the_one_nudged() -> None:
     # emptied it — sails straight through.
     prefs = _person()
     # No history at all, which is the default configuration's normal state.
-    assert (
-        day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True, loads=[])
-        == REASON_OK
-    )
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True, loads=[]
+    )[2] == REASON_OK
     # The coordinator knows whose load it was, so it says so.
-    assert (
-        day_nudge(
-            prefs, {}, "1", THU_EVE, THU, washer_free=True, loads=[], just_washed=True
-        )
-        == _nudge.REASON_ALREADY_WASHED
-    )
-    reason, budgets = claim_day_nudge(
-        prefs, {}, "1", THU_EVE, THU, washer_free=True, just_washed=True
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True,
+        loads=[], just_washed=True,
+    )[2] == _nudge.REASON_ALREADY_WASHED
+    reason, budgets = _claim(
+        prefs, {}, "1", THU_EVE, HEADS_UP, washer_free=True, just_washed=True
     )
     assert reason == _nudge.REASON_ALREADY_WASHED
     # ...and it costs them nothing, like every other "no" that isn't the budget.
     assert check_nudge(budget_for(budgets, "1"), THU) == BUDGET_OK
     # It is about *them*, not about everybody: the housemate who didn't touch
-    # the machine still gets their nudge.
-    assert (
-        day_nudge(prefs, {}, "1", THU_EVE, THU, washer_free=True, just_washed=False)
-        == REASON_OK
-    )
+    # the machine still gets their message.
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True,
+        just_washed=False,
+    )[2] == REASON_OK
 
 
 def test_a_sunday_push_lands_in_the_week_it_actually_means() -> None:
@@ -541,7 +580,7 @@ def test_a_sunday_push_lands_in_the_week_it_actually_means() -> None:
     assert _plan.iso_week_key(monday) == "2026-W32"
     occupancy = _plan.effective_week({}, overrides, _plan.iso_week_key(monday))
     assert _plan.is_mine(occupancy, "0-eve", "1") is True
-    assert current_cell(list(occupancy), None, monday) == "0-eve"
+    assert slot_soon(list(occupancy), at(2026, 8, 3, 19, 30)) == "0-eve"
     # The old behaviour, kept as the thing that must not come back.
     stranded, _b = _plan.toggle_booking({}, {}, "2026-W31", "0-eve", "1")
     assert _plan.effective_week({}, stranded, "2026-W32") == {}
@@ -553,12 +592,11 @@ def test_push_to_tomorrow_is_where_the_nudge_moves_to() -> None:
     # button being a polite way of saying no.
     tomorrow = next_day_cell(THU_EVE)
     assert tomorrow == "4-eve"
-    friday = at(2026, 8, 7, 21)
-    assert current_cell([tomorrow], None, friday) == tomorrow
-    assert (
-        day_nudge(_person(), {}, "1", tomorrow, friday, washer_free=True)
-        == REASON_OK
-    )
+    friday = lead(7, 20)
+    assert slot_soon([tomorrow], friday) == tomorrow
+    assert select(
+        _person(), {}, "1", friday, booked=[tomorrow], washer_free=True
+    )[:3] == (MSG_SLOT, tomorrow, REASON_OK)
     # Sunday wraps to Monday rather than stranding the push.
     assert next_day_cell("6-eve") == "0-eve"
 
@@ -569,18 +607,100 @@ def test_nothing_is_sent_about_a_guess_the_person_cannot_argue_with() -> None:
     # either. It must hold even when a prediction is handed straight in.
     off = _person(predict=False)
     assert plan_dm(off, {}, "1", _guess(), THU) == REASON_PREDICT_OFF
-    assert day_nudge(off, {}, "1", THU_EVE, THU, washer_free=True) == (
-        REASON_PREDICT_OFF
-    )
-    reason, budgets = claim_day_nudge(off, {}, "1", THU_EVE, THU, washer_free=True)
+    assert select(
+        off, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True
+    )[2] == REASON_PREDICT_OFF
+    reason, budgets = _claim(off, {}, "1", THU_EVE, HEADS_UP, washer_free=True)
     assert reason == REASON_PREDICT_OFF
     assert check_nudge(budget_for(budgets, "1"), THU) == BUDGET_OK
-    # Somebody down for the slot who booked it themselves is refused too: the
-    # opt-out is from being messaged, not from being guessed at.
-    assert current_cell([THU_EVE], None, THU) == THU_EVE
-    assert (
-        day_nudge(off, {}, "1", THU_EVE, THU, washer_free=True) == REASON_PREDICT_OFF
+    # Somebody who booked the slot themselves is refused too: the opt-out is
+    # from being messaged, not from being guessed at.
+    assert slot_soon([THU_EVE], HEADS_UP) == THU_EVE
+    assert select(
+        off, {}, "1", HEADS_UP, booked=[THU_EVE], washer_free=True, due=True,
+        prediction=_guess(),
+    )[2] == REASON_PREDICT_OFF
+
+
+# --- the opportunity, and only ever one message (live-use design §3) --------
+
+
+def test_an_opportunity_needs_them_to_be_overdue_by_their_own_cadence() -> None:
+    # The gate that makes this useful rather than nagging. A fixed number of
+    # days would be wrong for the twice-a-week washer and the fortnightly one
+    # alike, so the threshold is each person's own learned gap.
+    prefs, guess = _person(), _guess()
+    kind, cell, reason = select(
+        prefs, {}, "1", HEADS_UP, prediction=guess, due=False
     )
+    assert (kind, cell, reason) == (MSG_NONE, None, REASON_NOT_DUE)
+    kind, cell, reason = select(
+        prefs, {}, "1", HEADS_UP, prediction=guess, due=True
+    )
+    assert (kind, cell, reason) == (MSG_OPPORTUNITY, THU_EVE, REASON_OK)
+    # Overdue with nothing to say is still silence: no confident guess, no
+    # message (P6). "I don't know your days yet" is a notification whose whole
+    # content is that the bot has nothing to tell you.
+    assert select(prefs, {}, "1", HEADS_UP, prediction=None, due=True) == (
+        MSG_NONE, None, REASON_NO_PREDICTION
+    )
+
+
+def test_an_opportunity_is_never_about_a_slot_somebody_else_booked() -> None:
+    # The whole claim of this message is that nobody has it — that is the bit
+    # the person cannot see from their bedroom. A slot somebody else booked is
+    # not an opportunity even with the drum standing empty, because the point
+    # of the grid is that the booking is the thing to respect.
+    prefs, guess = _person(), _guess()
+    theirs = _plan.effective_week({}, {"2026-W32": {THU_EVE: ["2"]}}, "2026-W32")
+    assert opportunity_cell(guess, theirs, "1", HEADS_UP) is None
+    assert select(
+        prefs, {}, "1", HEADS_UP, prediction=guess, occupancy=theirs, due=True
+    )[2] == REASON_NO_PREDICTION
+    # Their own booking of it does not disqualify it — two people can hold one
+    # cell, and this one is already partly theirs.
+    mine = _plan.effective_week({}, {"2026-W32": {THU_EVE: ["1"]}}, "2026-W32")
+    assert opportunity_cell(guess, mine, "1", HEADS_UP) == THU_EVE
+    # A guess about another day is not about right now.
+    assert opportunity_cell(_guess("5-eve"), {}, "1", HEADS_UP) is None
+    # ...nor is one whose window has already closed today.
+    assert opportunity_cell(_guess("3-am"), {}, "1", HEADS_UP) is None
+    assert opportunity_cell(None, {}, "1", HEADS_UP) is None
+
+
+def test_only_one_message_is_ever_chosen() -> None:
+    # Four independent triggers racing each other into four DMs about one
+    # evening is the failure this function exists to prevent. It returns one
+    # kind, one cell, one verdict — there is no path that returns two.
+    prefs, guess = _person(), _guess()
+    for kwargs in (
+        {},
+        {"booked": [THU_EVE]},
+        {"prediction": guess, "due": True},
+        {"booked": [THU_EVE], "prediction": guess, "due": True},
+        {"booked": [THU_EVE], "washer_free": False},
+        {"booked": [THU_EVE], "just_washed": True},
+    ):
+        kind, cell, reason = select(prefs, {}, "1", HEADS_UP, **kwargs)
+        assert kind in (MSG_NONE, MSG_SLOT, MSG_OPPORTUNITY)
+        assert (kind == MSG_NONE) == (reason != REASON_OK), (kind, reason)
+        assert (cell is None) == (kind == MSG_NONE), (kind, cell)
+    # Silence is the default, and it is the answer for somebody the bot knows
+    # nothing about — which is every person for the first month.
+    assert select(prefs, {}, "1", HEADS_UP)[0] == MSG_NONE
+
+
+def test_a_reply_is_refused_once_its_slot_has_gone() -> None:
+    # What the reply buttons check. Booking a window that has closed tells the
+    # house nothing and blocks a slot nobody can use.
+    assert slot_ended(THU_EVE, HEADS_UP) is False  # not started yet
+    assert slot_ended(THU_EVE, THU) is False  # running
+    assert slot_ended("3-am", THU) is True  # this morning, long gone
+    assert slot_ended(THU_EVE, at(2026, 8, 7, 9)) is True  # next morning
+    # Unreadable input is not "ended" — the caller's fallback is better than
+    # silently refusing somebody's tap.
+    assert slot_ended("nonsense", THU) is False
+    assert slot_ended(THU_EVE, None) is False
 
 
 def _run() -> None:

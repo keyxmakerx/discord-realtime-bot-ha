@@ -476,6 +476,88 @@ def history_weeks(history, user_id, moment) -> float:
     return history_days(history, user_id, moment) / 7
 
 
+# --- how often somebody washes ----------------------------------------------
+# Gaps below this are not a cadence, they are one trip to the utility room
+# counted twice: a wash and then a dry claimed separately, which at 4-5 hours a
+# cycle is the ordinary shape of one evening's laundry. Counting those would
+# drag the median toward a few hours and leave everybody permanently "due".
+#
+# Half a day rather than something tighter because the pair can be far apart —
+# a wash claimed at 17:00 and its dry at 22:00 is five hours. A genuine second
+# load the next morning is over the line and counts, which is right: that is a
+# real interval, whatever prompted it.
+MIN_GAP_DAYS = 0.5
+
+# Two gaps means three loads, which is the same evidence bar the day prediction
+# uses. Below that, "how often do you wash" has no answer worth acting on.
+MIN_GAPS = 2
+
+
+def gaps_for(history, user_id, moment=None) -> list[float]:
+    """The intervals between this person's loads, in days, oldest first.
+
+    Reads through :func:`history_for`, so it inherits the §11 guarantee and the
+    retention window like everything else here.
+    """
+    rows = history_for(history, user_id, moment)
+    gaps: list[float] = []
+    for older, newer in zip(rows, rows[1:]):
+        days = (newer["ts"] - older["ts"]) / SECONDS_PER_DAY
+        if days >= MIN_GAP_DAYS:
+            gaps.append(days)
+    return gaps
+
+
+def typical_gap(history, user_id, moment=None) -> float | None:
+    """How many days this person usually leaves between loads, or **None**.
+
+    The **median**, not the mean, and that is the whole design. One holiday, one
+    fortnight visiting family, one stretch of illness — a single 21-day gap in
+    an otherwise weekly pattern drags a mean past ten days and would silence the
+    opportunity nudge for a week and a half. The median ignores it, which is the
+    behaviour somebody would describe as "it knows I wash about weekly".
+
+    None whenever there is not enough to say (:data:`MIN_GAPS`), and None is the
+    answer that sends nothing: a cadence guessed from one interval is not a
+    cadence, and P6 says the bot stays quiet rather than guessing out loud.
+    """
+    gaps = sorted(gaps_for(history, user_id, moment))
+    if len(gaps) < MIN_GAPS:
+        return None
+    middle = len(gaps) // 2
+    if len(gaps) % 2:
+        return gaps[middle]
+    return (gaps[middle - 1] + gaps[middle]) / 2
+
+
+def days_since_load(history, user_id, moment) -> float | None:
+    """Days since this person's last load, or None if they have none."""
+    rows = history_for(history, user_id, moment)
+    now = moment_ts(moment)
+    if not rows or now is None:
+        return None
+    return max(0.0, (now - rows[-1]["ts"]) / SECONDS_PER_DAY)
+
+
+def is_due(history, user_id, moment) -> bool:
+    """Whether this person is past **their own** usual gap between washes.
+
+    The gate on the opportunity nudge, and the reason it can claim to be useful
+    rather than nagging: the threshold is learned per person, so a housemate who
+    washes twice a week and one who washes fortnightly are both left alone until
+    *they* are overdue by their own standard. A fixed number of days would be
+    wrong for at least one of them and probably both.
+
+    False whenever the cadence is unknown — the common early answer, and the
+    quiet one.
+    """
+    gap = typical_gap(history, user_id, moment)
+    if gap is None:
+        return False
+    since = days_since_load(history, user_id, moment)
+    return since is not None and since >= gap
+
+
 # --- corrections (design doc §7.3) ------------------------------------------
 def correction_record(user_id, cell, kind, moment) -> dict | None:
     """One correction row, or None if it is not a usable one."""

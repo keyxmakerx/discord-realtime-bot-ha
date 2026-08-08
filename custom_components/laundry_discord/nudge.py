@@ -20,7 +20,7 @@ across an HA callback where a stray ``return`` is invisible:
 * **Every preference gates independently**, and each has its own reason string,
   so "why was nothing sent" is answerable without a log line per evaluation.
 * **The budget is claimed, never merely checked** (P2). :func:`claim_plan_dm`
-  and :func:`claim_day_nudge` return the *new* accounting alongside the verdict,
+  and :func:`claim_select` return the *new* accounting alongside the verdict,
   exactly as :func:`habit.claim_nudge_for` does and for the same reason: two
   calls is one early ``return`` away from a bot that checks the budget and then
   sends anyway. The caller persists what comes back **before** it sends, which
@@ -29,6 +29,12 @@ across an HA callback where a stray ``return`` is invisible:
 * **Silence is the default (P6).** No confident prediction and no booking means
   no message at all — not "I don't know your days yet", which is a notification
   that tells you nothing and trains you to ignore the next one.
+* **At most one message, chosen for the moment.** :func:`select` picks between
+  the slot heads-up and the opportunity, or picks nothing, so the triggers
+  cannot race each other into four separate DMs about one evening. The bot may
+  only speak when *its own private information is the point*: it knows the
+  washer is free and that nobody has booked your usual slot; it does not know
+  whether you have dirty clothes, and it never assumes.
 * **The caller passes the clock.** Nothing here reads the time, exactly like
   :mod:`habit` and :mod:`detect`, which is what makes "the slot had already
   ended" a test rather than something you discover at 11pm.
@@ -74,6 +80,7 @@ REASON_OUTSIDE_SLOT = "outside_slot"  # their day, wrong part of it
 REASON_WASHER_BUSY = "washer_busy"  # somebody else is mid-load
 REASON_ALREADY_WASHED = "already_washed"  # they've done it — nothing to nudge
 REASON_ALREADY = "already"  # one nudge per slot, whichever trigger won
+REASON_NOT_DUE = "not_due"  # they washed inside their own usual gap
 REASON_BUDGET_DAY = "budget_day"
 REASON_BUDGET_WEEK = "budget_week"
 
@@ -93,6 +100,7 @@ REASONS = (
     REASON_WASHER_BUSY,
     REASON_ALREADY_WASHED,
     REASON_ALREADY,
+    REASON_NOT_DUE,
     REASON_BUDGET_DAY,
     REASON_BUDGET_WEEK,
 )
@@ -167,33 +175,6 @@ def slot_start_ts(cell, moment) -> float | None:
     """When this cell's slot began on the moment's own day, or None."""
     window = slot_window_ts(cell, moment)
     return window[0] if window else None
-
-
-def fallback_clock(slot, lead_minutes) -> tuple[int, int] | None:
-    """The wall-clock time the day-of backstop fires for one slot, or None.
-
-    §10.4's trigger (b): "a fallback time near the end of that slot". *That*
-    slot — so this is one time per slot, derived from the slot's own end and a
-    single configured lead, rather than one clock time for the whole day. A
-    single 18:00 reminder cannot be near the end of a slot that ended at noon,
-    and the person who washes on Saturday mornings is exactly the person a fixed
-    evening reminder is useless to.
-
-    The lead is clamped to the shortest slot (4 h) so the answer always lands
-    *inside* the window it belongs to — which is what lets :func:`day_nudge`
-    apply one rule to both triggers instead of special-casing this one.
-    """
-    if not plan.is_slot(slot):
-        return None
-    try:
-        lead = int(lead_minutes)
-    except (TypeError, ValueError):
-        return None
-    start, end = plan.SLOT_WINDOWS[slot]
-    span = (end - start) * 60
-    lead = max(1, min(lead, span - 1))
-    minutes = end * 60 - lead
-    return (minutes // 60, minutes % 60)
 
 
 def parse_clock(value) -> tuple[int, int] | None:
@@ -305,50 +286,13 @@ def is_booked(booked, cell) -> bool:
     return any(plan.normalise_cell(item) == key for item in booked)
 
 
-def current_cell(booked, prediction, moment) -> str | None:
-    """The cell this person is down for **right now**, or None.
-
-    "Right now" rather than "today" on purpose: a nudge is only ever sent inside
-    the window it is about (§10.4), so the only cell that can matter at this
-    moment is this moment's own. Asking the narrower question here also means
-    somebody down for both Saturday morning and Saturday night gets the right
-    one of the two rather than whichever sorted first.
-
-    Two sources, in the same precedence :func:`plan.cell_state` draws them in:
-
-    1. **A booking** — they tapped a slot on their own week. A fact, and how ⏭
-       "push to tomorrow" moves a nudge: the push books tomorrow's slot, so
-       tomorrow that booking is what they are down for.
-    2. **The prediction** — the model's guess at their usual days, and only if
-       it cleared the §7.2 confidence gate, which is the caller's business
-       (:func:`habit.predict` returns None otherwise).
-
-    None — nothing on right now — is the overwhelmingly common answer, and it is
-    the answer that sends nothing at all.
-    """
-    if _ts(moment) is None:
-        return None
-    cell = plan.cell_key(
-        plan.weekday_of(moment), plan.slot_for_hour(getattr(moment, "hour", None))
-    )
-    if cell is None:
-        return None
-    if is_booked(booked, cell):
-        return cell
-    if isinstance(prediction, dict) and plan.normalise_cell(
-        prediction.get("cell")
-    ) == cell:
-        return cell
-    return None
-
-
 def in_slot_now(cell, moment) -> bool:
     """Whether ``moment`` falls inside this cell's own window, today.
 
-    One rule for both of §10.4's triggers. The washer-freeing path has to check
-    it (the machine coming free at 2pm says nothing about somebody's evening),
-    and the backstop path passes it by construction because
-    :func:`fallback_clock` puts the time inside the window it belongs to.
+    What a *reply* is checked against: a tap on a DM has to land while the slot
+    it was about is still running, or there is nothing useful left to write.
+    :func:`slot_ended` is the same question asked from the other side, and it
+    also answers it for a cell on another day.
     """
     parsed = plan.parse_cell(plan.normalise_cell(cell))
     if parsed is None:
@@ -403,26 +347,249 @@ def washed_today(loads, moment) -> bool:
     return False
 
 
-def already_nudged_in_slot(budgets, user_id, cell, moment) -> bool:
-    """Whether a DM already went to this person inside this slot's window.
+def already_nudged_in_slot(budgets, user_id, cell, moment, lead_minutes=0) -> bool:
+    """Whether a DM about this slot already went to this person.
 
-    This is §10.4's *whichever comes first*, made structural. The day cap alone
-    would deliver the same behaviour today — it is 1 — but only by coincidence:
-    raise :data:`habit.MAX_NUDGES_PER_DAY` to 2 and the washer freeing at 20:30
-    plus the backstop at 23:00 would be two DMs about one evening. The rule is
-    "one nudge per slot", so that is what is checked.
+    §10.4's *whichever comes first*, made structural. The day cap alone would
+    deliver the same behaviour today — it is 1 — but only by coincidence: raise
+    :data:`habit.MAX_NUDGES_PER_DAY` to 2 and two triggers an hour apart would
+    be two DMs about one evening. The rule is "one message per slot", so that is
+    what is checked.
 
-    Bounded at *both* ends of the window, not just the start. In practice a
-    trigger only ever asks about the slot that is running, so a nudge sent after
-    the window cannot exist — but a function whose answer is only correct
-    because of how its callers are ordered is one refactor from being wrong, and
-    the wrong direction here is silently suppressing somebody's nudge.
+    **The window starts at the lead, not at the slot.** A heads-up is sent
+    *before* its slot opens, so measuring from the slot's own start would put
+    the message outside the window it was about, and the second trigger would
+    find nothing and send again. That is not a hypothetical: the two triggers
+    for an evening slot are the 19:00 tick and a washer freeing at 19:40, and
+    both land before 20:00.
+
+    Bounded at *both* ends, not just the start. In practice a trigger only ever
+    asks about a slot that is running or about to, so a message sent after the
+    window cannot exist — but a function whose answer is only correct because of
+    how its callers are ordered is one refactor from being wrong, and the wrong
+    direction here is silently suppressing somebody's message.
     """
     last = habit.budget_for(budgets, user_id)["last_nudge_ts"]
     window = slot_window_ts(cell, moment)
     if last is None or window is None:
         return False
-    return window[0] <= last < window[1]
+    try:
+        lead = max(0.0, float(lead_minutes) * 60)
+    except (TypeError, ValueError):
+        lead = 0.0
+    return (window[0] - lead) <= last < window[1]
+
+
+# --- the heads-up and the opportunity (live-use design §3) -------------------
+# How long before a booked slot *starts* the heads-up goes out. An hour is the
+# smallest useful number: less and there is no time to put a load on before the
+# window opens, more and "in a while" is not news you can act on. Note this is a
+# lead before the **start**, where the retired day-of nudge used a lead before
+# the *end* — which is why booking Thursday Eve used to do nothing until you
+# were already inside it.
+HEADS_UP_LEAD_MINUTES = 60
+
+# What a message, if any, should be about. At most one of these is ever chosen:
+# the whole point of routing them through one decision is that four independent
+# triggers cannot race each other into four DMs.
+MSG_NONE = "none"
+MSG_SLOT = "slot"  # you booked this, it starts within the hour
+MSG_OPPORTUNITY = "opportunity"  # you're overdue and your usual slot is clear
+MESSAGES = (MSG_NONE, MSG_SLOT, MSG_OPPORTUNITY)
+
+
+def slot_soon(booked, moment, lead_minutes=HEADS_UP_LEAD_MINUTES) -> str | None:
+    """A cell of theirs whose window opens within ``lead_minutes``, or None.
+
+    Looks only at the moment's own day, and only *forward*: a slot already open
+    is not "soon", it is now, and telling somebody their evening is starting at
+    22:00 is the timing failure the day-of nudge was retired for.
+
+    Ties go to the earliest slot, which is the one they can act on first.
+    """
+    now = _ts(moment)
+    if now is None:
+        return None
+    try:
+        lead = float(lead_minutes) * 60
+    except (TypeError, ValueError):
+        return None
+    if lead <= 0:
+        return None
+    today = plan.weekday_of(moment)
+    best: tuple[float, str] | None = None
+    for item in booked or ():
+        cell = plan.normalise_cell(item)
+        parsed = plan.parse_cell(cell) if cell else None
+        if parsed is None or parsed[0] != today:
+            continue
+        start = slot_start_ts(cell, moment)
+        if start is None or start <= now or start - now > lead:
+            continue
+        if best is None or start < best[0]:
+            best = (start, cell)
+    return best[1] if best else None
+
+
+def slot_ended(cell, moment) -> bool:
+    """Whether this cell's window has already closed, relative to ``moment``.
+
+    True for a cell on another weekday too, which is what a reply tapped the
+    next morning needs: "yesterday evening" is over, whatever the clock says
+    now. Unreadable input is *not* treated as ended — the caller's fallback is
+    better than silently refusing a tap.
+    """
+    parsed = plan.parse_cell(plan.normalise_cell(cell))
+    now = _ts(moment)
+    if parsed is None or now is None:
+        return False
+    if plan.weekday_of(moment) != parsed[0]:
+        return True
+    window = slot_window_ts(cell, moment)
+    return window is not None and now >= window[1]
+
+
+def heads_up_clock(slot, lead_minutes=HEADS_UP_LEAD_MINUTES) -> tuple[int, int] | None:
+    """The wall-clock time the heads-up fires for one slot, or None.
+
+    One trigger per slot, derived from that slot's own **start** — 05:00, 11:00,
+    15:00 and 19:00 at the default hour's lead. The retired day-of nudge took
+    its lead from the slot's *end*, which is the single line that made a
+    reservation worthless: booking Thursday Eve bought nothing until you were
+    already standing inside it.
+
+    Clamped so the answer stays on the same day as the slot it belongs to. The
+    earliest slot opens at 06:00, so a lead beyond that would wrap into
+    yesterday and fire a heads-up for a window that had already opened.
+    """
+    if not plan.is_slot(slot):
+        return None
+    try:
+        lead = int(lead_minutes)
+    except (TypeError, ValueError):
+        return None
+    start = plan.SLOT_WINDOWS[slot][0] * 60
+    lead = max(1, min(lead, start))
+    minutes = start - lead
+    return (minutes // 60, minutes % 60)
+
+
+def opportunity_cell(prediction, occupancy, user_id, moment) -> str | None:
+    """The cell an opportunity nudge would be about, or None.
+
+    Their predicted usual slot, but only when it is **starting soon and nobody
+    else has it**. Both halves matter, and they are what make this message the
+    bot's private information rather than an opinion about somebody's laundry:
+    it knows the slot is unbooked and they cannot see that from their bedroom.
+
+    Deliberately *not* "the machine is free right now" — the caller checks that
+    separately. A slot somebody else has booked is not an opportunity even with
+    the drum standing empty, because the whole point of the grid is that the
+    booking is the thing to respect.
+    """
+    cell = plan.normalise_cell(
+        prediction.get("cell") if isinstance(prediction, dict) else None
+    )
+    if cell is None:
+        return None
+    parsed = plan.parse_cell(cell)
+    if parsed is None or parsed[0] != plan.weekday_of(moment):
+        return None
+    start = slot_start_ts(cell, moment)
+    now = _ts(moment)
+    if start is None or now is None:
+        return None
+    window = slot_window_ts(cell, moment)
+    # Either it is about to open, or it is open and has time left in it.
+    if now >= (window[1] if window else start):
+        return None
+    if plan.is_taken_by_other(occupancy or {}, cell, user_id):
+        return None
+    return cell
+
+
+def select(
+    people_map,
+    budgets,
+    user_id,
+    moment,
+    *,
+    booked=(),
+    prediction=None,
+    occupancy=None,
+    washer_free=True,
+    due=False,
+    loads=(),
+    just_washed=False,
+    lead_minutes=HEADS_UP_LEAD_MINUTES,
+) -> tuple[str, str | None, str]:
+    """The one thing worth saying to this person right now, if anything.
+
+    Returns ``(kind, cell, reason)``. ``kind`` is :data:`MSG_NONE` unless
+    ``reason`` is :data:`REASON_OK`, and **none is the overwhelmingly common
+    answer** — that is the design working, not the design failing.
+
+    The rule this whole function exists to enforce: *the bot may only speak when
+    its own private information is the point*. It knows the washer is free, it
+    knows nobody has booked your usual slot, and it knows your booked slot is
+    about to pass unused. It does **not** know whether you have dirty clothes or
+    a free evening, so it never assumes either.
+
+    Every suppression below drops the message rather than queueing it (P2), and
+    they are checked before the budget so that a silenced message costs nothing:
+
+    - the machine is busy (nothing useful to say about a slot you can't use)
+    - they already washed today, or the caller knows the load that just finished
+      was theirs
+    - they have already heard from the bot today (the 1/day budget, but checked
+      as a rule rather than as an accident of the number)
+
+    **Precedence: a booking beats a guess**, the same rule the grid draws with
+    (:func:`plan.cell_state`) and for the same reason. A slot heads-up is about
+    something the person actually said; an opportunity is arithmetic about their
+    past. If they have both, saying the second would be answering a question
+    they didn't ask while ignoring one they did.
+    """
+    verdict = eligible(people_map, user_id, moment)
+    if verdict != REASON_OK:
+        return (MSG_NONE, None, verdict)
+    if not washer_free:
+        return (MSG_NONE, None, REASON_WASHER_BUSY)
+    if just_washed or washed_today(loads, moment):
+        return (MSG_NONE, None, REASON_ALREADY_WASHED)
+
+    cell = slot_soon(booked, moment, lead_minutes)
+    kind = MSG_SLOT
+    if cell is None:
+        # No booking of theirs coming up. An opportunity needs them to be
+        # overdue *by their own learned cadence* — a fixed number of days would
+        # be wrong for the twice-a-week washer and the fortnightly one alike.
+        if not due:
+            return (MSG_NONE, None, REASON_NOT_DUE)
+        cell = opportunity_cell(prediction, occupancy, user_id, moment)
+        kind = MSG_OPPORTUNITY
+    if cell is None:
+        return (MSG_NONE, None, REASON_NO_PREDICTION)
+    if already_nudged_in_slot(budgets, user_id, cell, moment, lead_minutes):
+        return (MSG_NONE, None, REASON_ALREADY)
+    spend = _budget_verdict(budgets, user_id, moment)
+    if spend != REASON_OK:
+        return (MSG_NONE, None, spend)
+    return (kind, cell, REASON_OK)
+
+
+def claim_select(people_map, budgets, user_id, moment, **kwargs):
+    """:func:`select`, spending the budget. ``(kind, cell, reason, budgets)``.
+
+    Charged before the send rather than after, for the reason
+    :func:`claim_plan_dm` gives: a DM refused by somebody's privacy settings is
+    gone, and refunding it would retry them at every trigger forever.
+    """
+    kind, cell, reason = select(people_map, budgets, user_id, moment, **kwargs)
+    spent, updated = _claim(reason, budgets, user_id, moment)
+    if spent != REASON_OK:
+        return (MSG_NONE, None, spent, updated)
+    return (kind, cell, REASON_OK, updated)
 
 
 # --- the two decisions -------------------------------------------------------
@@ -440,51 +607,6 @@ def plan_dm(people_map, budgets, user_id, prediction, moment) -> str:
         prediction.get("cell")
     ):
         return REASON_NO_PREDICTION
-    return _budget_verdict(budgets, user_id, moment)
-
-
-def day_nudge(
-    people_map,
-    budgets,
-    user_id,
-    cell,
-    moment,
-    *,
-    washer_free,
-    loads=(),
-    just_washed=False,
-) -> str:
-    """Whether to send the day-of nudge (§10.3). :data:`REASON_OK` to send.
-
-    Called at both of §10.4's triggers with the same arguments, because they
-    are the same decision asked at two different moments — the washer coming
-    free during the slot, and the backstop near the slot's end. ``washer_free``
-    is the caller's reading of the machine: the message says "the washer's free
-    right now", so it is only ever sent when that is true. ``loads`` is this
-    person's own claim history, and it is what stops the bot telling somebody to
-    do the laundry they have just finished (see :func:`washed_today`).
-
-    ``just_washed`` is the same guard from the other direction, and it exists
-    because ``loads`` cannot be trusted to be there: history is written only
-    when the *house* has day-learning on and the person has 👁 Monitoring on,
-    and it is written only for a load somebody actually tapped Claim on. The
-    washer freeing is very often the load of the person about to be nudged, and
-    the caller knows whose it was — so it says so, rather than hoping the
-    history happens to exist.
-    """
-    verdict = eligible(people_map, user_id, moment)
-    if verdict != REASON_OK:
-        return verdict
-    if plan.normalise_cell(cell) is None:
-        return REASON_NOTHING_TODAY
-    if not in_slot_now(cell, moment):
-        return REASON_OUTSIDE_SLOT
-    if just_washed or washed_today(loads, moment):
-        return REASON_ALREADY_WASHED
-    if not washer_free:
-        return REASON_WASHER_BUSY
-    if already_nudged_in_slot(budgets, user_id, cell, moment):
-        return REASON_ALREADY
     return _budget_verdict(budgets, user_id, moment)
 
 
@@ -508,35 +630,6 @@ def claim_plan_dm(people_map, budgets, user_id, prediction, moment):
     """
     return _claim(plan_dm(people_map, budgets, user_id, prediction, moment),
                   budgets, user_id, moment)
-
-
-def claim_day_nudge(
-    people_map,
-    budgets,
-    user_id,
-    cell,
-    moment,
-    *,
-    washer_free,
-    loads=(),
-    just_washed=False,
-):
-    """:func:`day_nudge`, spending the budget. Returns ``(reason, new_budgets)``."""
-    return _claim(
-        day_nudge(
-            people_map,
-            budgets,
-            user_id,
-            cell,
-            moment,
-            washer_free=washer_free,
-            loads=loads,
-            just_washed=just_washed,
-        ),
-        budgets,
-        user_id,
-        moment,
-    )
 
 
 def _claim(verdict, budgets, user_id, moment):
@@ -574,28 +667,63 @@ def plan_dm_text(prediction) -> str | None:
     )
 
 
-def day_nudge_text(cell, prediction=None) -> str | None:
-    """The day-of DM's body, or None when the cell isn't renderable.
+def heads_up_text(cell, minutes=None) -> str | None:
+    """The slot heads-up's body, or None when the cell isn't renderable.
 
-    Two shapes for the two things a cell can be. A booking is quoted back as
-    theirs; a guess is quoted as a guess, with the arithmetic behind it, because
-    P4 says the model's guesses are visible and arguable — including in the one
-    message that acts on them.
+    The message a reservation has never had. Until now, booking Thursday Eve
+    bought you nothing until you were already standing inside it — the reminder
+    fired on a lead before the slot *ended*, so the strongest signal anybody can
+    give the bot produced the weakest response it has.
+
+    Worded as a **question about the booking**, not an instruction about the
+    laundry. "Still want it?" is answerable by somebody who has changed their
+    mind, and that is the point: the reply that helps the house most is the one
+    that gives the slot back.
     """
     parsed = plan.parse_cell(plan.normalise_cell(cell))
     if parsed is None:
         return None
     _weekday, slot = parsed
     when = TODAY_PHRASES[slot]
-    guess = (
-        isinstance(prediction, dict)
-        and plan.normalise_cell(prediction.get("cell")) == plan.normalise_cell(cell)
+    try:
+        soon = int(minutes) if minutes is not None else None
+    except (TypeError, ValueError):
+        soon = None
+    lead = f"in about {soon} minutes" if soon and soon > 0 else "soon"
+    return (
+        f"🧺 **You're down for {when}**\n"
+        f"Your slot starts {lead} and the washer's free. Still want it?"
     )
-    why = habit.explain(prediction) if guess else None
-    if guess:
-        lead = f"I've got you down for **{when}**"
-        if why:
-            lead += f" ({why})"
-    else:
-        lead = f"You're down for **{when}**"
-    return f"🧺 **Laundry day**\n{lead}, and the washer's free right now."
+
+
+def opportunity_text(cell, prediction=None, gap_days=None) -> str | None:
+    """The opportunity nudge's body, or None when the cell isn't renderable.
+
+    The one message that is *not* about something the person said, so it has to
+    earn its place by carrying only what they cannot see: the machine is free
+    and **nobody has booked** the slot they usually use. It says both, and it
+    says how it worked the timing out, because a message that just said "fancy
+    doing some laundry?" would be exactly the nagging this design refuses.
+
+    ``gap_days`` is their own learned cadence, quoted back so the timing is
+    arguable rather than mysterious — the same principle as ``habit.explain``
+    behind a day guess.
+    """
+    parsed = plan.parse_cell(plan.normalise_cell(cell))
+    if parsed is None:
+        return None
+    _weekday, slot = parsed
+    when = TODAY_PHRASES[slot]
+    why = habit.explain(prediction) if isinstance(prediction, dict) else None
+    since = ""
+    try:
+        days = int(round(float(gap_days))) if gap_days is not None else None
+    except (TypeError, ValueError):
+        days = None
+    if days and days > 0:
+        since = f" It's been about {days} day{'s' if days != 1 else ''}."
+    detail = f" ({why})" if why else ""
+    return (
+        f"🧺 **{when.capitalize()} is wide open**\n"
+        f"Nobody's booked {when} and the washer's free{detail}.{since}"
+    )
