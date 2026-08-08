@@ -249,6 +249,11 @@ GRID_SLOT_CUSTOM_IDS = {
     "pm": "laundry_discord_grid_pm",
     "eve": "laundry_discord_grid_eve",
 }
+# ♻ Every week — promotes the cell you just tapped to a standing weekly slot,
+# or demotes it back. Registered unconditionally like 🔁 next to it: it is only
+# *shown* when there is a booking of yours to promote, and a button whose id was
+# never handed to add_view does not error, it silently stops dispatching.
+GRID_RECUR_CUSTOM_ID = "laundry_discord_grid_recur"
 # 🔮 Fix a guess (design doc §7.3) — the panel that shows what the habit model
 # thinks, and the three ways to answer it. Same registry rule again: all five
 # ids go into views handed to add_view, including the 🔮 button itself, which is

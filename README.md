@@ -349,14 +349,20 @@ assistant button** option if it's not wanted.
 Behind **📅 My week** on the assistant panel is the whole week at a glance:
 
 ```
+               ▾
       Mo Tu We Th Fr Sa Su
 AM     ·  ·  ▒  ·  ·  ║  ·
 Mid    ·  ·  ·  ▒  ·  ·  ·
 PM     ▒  ·  ·  ║  ·  ·  ▒
-Eve    ·  ▒  ·  █  ·  ▒  ·
+Eve    ·  ▒  ·  █  ·  *  ·
 
-█ yours  ▒ taken  ║ taken, every week  · free
+█ yours  ▒ taken  ║ taken, every week  * running now  · free
 ```
+
+The **`▾`** is today. It's a marker rather than another cell state on purpose —
+it's a fact about the week, not about any one cell — but without it every column
+is equally far away, and *"is that free evening tonight or six days off?"* means
+counting on your fingers from a header two rows up.
 
 **Four slots a day, because at 4–5 hours a cycle one slot is about one load.**
 A cell isn't a time range you're renting, it's roughly "a wash" — AM 06:00–12:00,
@@ -382,6 +388,7 @@ Mid 12:00–16:00, PM 16:00–20:00, Eve 20:00–00:00.
 | `█` | U+2588 | **yours** |
 | `▒` | U+2592 | somebody else's, **this week only** |
 | `║` | U+2551 | somebody else's, **every week** — a standing slot |
+| `*` | ASCII | the washer is **running right now** in that slot |
 | `?` | ASCII | the bot's **guess** at your usual days. Yours alone, never on anybody else's view |
 
 This used to be `·` → `░` → `▓` → `█`: four steps of a single shading ramp, from
@@ -400,6 +407,21 @@ now mean one thing: `▒` somebody else, `█` you. Everything else is a differe
 **shape** rather than a different darkness — `?` is a question mark because it
 *is* a question, `║` is two vertical rules because a standing booking is a rail
 running through every week.
+
+**`*` is the one glyph that isn't a plan.** It's worked out from the load
+actually running — the session the bot is already tracking — recomputed every
+time the grid is drawn and stored nowhere, so it clears itself the moment the
+load ends. It sits *below* every booking in the precedence order, which is worth
+arguing about: a running load is about the machine and it's over in an hour, but
+a booking is a stated intention that outlives it and is the thing you can
+actually act on. You can ask somebody to swap a slot; there's nothing to ask of a
+drum that's spinning. So a cell that's both draws the claim, not the noise. It
+also never counts as *taken* — you can't trade a slot the machine is using.
+
+It's capped at four cells, and that cap is the point rather than tidiness: a
+stuck tracker would otherwise paint `*` across days of everyone's grid, and `*`
+is the one glyph making a claim about *right now*, which is exactly the claim
+nobody can check from their bedroom.
 
 **Why cadence gets a glyph at all.** `║` is shown for other people because it
 changes what you'd do next: a slot somebody stands on every week is far less
@@ -434,6 +456,17 @@ rather than as a standing habit, because "Thursday evening" is the only thing
 you can actually know on a Tuesday. Touching a cell also pins it for that week,
 so a later change to anyone's usual days can't reach back into a week somebody
 has already edited by hand.
+
+**♻️ Every week** is how you say the other thing. Tap a slot, then tap ♻️, and
+that cell becomes a standing weekly booking — it's on your grid every week
+without you touching it, and everyone else sees `║` there instead of `▒`. Tap it
+again (it now reads **Just this week**) to go back to a one-off.
+
+It targets the slot you last tapped, the same way 🔁 does, because that's the
+only cell on a 7×4 grid the panel can know you mean. Two things it deliberately
+*doesn't* do: promoting doesn't re-book the week you're looking at (you already
+have it), and demoting doesn't cancel it either — *"I don't do this every week
+any more"* is not *"cancel the one I have on Thursday"*.
 
 You pick a day from the dropdown and tap one of the four slot buttons; the grid
 redraws in place. It's a **display**, not a clickable table — Discord caps a

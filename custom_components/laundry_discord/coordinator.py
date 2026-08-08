@@ -512,6 +512,13 @@ class LaundryCoordinator:
 
     @callback
     def _notify_entities(self) -> None:
+        # The planner's ``*`` rides along here rather than on the session edges
+        # themselves. There are five places that start or end a session — wash,
+        # dry, self-clean, the completion path and the reset service — and a
+        # push added to four of them is a grid that keeps claiming the washer is
+        # busy after the fifth. This is the one call every one of them already
+        # makes, so it cannot be the one somebody forgets.
+        self._publish_running()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     # ---------------------------------------------------------- state handlers
@@ -617,6 +624,26 @@ class LaundryCoordinator:
         return (True, dt_util.utcnow() >= target)
 
     @callback
+    def _publish_running(self) -> None:
+        """Tell the planner the live load's window, so its grid can draw ``*``.
+
+        Pushed, never pulled: the assistant must not reach back into the
+        coordinator (§14 rule 5), so that a planner panel still opens when the
+        detection side is wedged. Two floats and no store write, which is what
+        makes it safe to call from a hot path.
+
+        Called from :meth:`_notify_entities`, which every state transition
+        already goes through, *and* from the 5-minute tick. The first makes it
+        prompt; the second makes it self-correcting, so the worst case is one
+        stale grid rather than a ``*`` that never goes away.
+        """
+        running = self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN)
+        self.assistant.note_running(
+            self._session_started_ts if running else None,
+            self._last_eta_ts if running else None,
+        )
+
+    @callback
     def _check_time_completion(self, _now=None) -> None:
         """Time-based completions on the periodic ticks (job 'finish' / the ETA
         gate normally complete far earlier).
@@ -625,6 +652,9 @@ class LaundryCoordinator:
           its last-known ETA has passed (+grace) — finish, flagged *unverified*.
         - **Max-session:** absolute safety net so a stuck session can't live on.
         """
+        # Before the stage guard: an idle machine is exactly when the planner
+        # most needs telling there is nothing running.
+        self._publish_running()
         if self.stage not in (STAGE_WASHING, STAGE_DRYING):
             return
         now = dt_util.utcnow().timestamp()

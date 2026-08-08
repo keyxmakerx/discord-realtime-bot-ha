@@ -70,6 +70,7 @@ from .const import (
     DEFAULT_TRADES,
     GRID_BACK_CUSTOM_ID,
     GRID_DAY_CUSTOM_ID,
+    GRID_RECUR_CUSTOM_ID,
     GRID_SLOT_CUSTOM_IDS,
     GUESS_BACK_CUSTOM_ID,
     GUESS_OFF_CUSTOM_ID,
@@ -531,10 +532,51 @@ class _TradeAskButton(discord.ui.Button):
             await self.assistant.async_report_error(interaction)
 
 
+class _GridRecurButton(discord.ui.Button):
+    """♻ — promote the cell you just tapped to *every week*, or demote it.
+
+    The writer ``person["slots"]`` never had. The field has been defaulted,
+    normalised, read and reconciled since the planner shipped; nothing could
+    set it, so a standing slot was a thing the store understood, the grid could
+    draw and no human could create.
+
+    It targets **the cell you last tapped**, the same convention 🔁 next to it
+    uses, because that is the only cell on a seven-by-four grid the panel can
+    know you mean. So the gesture is: tap Thu Eve, then tap ♻. It is added only
+    when there is something to say — you hold the last-tapped cell — so it can
+    never ask "every week?" about somebody else's booking or about nothing at
+    all.
+
+    Labelled by what it will *do* rather than by what is true now. "Every week"
+    on a cell that is already standing reads as a statement and gets tapped by
+    people meaning to confirm it, which would quietly cancel the thing they
+    were agreeing with.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant", *, standing: bool) -> None:
+        super().__init__(
+            label="Just this week" if standing else "Every week",
+            style=discord.ButtonStyle.secondary
+            if standing
+            else discord.ButtonStyle.primary,
+            emoji="♻️",
+            custom_id=GRID_RECUR_CUSTOM_ID,
+            row=2,
+        )
+        self.assistant = assistant
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await self.assistant.async_toggle_recurring(interaction)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to change a recurring slot")
+            await self.assistant.async_report_error(interaction)
+
+
 class GridView(discord.ui.View):
     """The week grid's controls: day select, four slot toggles, back.
 
-    Three rows, six or seven components — well inside the 5-row /
+    Three rows, six to eight components — well inside the 5-row /
     25-component ceiling, with the select occupying a whole row of its own as
     Discord requires.
 
@@ -542,13 +584,17 @@ class GridView(discord.ui.View):
     Passing neither builds the neutral registration template for ``add_view``,
     which must carry **every** ``custom_id`` — one that was never registered
     doesn't error, it silently stops dispatching, and this integration has
-    already been bitten by that. That is why 🔁 is added for the template even
-    though a template has no tapped cell to ask about.
+    already been bitten by that. That is why 🔁 and ♻ are both added for the
+    template even though a template has no tapped cell to ask about or promote.
 
     ``expected`` and ``running`` are passed straight through to
     :func:`plan.cell_state` so a button and the cell above it can never disagree
     about what state that cell is in — one question, asked once, answered in the
     module that owns the precedence rule.
+
+    ``recur`` is None when there is nothing of yours to promote, and otherwise
+    says whether the last-tapped cell is already standing — which decides what
+    ♻ is labelled, not whether it appears.
     """
 
     def __init__(
@@ -561,6 +607,7 @@ class GridView(discord.ui.View):
         ask: bool = False,
         expected=None,
         running=None,
+        recur: bool | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.add_item(_GridDaySelect(assistant, day))
@@ -573,6 +620,8 @@ class GridView(discord.ui.View):
             )
             self.add_item(_GridSlotButton(assistant, slot, state=state))
         self.add_item(_GridBackButton(assistant))
+        if recur is not None or occupancy is None:
+            self.add_item(_GridRecurButton(assistant, standing=bool(recur)))
         if ask or occupancy is None:
             self.add_item(_TradeAskButton(assistant))
 
@@ -883,6 +932,20 @@ class LaundryAssistant:
         # one.
         self._ask_cell: dict[str, str] = {}
         self._ask_offer: dict[str, str] = {}
+        # Which cell each person's open grid last tapped, whoever holds it.
+        # ``_ask_cell`` above is *not* this: it holds a cell only when the tap
+        # landed on somebody else's, because 🔁 has nothing to offer otherwise.
+        # ♻ needs the opposite case — a cell of your own — so it needs its own
+        # note. View state, memory only, like the two above.
+        self._last_cell: dict[str, str] = {}
+        # The live load's window, pushed by the coordinator (never pulled: the
+        # dependency runs one way, §14 rule 5). Two floats, memory only, and
+        # deliberately *not* the cells themselves — those are worked out on
+        # each render by :meth:`_running_cells`, so ``*`` cannot outlive the
+        # load that justified it. A restart mid-load loses them, and the grid
+        # simply stops claiming the washer is busy, which is the safe way round.
+        self._running_from: float | None = None
+        self._running_until: float | None = None
         # The habit model's two stores (design doc §12), both lists of rows
         # carrying an id and a timestamp and nowhere to put a name. They live
         # in *this* Store alongside people and overrides — one planner store,
@@ -1011,6 +1074,40 @@ class LaundryAssistant:
         """Today's Monday-based weekday index, defaulting to Monday."""
         day = plan_mod.weekday_of(self._now())
         return day if day is not None else 0
+
+    def note_running(self, started_ts, eta_ts) -> None:
+        """The coordinator telling us a load's window, or that there isn't one.
+
+        Pushed rather than pulled — the assistant must not reach back into the
+        coordinator (§14 rule 5), so that the planner keeps working if the
+        detection side is having a bad day. Two floats and no store write, so
+        this is free to call on every tick that moves the ETA.
+        """
+        self._running_from = started_ts if isinstance(started_ts, (int, float)) else None
+        self._running_until = eta_ts if isinstance(eta_ts, (int, float)) else None
+
+    def _running_cells(self) -> list[str]:
+        """The cells the washer is mid-load in, worked out fresh right now.
+
+        Derived on every render and stored nowhere. ``*`` is the one glyph that
+        claims something about *this moment*, so anything that could let it
+        outlive its load — a cached list, a value in the Store — would make it a
+        claim nobody can check. Recomputing is cheap and self-correcting: the
+        moment the coordinator clears the window, the next render has no ``*``
+        in it.
+        """
+        if self._running_from is None:
+            return []
+        try:
+            start = dt_util.as_local(dt_util.utc_from_timestamp(self._running_from))
+            end = (
+                dt_util.as_local(dt_util.utc_from_timestamp(self._running_until))
+                if self._running_until is not None
+                else None
+            )
+        except (OSError, OverflowError, TypeError, ValueError):
+            return []
+        return plan_mod.cells_between(start, end)
 
     # ------------------------------------------------------------- the model
     async def async_note_claim(self, user_id) -> None:
@@ -1527,6 +1624,8 @@ class LaundryAssistant:
         # of §9 step 1: the booking is the information, the offer to ask is the
         # extra option, and neither one is a veto over the other.
         self._note_ask(user_id, cell, week)
+        # ♻ targets this, whoever holds it — see ``_last_cell``.
+        self._last_cell[str(user_id)] = cell
         # Booking a slot enrols them. Not because the grid needs it — a
         # booking stores the raw id in the override, so it renders as theirs
         # whether or not a prefs record exists — but because deliberately
@@ -1540,6 +1639,60 @@ class LaundryAssistant:
             )
         await self._async_save()
         await self._async_render_grid(interaction, edit=True)
+
+    async def async_toggle_recurring(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """♻ — make the last-tapped cell a standing weekly slot, or stop it.
+
+        Writes ``person["slots"]`` and nothing else. This week's override is
+        deliberately left alone: you already hold the cell — that is the only
+        reason ♻ was offered — so booking it again would be a no-op, and
+        *freeing* it would make "every week" mean "every week starting next
+        week", which is not what the button says.
+
+        Demoting is the mirror image and the same restraint applies. Dropping
+        the standing slot leaves this week's booking standing on its own, which
+        is exactly right: "I don't do this every week any more" is not "cancel
+        the one I have on Thursday".
+        """
+        user_id = interaction.user.id
+        cell = self._last_cell.get(str(user_id))
+        week = self._current_week()
+        if cell is None or not week:
+            await self._async_render_grid(interaction, edit=True)
+            return
+        person = people_mod.get_person(self._people, user_id)
+        slots, standing = plan_mod.toggle_recurring(person.get("slots"), cell)
+        self._people = people_mod.set_person(self._people, user_id, slots=slots)
+        # Demoting must leave the cell booked for *this* week, and it would not
+        # be if the standing slot was the only thing putting them on it — the
+        # override for this week may simply not mention the cell. Writing the
+        # reconciled holder list back pins what they can already see, so ♻ never
+        # silently cancels a booking the grid was showing them a second ago.
+        if not standing:
+            held = plan_mod.holders(
+                plan_mod.effective_week(self._people, self._overrides, week), cell
+            )
+            if str(user_id) not in held:
+                self._overrides, _booked = plan_mod.toggle_booking(
+                    self._people, self._overrides, week, cell, user_id
+                )
+        await self._async_save()
+        parsed = plan_mod.parse_cell(cell)
+        where = (
+            f"{plan_mod.DAY_NAMES[parsed[0]]} {plan_mod.slot_label(parsed[1])}"
+            if parsed
+            else "That slot"
+        )
+        note = (
+            f"♻️ **{where}** is yours every week now — it'll be on your grid "
+            "before anyone else books it."
+            if standing
+            else f"♻️ **{where}** is just this week again. You still have it "
+            "this week."
+        )
+        await self._async_render_grid(interaction, edit=True, note=note)
 
     async def async_back_to_panel(self, interaction: discord.Interaction) -> None:
         """Return from the grid to the settings panel."""
@@ -1592,8 +1745,23 @@ class LaundryAssistant:
         occupancy = plan_mod.effective_week(self._people, self._overrides, week)
         ask_cell = self._ask_cell.get(str(user_id))
         expected = self._predicted_cells(user_id)
+        running = self._running_cells()
+        # ♻ is offered only for a cell of your own — there is nothing to promote
+        # about somebody else's booking, and nothing at all about a free slot.
+        last = self._last_cell.get(str(user_id))
+        recur = (
+            plan_mod.is_recurring_for_me(occupancy, last, user_id)
+            if last is not None and plan_mod.is_mine(occupancy, last, user_id)
+            else None
+        )
         embed = self._grid_embed(
-            occupancy, user_id, day, expected=expected, ask_cell=ask_cell, note=note
+            occupancy,
+            user_id,
+            day,
+            expected=expected,
+            running=running,
+            ask_cell=ask_cell,
+            note=note,
         )
         view = GridView(
             self,
@@ -1602,6 +1770,8 @@ class LaundryAssistant:
             viewer_id=user_id,
             ask=ask_cell is not None,
             expected=expected,
+            running=running,
+            recur=recur,
         )
         await self._async_respond(interaction, embed, view, edit=edit)
 
@@ -1612,6 +1782,7 @@ class LaundryAssistant:
         day: int,
         *,
         expected=None,
+        running=None,
         ask_cell: str | None = None,
         note: str | None = None,
     ) -> discord.Embed:
@@ -1633,8 +1804,18 @@ class LaundryAssistant:
         way that only looked harmless while the glyph was ``░``: the moment the
         guess became ``?``, any question mark anywhere in the block would have
         lit up an explainer for a guess nobody had made.
+
+        ``running`` is the live load, and ``today`` is what turns the block from
+        a shape into a calendar — without the marker, "is that free evening
+        tonight or six days off?" needs counting from a header two lines up.
         """
-        drawn = plan_mod.render_week(occupancy, viewer_id=user_id, expected=expected)
+        drawn = plan_mod.render_week(
+            occupancy,
+            viewer_id=user_id,
+            expected=expected,
+            running=running,
+            today=self._today(),
+        )
         embed = discord.Embed(
             title="📅 The week",
             description=(
@@ -1645,12 +1826,25 @@ class LaundryAssistant:
             ),
             color=_COLOR_GRID,
         )
-        mine = plan_mod.describe_cells(occupancy, user_id)
+        now = self._now()
+        mine = plan_mod.describe_cells(
+            occupancy, user_id, today=self._today(), hour=getattr(now, "hour", None)
+        )
         embed.add_field(
             name="Yours this week",
             value=mine or "nothing booked — tap a slot below",
             inline=False,
         )
+        if drawn.running:
+            embed.add_field(
+                name=f"{plan_mod.CELL_RUNNING} The washer's going right now",
+                value=(
+                    "Worked out from the load actually running, not from "
+                    "anybody's plans — it clears itself when the load ends. "
+                    "It doesn't block the slot: whoever booked it still has it."
+                ),
+                inline=False,
+            )
         if drawn.standing:
             # Only when a ║ is actually on the block, same rule as the guess
             # below: a note explaining a character nobody can see is noise.
