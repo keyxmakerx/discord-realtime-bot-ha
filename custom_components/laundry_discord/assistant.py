@@ -151,7 +151,10 @@ _MODE_LABELS = {
 # and the README both call it: the day is an integration option
 # (``plan_dm_weekday``), read in :mod:`reminders`, and a panel that names a day
 # the house has changed is a settings screen caught lying about something the
-# reader can check in one tap.
+# reader can check in one tap. The heads-up line says "before" and not "an hour
+# before" for exactly the same reason: its lead is ``nudge_lead``, an option
+# running from five minutes to three hours, so the hour belongs to the house
+# rather than to this panel.
 _NOTIFY_KINDS = {
     people_mod.KIND_CHECKIN: (
         "📅",
@@ -161,7 +164,7 @@ _NOTIFY_KINDS = {
     people_mod.KIND_SLOT: (
         "⏰",
         "Heads-up",
-        "an hour before a slot you booked, so it doesn't lapse unused",
+        "before a slot you booked opens, so it doesn't lapse unused",
     ),
     people_mod.KIND_OPPORTUNITY: (
         "💡",
@@ -182,10 +185,12 @@ _NOTIFY_KINDS = {
 #
 # Overnight only, and only five of them. That is not a limitation, it is the
 # actual complaint: :data:`plan.SLOT_WINDOWS` opens AM at 06:00 and the heads-up
-# runs an hour ahead of a slot, so 05:00 is the earliest thing this integration
-# can put on a phone and the only one that can wake somebody. A midday window
-# would be a setting nobody picks, and every unused setting is one more line a
-# newcomer reads past to reach the one they came for.
+# runs ahead of the slot it is about, so the AM one is the earliest thing this
+# integration schedules and the only one that can wake somebody — and *how much*
+# earlier than 06:00 is the house's ``nudge_lead``, which is why no line in this
+# panel names the hour it lands at. A midday window would be a setting nobody
+# picks, and every unused setting is one more line a newcomer reads past to
+# reach the one they came for.
 _QUIET_PRESETS = (None, (22, 8), (23, 9), (0, 7), (21, 9))
 
 
@@ -3056,6 +3061,16 @@ class LaundryAssistant:
             lines.append(line)
         embed.add_field(name="Messages", value="\n".join(lines), inline=False)
         window = people_mod.quiet_hours(person)
+        # The "no window" line names no clock time, though the obvious sentence
+        # to write is "the earliest I'd reach you is 05:00". That one is only
+        # true at the default lead: ``nudge_lead`` goes up to three hours, which
+        # puts the AM heads-up at 03:00, and 💡 rides the washer coming free at
+        # whatever hour that happens. Naming an hour the house has moved would
+        # be this screen caught lying about the very thing the reader opened it
+        # to decide — worse here than anywhere else, because the answer they
+        # take away is "then I don't need a quiet window". What this module does
+        # own is the slot table, and 06:00 is in it.
+        opens = plan_mod.SLOT_WINDOWS[plan_mod.SLOT_AM][0]
         embed.add_field(
             name="Quiet hours",
             value=(
@@ -3063,8 +3078,9 @@ class LaundryAssistant:
                 "land inside it is **dropped**, not saved up for the morning. "
                 "A heads-up delivered at 08:00 is about a slot that has gone."
                 if window
-                else "🌙 **None** — the earliest I'd reach you is 05:00, an "
-                "hour before an AM slot you booked."
+                else "🌙 **None** — these arrive whenever they're due, small "
+                "hours included: a heads-up runs ahead of the slot it's about "
+                f"and the first slot of the day opens at {opens:02d}:00."
             ),
             inline=False,
         )

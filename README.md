@@ -271,12 +271,13 @@ How should I reach you when something's actually for you?
 ```
 🤖 Your laundry assistant
 
-  Pings        💬 In the channel, with an @mention
-  Monitoring   👁 on — when you tap Claim I note the day and time
-  Guessing     🔮 on — I'll mark your usual days with ? on your week
+  Pings             💬 In the channel, with an @mention
+  Monitoring        👁 on — when you tap Claim I note the day and time
+  What I send you   🔔 all four on · no quiet hours
+  Guessing          🔮 on — I'll mark your usual days with ? on your week
 
 [ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ]
-[ 👁 Monitoring: on ] [ 📅 My week ] [ 🔮 Fix a guess ]
+[ 👁 Monitoring: on ] [ 📅 My week ] [ 🔔 What I send you ] [ 🔮 Fix a guess ]
         Only you can see this
 ```
 
@@ -308,8 +309,59 @@ that does nothing yet is worse than no button:
   logged for anyone and this is simply your answer for if it's switched on.
   **No stats about anyone are ever shown to the household** — no streaks, no
   counts, no "who does the most laundry."
+- **What I send you** — the other half of the question **Pings** asks. **Pings**
+  is the *route*; this is the *list* — every message the bot, or a housemate,
+  starts on its own, with a switch each. It has a panel of its own, below.
 - **📅 My week** and **🔮 Fix a guess** open the two displays below: the week
   grid, and what the bot thinks your usual days are.
+
+#### 🔔 What I send you
+
+The four messages nobody asked for at the moment they arrive, each with its own
+switch, plus one overnight quiet window:
+
+```
+🔔 What I send you
+
+  Messages     📅 Check-in: on — the weekly DM about the week ahead
+               ⏰ Heads-up: on — before a slot you booked opens
+               💡 Spare slot: on — when the washer's clear and you're overdue
+               🔁 Swaps: on — a housemate asking for one of your slots
+  Quiet hours  🌙 None
+
+[ 📅 Check-in: on ] [ ⏰ Heads-up: on ] [ 💡 Spare slot: on ] [ 🔁 Swaps: on ]
+[ Quiet hours: none ▾ ]
+[ ↩️ Back ]
+        Only you can see this
+```
+
+**All four are on by default**, and every one of them can only ever *subtract*:
+the house options, 📬 **DM me** and the daily budget all still apply on top, so
+nothing here can cause a message that wasn't already going to be sent. The point
+is that the thing you opt out of should be **the thing that annoyed you** — one
+switch for the lot turns "I don't want the early one" into "stop talking to me",
+and the bot then loses the ability to tell you your load is done, which nobody
+asked for.
+
+🔁 **Swaps** is deliberately its own switch rather than part of 🔮 *Stop
+guessing*: a swap request is a **housemate** talking, not the model, so somebody
+who doesn't want to be predicted at is still a person who can be asked whether
+they'd trade — and the reverse.
+
+**Quiet hours** are a short list of overnight presets — none, 22:00–08:00,
+23:00–09:00, 00:00–07:00, 21:00–09:00 — rather than a free time picker, because
+Discord has no time input and the alternative is guessing at what somebody typed
+into a text box. Overnight-only isn't a limitation, it's the actual complaint:
+the heads-up runs ahead of the slot it's about and the first slot of the day
+opens at 06:00, so that one is the only message here that can wake you. Anything
+due inside your window is **dropped, not saved up for the morning** — a heads-up
+delivered at 08:00 is about a slot that has gone.
+
+**None of it touches the messages that answer something you did.** 🧺 Claim
+still tells you your load is done and 🔜 still tells you when the washer is
+actually yours. Both are replies, and both are time-critical — a handoff held
+until 08:00 tells you the washer was free eight hours ago, which is worse than
+not sending it. Those stay under **Pings**.
 
 #### When Discord won't let the bot DM you
 
@@ -626,10 +678,11 @@ It fires on **whichever comes first**:
   nobody actually confirmed anything, the message only goes out if the load was
   emptied or nobody had claimed it: "done" is not "empty", and somebody else's
   wet clothes are not a free washer; or
-- **an hour before your slot opens** — one time per slot, off that slot's own
-  start, so it's 05:00 for people who wash in the morning and 19:00 for people
-  who wash at night. A single evening reminder would be useless to the first
-  group.
+- **a lead before your slot opens** — one time per slot, off that slot's own
+  start, so at the default hour's lead it's 05:00 for people who wash in the
+  morning and 19:00 for people who wash at night. A single evening reminder
+  would be useless to the first group. (The lead is the *Slot heads-up lead*
+  option, up to three hours, and it moves all four of those times with it.)
 
 Whichever one gets there first sends; the other is dropped. You never get two
 about one evening. And **if you've already run a load today you get nothing** —
@@ -701,6 +754,7 @@ All of it, per person, every time:
 | **Learn the days each person washes** on | integration options — also off by default |
 | **📬 DM me** chosen | 🤖 panel. The default is the channel, so somebody who never opened the panel gets **nothing** |
 | **🔮 guessing** and **👁 monitoring** left on | 🤖 panel, per person |
+| **this kind's own 🔔 switch** left on, and the moment **outside your quiet hours** | 🤖 → 🔔 panel, per person. All four kinds default to on and there are no quiet hours by default, so this changes nothing until somebody sets it |
 | your DMs actually open | one `Forbidden` and the bot stops trying, and tells you why the next time you tap anything |
 | not paused, and a confident guess (or a booking) for *this* slot | — |
 
@@ -786,9 +840,10 @@ being unreasonable, people stop putting anything on it.
 So **"someone" is the only word the bot uses** until an accept. Not the DM, not
 the grid, not an embed field, not a dropdown option, and not an error message —
 including the case where the bot *can't* ask. A refusal to ask reads identically
-whether that person blocked you, has their DMs shut, is paused, is already
-fielding somebody else's ask, or has had their one DM for the day: *"I can't ask
-about that one right now. Nothing to read into it."* If it said anything more
+whether that person blocked you, has their DMs shut, is paused, has 🔁 **Swaps**
+switched off, is asleep inside their quiet hours, is already fielding somebody
+else's ask, or has had their one DM for the day: *"I can't ask about that one
+right now. Nothing to read into it."* If it said anything more
 specific, you could learn something about a person you can't even name.
 
 #### Every guardrail, spelled out
@@ -804,7 +859,7 @@ own:
 | **🚫 Don't ask me again is permanent** | Per requester-pair, stored on your own record, and there is no way for the asker to undo it. Everybody else is unaffected, and the blocked person is never told. |
 | **One ask in flight, in each direction** | At most one request waiting on you at a time, so you never open Discord to a queue of people wanting your Thursday. And at most **2** outstanding asks of your own. |
 | **You must have a slot to offer** | You can only ask if you've put something on the board yourself, and the offer has to be a slot you actually hold. A swap with nothing on the other side is just a request to give something up. |
-| **They have to be reachable** | Somebody with reminders 🚫 off, on the channel default, paused, with DMs closed, or who has never opened the 🤖 panel **cannot be asked at all**. Never opening the panel is not "unset", it's *not opted in*. |
+| **They have to be reachable** | Somebody with reminders 🚫 off, on the channel default, paused, with DMs closed, with 🔁 **Swaps** switched off in their own 🔔 panel, inside their **quiet hours**, or who has never opened the 🤖 panel **cannot be asked at all**. Never opening the panel is not "unset", it's *not opted in*. |
 | **You have to be reachable too** | The answer comes back as a DM hours later and it's the only way you find out — so you need 📬 **DM me** on before you can ask. |
 | **The daily DM budget** | A swap request counts against the recipient's **1 DM per person per day** cap. Whatever else is true, this integration puts at most one unprompted message on your phone a day, swaps included. |
 | **Asks expire** | 48 hours, and then it's dead — it can't be answered, and a tap on the old DM does nothing. A week's plan is worthless a week later. Nothing sits in the store past the week it belongs to. |
