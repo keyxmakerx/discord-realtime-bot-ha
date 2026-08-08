@@ -580,6 +580,39 @@ def toggle_holder(held, user_id) -> tuple[list[str], bool]:
     return ([*current, person_id], True)
 
 
+def toggle_recurring(slots, cell) -> tuple[list[list], bool]:
+    """Promote one cell to a standing weekly slot, or demote it back.
+
+    Returns ``(new_slots, standing)`` in the stored ``[[weekday, slot], ...]``
+    form, never mutating the list it was given — the caller writes the result
+    back onto ``person["slots"]``, so a rejected store write cannot half-apply.
+
+    This is the writer the data model has been missing. ``person["slots"]`` was
+    defaulted, normalised, read by :func:`recurring_cells` and reconciled by
+    :func:`effective_week` since the planner shipped; nothing could ever *set*
+    it, so "every week" was a shape the store understood and no button could
+    produce.
+
+    **It deliberately does not touch this week's overrides.** The two layers
+    answer different questions — a standing slot is "this is my usual", an
+    override is "here is what I am doing in the week of the 3rd" — and
+    :func:`effective_week` already lays the second over the first. Writing both
+    from one tap would make "every week" mean "every week except when somebody
+    happened to edit that week", which is the bug the two-layer model exists to
+    avoid. The caller books the current week separately if it wants to, and the
+    grid does exactly that: promoting a cell you already hold leaves this week
+    alone, because you already hold it.
+    """
+    key = normalise_cell(cell)
+    current = normalise_slots(slots)
+    if key is None:
+        return (current, False)
+    kept = [pair for pair in current if cell_key(*pair) != key]
+    if len(kept) != len(current):
+        return (kept, False)
+    return (normalise_slots([*current, key]), True)
+
+
 def toggle_booking(people, overrides, week, cell, user_id):
     """Book or free one cell for one person, for one ISO week.
 
@@ -662,6 +695,125 @@ def running_cells(running) -> list[str]:
     return keys
 
 
+# The most cells one live load may black out. A wash is one slot; a wash then a
+# dry, started late and crossing midnight, is a plausible three. Past that the
+# input is not a load, it is a stuck session — and the failure mode matters: a
+# wedged tracker would paint ``*`` across days of everybody's grid, which is
+# both wrong and unfalsifiable from the outside, because the one thing ``*``
+# claims is that the machine is busy *right now*. Phase 1 fixed the 12-hour hang
+# that made this likely; the cap is what stops the next such bug reaching the
+# display at all. Clamped rather than dropped: a load that really is running
+# should still show its first few slots.
+MAX_RUNNING_CELLS = 4
+
+
+def cells_between(start, end) -> list[str]:
+    """The cells a load running from ``start`` to ``end`` actually occupies.
+
+    Both are ``datetime``s in local time, and the caller owns the clock as
+    everywhere else in this module. Returns cell keys in chronological order,
+    capped at :data:`MAX_RUNNING_CELLS`.
+
+    Half-open at the end, matching :data:`SLOT_WINDOWS`: a load finishing at
+    exactly 16:00 occupied PM for no time at all and does not light it up.
+    Hours that fall in no slot (00:00-06:00) contribute nothing, so an overnight
+    dry lights Eve and then the next morning's AM with the dead hours simply
+    absent — which is what the machine was actually doing.
+
+    A missing or unparseable end (no ETA yet) yields **just the starting cell**
+    rather than nothing: "the washer is on now" is the fact worth drawing, and
+    guessing how long it will run is exactly the guess this glyph must not make.
+    """
+    first = _cell_at(start)
+    if first is None:
+        return []
+    cells = [first]
+    try:
+        span = (end - start).total_seconds()
+    except (AttributeError, TypeError, ValueError):
+        return cells
+    if span <= 0:
+        return cells
+    # Step by the shortest slot (4h) would skip nothing, but stepping hourly is
+    # simpler to reason about and costs at most ~24 iterations before the cap.
+    hours = min(int(span // 3600) + 1, 24 * 7)
+    for offset in range(1, hours + 1):
+        try:
+            moment = start + _hours(offset)
+        except (OverflowError, TypeError, ValueError):
+            break
+        if (moment - start).total_seconds() >= span:
+            break
+        key = _cell_at(moment)
+        if key is not None and key not in cells:
+            cells.append(key)
+            if len(cells) >= MAX_RUNNING_CELLS:
+                break
+    return cells
+
+
+def _hours(count: int):
+    """``timedelta(hours=count)``, imported lazily to keep the module light."""
+    from datetime import timedelta
+
+    return timedelta(hours=count)
+
+
+def _cell_at(moment) -> str | None:
+    """The cell a moment falls in, or None for the 00:00-06:00 dead hours."""
+    weekday = weekday_of(moment)
+    if weekday is None:
+        return None
+    try:
+        slot = slot_for_hour(moment.hour)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if slot is None:
+        return None
+    return cell_key(weekday, slot)
+
+
+def days_ahead(cell, today, hour=None) -> int:
+    """How many days until this cell next comes round. 0 is today, 7 is a week.
+
+    The grid repeats weekly, so every cell is always "coming up" — the only
+    question is how soon. A cell earlier in the week than today is next week's,
+    which is why this is modular rather than a subtraction.
+
+    ``hour`` closes the last gap: today's AM slot at 21:00 has already gone, and
+    calling it "today" would sort a slot nobody can still use above tomorrow's.
+    Given the hour, a slot whose window has already **ended** today is treated as
+    next week's — honest for a weekly repeating plan, and it is what stops
+    "Yours this week" opening with something that already happened.
+    """
+    parsed = parse_cell(cell)
+    if parsed is None or not is_weekday(today):
+        return 99
+    weekday, slot = parsed
+    delta = (weekday - int(today)) % 7
+    if delta != 0 or hour is None:
+        return delta
+    try:
+        current = int(hour)
+    except (TypeError, ValueError):
+        return delta
+    return 7 if SLOT_WINDOWS[slot][1] <= current else 0
+
+
+def cells_soonest_first(cells, today, hour=None) -> list[str]:
+    """Cell keys ordered by how soon each comes round, then by time of day.
+
+    With ``today=None`` this is plain Monday-first order, which is what the
+    stored form and every test that predates a clock expect.
+    """
+    keys = [key for key in (normalise_cell(c) for c in cells or ()) if key]
+    if not is_weekday(today):
+        keys.sort(key=_cell_order)
+        return keys
+    keys.sort(key=lambda k: (days_ahead(k, today, hour), _cell_order(k)[1]))
+    return keys
+
+
 def cell_state(occupancy, cell, viewer_id=None, expected=None, running=None) -> str:
     """Which of the six :data:`CELL_STATES` this cell is in, for this viewer.
 
@@ -724,7 +876,9 @@ def cell_char(occupancy, cell, viewer_id=None, expected=None, running=None) -> s
     return CELL_STATES[cell_state(occupancy, cell, viewer_id, expected, running)]
 
 
-def render_grid(occupancy, viewer_id=None, expected=None, running=None) -> str:
+def render_grid(
+    occupancy, viewer_id=None, expected=None, running=None, today=None
+) -> str:
     """The week, as a monospace block. Deterministic for a given input.
 
     Renders **per viewer** — your cells are ``█``, everybody else's are ``▒`` or
@@ -739,8 +893,16 @@ def render_grid(occupancy, viewer_id=None, expected=None, running=None) -> str:
     :func:`expected_cells` rather than in a comment: with no ``viewer_id`` there
     is no prediction, full stop.
 
-    ``running`` is live occupancy, drawn as ``*``. Nothing passes it yet
-    (Phase 4) and the legend does not mention it until something does.
+    ``running`` is live occupancy, drawn as ``*`` — the cells the machine is
+    actually mid-load in (:func:`cells_between`).
+
+    ``today`` adds a ``▾`` over today's column, and it is the one thing that
+    turns this from a shape into a calendar: without it every column is equally
+    far away, and "is that free evening tonight or six days off?" needs counting
+    on fingers from a header two lines up. It is a *marker* rather than a
+    seventh cell state on purpose — it is a fact about the week, not about any
+    cell, so it must not compete with the alphabet for the reader's attention.
+    A weekday out of range, or None, simply draws no marker row.
 
     ASCII and block characters only, and every line exactly
     :data:`GRID_WIDTH` (26) characters, comfortably inside the ~30 a phone
@@ -749,7 +911,15 @@ def render_grid(occupancy, viewer_id=None, expected=None, running=None) -> str:
     """
     predicted = expected_cells(expected, viewer_id)
     live = running_cells(running)
-    lines = [" " * (_LABEL_WIDTH + 1) + " ".join(DAY_ABBRS)]
+    lines: list[str] = []
+    if is_weekday(today):
+        # Over the *second* letter of the abbreviation, which is the column the
+        # cells below line up on — a marker over the first letter points
+        # convincingly at the gap between two days.
+        marker = [" "] * GRID_WIDTH
+        marker[_LABEL_WIDTH + 1 + 3 * int(today) + 1] = "▾"
+        lines.append("".join(marker))
+    lines.append(" " * (_LABEL_WIDTH + 1) + " ".join(DAY_ABBRS))
     for slot in SLOTS:
         row = SLOT_LABELS[slot].ljust(_LABEL_WIDTH)
         for weekday in range(7):
@@ -762,7 +932,10 @@ def render_grid(occupancy, viewer_id=None, expected=None, running=None) -> str:
 
 
 def render_legend(
-    personal: bool = True, expected: bool = False, standing: bool = False
+    personal: bool = True,
+    expected: bool = False,
+    standing: bool = False,
+    running: bool = False,
 ) -> str:
     """The key to the grid, for the line under the block.
 
@@ -781,14 +954,17 @@ def render_legend(
     :func:`render_week` works both flags out from the grid it just drew, so no
     caller has to.
 
-    ``*`` is deliberately **absent**, with no flag to turn it on, because
-    nothing produces live occupancy yet (Phase 4) — the same discipline ``?``
-    got when it shipped a phase ahead of the habit model.
+    ``running`` earns its entry the same way and is ungated by ``personal``:
+    the washer being mid-load is a fact about the machine that anybody in the
+    utility room can see, so the anonymous board may say it too. It shipped
+    defined-but-unlegended for exactly one release, while nothing produced it.
     """
     parts = [f"{CELL_MINE} yours"] if personal else []
     parts.append(f"{CELL_TAKEN} taken")
     if standing:
         parts.append(f"{CELL_TAKEN_EVERY_WEEK} taken, every week")
+    if running:
+        parts.append(f"{CELL_RUNNING} running now")
     if personal and expected:
         parts.append(f"{CELL_EXPECTED} expected")
     parts.append(f"{CELL_FREE} free")
@@ -814,12 +990,14 @@ class RenderedWeek(NamedTuple):
     running: bool
 
 
-def render_week(occupancy, viewer_id=None, expected=None, running=None):
+def render_week(
+    occupancy, viewer_id=None, expected=None, running=None, today=None
+):
     """The grid, its matching legend, and which states are on it.
 
     One call, so the legend can never describe a different grid from the one
-    beside it. ``running`` is reported but not legended — see
-    :func:`render_legend`.
+    beside it. ``running`` is reported and, once something produces it, legended
+    — see :func:`render_legend`.
     """
     predicted = expected_cells(expected, viewer_id)
     live = running_cells(running)
@@ -830,14 +1008,18 @@ def render_week(occupancy, viewer_id=None, expected=None, running=None):
     }
     guessed = STATE_EXPECTED in states
     standing = STATE_TAKEN_EVERY_WEEK in states
+    live_now = STATE_RUNNING in states
     return RenderedWeek(
-        grid=render_grid(occupancy, viewer_id, predicted, live),
+        grid=render_grid(occupancy, viewer_id, predicted, live, today),
         legend=render_legend(
-            personal=viewer_id is not None, expected=guessed, standing=standing
+            personal=viewer_id is not None,
+            expected=guessed,
+            standing=standing,
+            running=live_now,
         ),
         guessed=guessed,
         standing=standing,
-        running=STATE_RUNNING in states,
+        running=live_now,
     )
 
 
@@ -848,8 +1030,8 @@ def render_windows() -> str:
     )
 
 
-def describe_cells(occupancy, viewer_id) -> str | None:
-    """One person's own cells this week — "Th Eve (every week) · Su AM", or None.
+def describe_cells(occupancy, viewer_id, today=None, hour=None) -> str | None:
+    """One person's own cells — "Th Eve (every week) · Su AM", or None.
 
     Only ever called with the viewer's own id, and only ever rendered back to
     that same person: it names *cells*, never people, so it cannot leak. None
@@ -861,12 +1043,22 @@ def describe_cells(occupancy, viewer_id) -> str | None:
     from your own one-off would be a third block weight to learn, and the answer
     matters in a different place — when you are reading back what you have
     actually committed to, not when you are scanning for a free evening.
+
+    **Ordered soonest first** when given the clock. Monday-first is the right
+    order for a *stored* list and the wrong one for a line somebody reads: on a
+    Friday it opened with Monday — a slot four days gone — and buried tonight's
+    at the end, so the one entry that could still be acted on was the hardest to
+    find. With ``hour`` as well, a slot whose window has already closed today
+    sorts round to next week rather than claiming to be today's news. Without
+    either it stays Monday-first, which is what the stored form and every test
+    that predates a clock expect.
     """
     if viewer_id is None:
         return None
-    mine = sorted(
-        (cell for cell in occupancy if is_mine(occupancy, cell, viewer_id)),
-        key=_cell_order,
+    mine = cells_soonest_first(
+        [cell for cell in occupancy if is_mine(occupancy, cell, viewer_id)],
+        today,
+        hour,
     )
     parts = []
     for cell in mine:
