@@ -833,6 +833,40 @@ def test_only_one_message_is_ever_chosen() -> None:
     assert select(prefs, {}, "1", HEADS_UP)[0] == MSG_NONE
 
 
+def test_the_spare_slot_nudge_cannot_fire_in_the_dead_hours() -> None:
+    # Found by adversarial review of the 🔔 change. "Not over yet" used to be
+    # the only bound, so from midnight onwards the 06:00 AM slot qualified: a
+    # housemate's load finishing at 02:00 fires SIGNAL_WASHER_FREE, and
+    # somebody due for a morning wash got "this morning is wide open" at two in
+    # the morning — four hours early, inside the hours SLOT_WINDOWS exists to
+    # declare nobody does laundry in.
+    #
+    # Worse here than for the heads-up, which at least concerns a slot the
+    # person deliberately booked. This one is the bot volunteering, which is
+    # exactly the nagging the message was designed not to be.
+    prefs, guess = _person(), _guess("3-am")  # AM opens at 06:00
+    def opportunity_at(hour, minute=0):
+        return select(
+            prefs, {}, "1", at(2026, 8, 6, hour, minute),
+            prediction=guess, due=True, washer_free=True,
+        )
+    for hour in (0, 2, 3, 4):
+        assert opportunity_at(hour)[0] == MSG_NONE, hour
+    # It opens exactly one lead before the slot, the same bound the heads-up
+    # uses — one answer to "how far ahead may this bot talk about a slot".
+    assert opportunity_at(4, 59)[0] == MSG_NONE
+    assert opportunity_at(5)[:3] == (MSG_OPPORTUNITY, "3-am", REASON_OK)
+    # ...stays available while the slot is actually running...
+    assert opportunity_at(9)[:3] == (MSG_OPPORTUNITY, "3-am", REASON_OK)
+    # ...and stops when it closes, rather than lingering all afternoon.
+    assert opportunity_at(12)[0] == MSG_NONE
+    # The bound is the caller's lead, not a second hard-coded number.
+    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 4), 120) == "3-am"
+    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 4), 60) is None
+    # An unreadable lead falls back to the default rather than opening the gate.
+    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 2), "junk") is None
+
+
 def test_a_reply_is_refused_once_its_slot_has_gone() -> None:
     # What the reply buttons check. Booking a window that has closed tells the
     # house nothing and blocks a slot nobody can use.

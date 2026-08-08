@@ -541,7 +541,9 @@ def heads_up_clock(slot, lead_minutes=HEADS_UP_LEAD_MINUTES) -> tuple[int, int] 
     return (minutes // 60, minutes % 60)
 
 
-def opportunity_cell(prediction, occupancy, user_id, moment) -> str | None:
+def opportunity_cell(
+    prediction, occupancy, user_id, moment, lead_minutes=HEADS_UP_LEAD_MINUTES
+) -> str | None:
     """The cell an opportunity nudge would be about, or None.
 
     Their predicted usual slot, but only when it is **starting soon and nobody
@@ -567,8 +569,28 @@ def opportunity_cell(prediction, occupancy, user_id, moment) -> str | None:
     if start is None or now is None:
         return None
     window = slot_window_ts(cell, moment)
-    # Either it is about to open, or it is open and has time left in it.
+    # Open now, or opening within the same lead the heads-up uses — and the
+    # lower bound is the half of this that matters.
+    #
+    # Without it "not over yet" was the only test, so from midnight onwards the
+    # 06:00 AM slot qualified: a housemate's load finishing at 02:00 would fire
+    # SIGNAL_WASHER_FREE and DM somebody "this morning is wide open", four hours
+    # early, in the dead hours :data:`plan.SLOT_WINDOWS` exists to declare
+    # nobody does laundry in. That is the exact nagging this message was
+    # designed not to be, and it is worse here than for the heads-up: a
+    # heads-up at least concerns a slot the person deliberately booked, where
+    # this one is the bot volunteering.
+    #
+    # Sharing the heads-up's lead rather than inventing a second number keeps
+    # one answer to "how far ahead is this bot allowed to talk about a slot",
+    # which is also the number the house can already tune.
     if now >= (window[1] if window else start):
+        return None
+    try:
+        lead = max(0.0, float(lead_minutes) * 60)
+    except (TypeError, ValueError):
+        lead = HEADS_UP_LEAD_MINUTES * 60
+    if now < start - lead:
         return None
     if plan.is_taken_by_other(occupancy or {}, cell, user_id):
         return None
@@ -636,7 +658,9 @@ def select(
         # be wrong for the twice-a-week washer and the fortnightly one alike.
         if not due:
             return (MSG_NONE, None, REASON_NOT_DUE)
-        cell = opportunity_cell(prediction, occupancy, user_id, moment)
+        cell = opportunity_cell(
+            prediction, occupancy, user_id, moment, lead_minutes
+        )
         kind = MSG_OPPORTUNITY
     if cell is None:
         return (MSG_NONE, None, REASON_NO_PREDICTION)
