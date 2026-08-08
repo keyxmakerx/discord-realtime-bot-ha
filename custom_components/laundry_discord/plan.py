@@ -723,11 +723,21 @@ def cells_between(start, end) -> list[str]:
     A missing or unparseable end (no ETA yet) yields **just the starting cell**
     rather than nothing: "the washer is on now" is the fact worth drawing, and
     guessing how long it will run is exactly the guess this glyph must not make.
+
+    A load that *starts* in the dead hours is the same case as one that passes
+    through them, and is treated the same way: the 05:00 start contributes no
+    cell of its own and the scan carries on into the morning, so a wash put on
+    before dawn still lights AM once 06:00 arrives. Returning early on a
+    slotless start — which is what this used to do — silently dropped ``*`` and
+    the "going right now" field for the whole life of that load, and only for
+    the six hours of the day where the *reason* it is missing is invisible.
     """
     first = _cell_at(start)
-    if first is None:
-        return []
-    cells = [first]
+    # Not `if first is None: return []` — the starting hour may fall in the
+    # 00:00-06:00 gap while the load itself runs well past it. An empty list is
+    # still the right answer for a load that never leaves those hours, and it
+    # falls out of the scan below rather than being asserted up front.
+    cells = [first] if first is not None else []
     try:
         span = (end - start).total_seconds()
     except (AttributeError, TypeError, ValueError):

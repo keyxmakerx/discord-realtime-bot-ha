@@ -491,9 +491,28 @@ store, so a planner bug can never corrupt session state.
   "overrides": { "2026-W32": { "3-eve": "123" } },        // one-off, per ISO week
   "trades": [ {"id": "...", "from": "123", "to": "456",
                "want": "3-eve", "offer": "2-eve",
-               "ts": 1754000000, "state": "open"} ]
+               "ts": 1754000000, "made": 1754000000, "state": "open"} ],
+  "nudges": { "123": {"cell": "3-eve", "message": "1401..."} }
 }
 ```
+
+Two fields there earn a note.
+
+`trades[].made` is when the ask was **made**; `ts` is what decides whether it is
+still *live*. They are equal on a fresh row and diverge on the two paths that
+age a row past its TTL on purpose — a holder-side refusal, which is born lapsed,
+and a withdrawal, when the DM could not be delivered. Liveness has to move,
+because neither of those may hold the holder's slot or inbox. The **asker's**
+own cap must not, or it reports back how many of their asks were really
+delivered, which is the holder-side fact the flat refusal exists to hide.
+
+`nudges` is one row per person: which cell that person's last reminder DM was
+about, and **which message it was**. Both halves are load-bearing. The heads-up
+is sent before its slot opens, so the message's own timestamp can no longer
+identify it (19:00 for a 20:00 booking reads as PM), and a note that named only
+the person answered for whichever DM was tapped — so an unanswered heads-up from
+yesterday acted on today's cell. Persisted rather than held in memory, because a
+tap has to keep meaning what the DM said across a restart.
 
 Queue state is **session** state, not planner state, and lives in the existing
 session store alongside `claimed_by`:

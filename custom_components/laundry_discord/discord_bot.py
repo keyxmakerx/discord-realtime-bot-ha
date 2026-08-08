@@ -6,6 +6,7 @@ as a background task tied to the config entry, and closed on unload.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -52,6 +53,28 @@ _LOGGER = logging.getLogger(__name__)
 # messages (the load card, and later a board), so this only exists to stop the
 # cache growing without bound across many loads.
 _MESSAGE_CACHE_MAX = 8
+
+# How long any send may wait for the gateway to be usable before giving up.
+#
+# ``wait_until_ready()`` waits on ``discord.Client._ready``, an ``asyncio.Event``
+# that ``login()`` creates *before* the login HTTP call that can fail. So when
+# the gateway task dies — a rotated or bad token, no network at boot, a Discord
+# 5xx during login — that event is left unset with nothing alive to set it, and
+# ``async_run_bot`` has already swallowed the exception and returned. Every send
+# then blocks **forever**, and the coordinator awaits these inside its session
+# lock: one wash at 09:00 would take the lock, set stage to washing, park here,
+# and never come back. No card, no completion, and ``reset_session`` — the
+# documented escape hatch — takes the same lock, so the recovery path is wedged
+# too. ``close()`` makes it strictly worse by *clearing* ``_ready`` again, so a
+# task parked here at unload can never be woken at all.
+#
+# Thirty seconds, the same number :data:`reminders._SEND_TIMEOUT` picked for the
+# same hazard one layer up: comfortably longer than an ordinary reconnect, and
+# short enough that a session transition cannot hold the lock across a real
+# outage. Timing out **raises**, so each caller's existing ``except`` runs —
+# ``_async_start_session`` puts the stage back to idle and resets the detector,
+# which is exactly the recovery a failed post already had.
+_READY_TIMEOUT = 30
 
 
 async def _safe_interaction_error(interaction: discord.Interaction) -> None:
@@ -499,6 +522,24 @@ class DiscordBot:
     def is_ready(self) -> bool:
         return self._client.is_ready()
 
+    async def _wait_ready(self) -> None:
+        """Wait for a usable gateway, or raise. **Never waits forever.**
+
+        The one place ``wait_until_ready()`` is allowed to be called, so the
+        bound in :data:`_READY_TIMEOUT` cannot be forgotten by a send added
+        later. Re-raised as ``TimeoutError`` rather than swallowed: a caller
+        that thinks it posted a card when it did not is worse off than one whose
+        ``except`` branch runs.
+        """
+        try:
+            async with asyncio.timeout(_READY_TIMEOUT):
+                await self._client.wait_until_ready()
+        except TimeoutError:
+            # Only the timeout. A CancelledError from outside is HA shutting
+            # down (or an unload cancelling this task) and has to keep going.
+            _LOGGER.debug("Discord gateway not ready within %ss", _READY_TIMEOUT)
+            raise
+
     async def _get_channel(self):
         channel = self._client.get_channel(self._channel_id)
         if channel is None:
@@ -537,7 +578,7 @@ class DiscordBot:
         silent: bool = True,
     ) -> int:
         """Post a new message and remember it. Returns the message ID."""
-        await self._client.wait_until_ready()
+        await self._wait_ready()
         channel = await self._get_channel()
         allowed = (
             discord.AllowedMentions(roles=True)
@@ -583,7 +624,7 @@ class DiscordBot:
         an embed never triggers a push notification. Only user mentions are
         allowed (no @everyone / role pings).
         """
-        await self._client.wait_until_ready()
+        await self._wait_ready()
         channel = await self._get_channel()
         await channel.send(
             content=content,
@@ -594,8 +635,12 @@ class DiscordBot:
 
     async def async_dm_user(
         self, user_id: int | str, content: str, *, view: discord.ui.View | None = None
-    ) -> None:
-        """Send one direct message to a known user ID.
+    ) -> discord.Message:
+        """Send one direct message to a known user ID. Returns the message.
+
+        The message comes back because a reminder DM has to stay identifiable:
+        its buttons are a persistent view and outlive both the slot and the
+        process, so what the DM was *about* is recorded against its id.
 
         Deliberately lets exceptions out: the assistant has to tell
         ``discord.Forbidden`` (error 50007 — "this user has DMs from server
@@ -606,12 +651,12 @@ class DiscordBot:
         first so a cached user costs no HTTP round trip; ``fetch_user`` covers
         somebody the gateway hasn't sent us yet.
         """
-        await self._client.wait_until_ready()
+        await self._wait_ready()
         uid = int(user_id)
         user = self._client.get_user(uid)
         if user is None:
             user = await self._client.fetch_user(uid)
-        await user.send(content=content, view=view)
+        return await user.send(content=content, view=view)
 
     async def async_announce_done(self, content: str) -> None:
         """Post a fresh, push-silent 'done' nudge as plain text (no embed).
@@ -623,7 +668,7 @@ class DiscordBot:
         like a duplicate of the card. ``silent=True`` keeps it visible without a
         push, and mentions are disabled so nobody is pinged.
         """
-        await self._client.wait_until_ready()
+        await self._wait_ready()
         channel = await self._get_channel()
         await channel.send(
             content=content,

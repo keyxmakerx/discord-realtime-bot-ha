@@ -55,7 +55,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_change
-from homeassistant.util import dt as dt_util
 
 from . import habit as habit_mod
 from . import nudge as nudge_mod
@@ -354,58 +353,57 @@ class NudgeView(discord.ui.View):
             self.add_item(_NudgeSkipButton(assistant))
 
 
-# What a day-of reply says when the slot the DM was about is over. Nothing is
-# written in that case, so the reply must not imply anything was: a person who
-# taps 👍 at breakfast and is told the house has been informed is worse off than
-# one who is told the truth.
+# What a reminder reply says when its own slot is over, or when the message is
+# too old for us to still know which slot it meant. Nothing is written in either
+# case, so the reply must not imply anything was: a person who taps 👍 at
+# breakfast and is told the house has been informed is worse off than one who is
+# told the truth. Worded to cover both, because from the reader's side they are
+# the same thing — an old message that no longer does anything.
 _STALE_TAP = (
-    "That slot's been and gone, so I've left the week grid alone — 🤖 → 📅 if "
-    "you want to put yourself down for another one."
+    "That one's out of date, so I've left the week grid alone — 🤖 → 📅 if you "
+    "want to put yourself down for a slot."
 )
 
 
 def _dm_cell(assistant: "LaundryAssistant", interaction: discord.Interaction):
-    """Which cell the DM in front of us was about, or None if it has expired.
+    """Which cell **this** DM was about, or None if it can't act on the grid.
 
-    Read off **the message's own timestamp**, not the clock at tap time. A DM
-    sits in an inbox indefinitely and a nudge routinely lands with an hour of
-    its slot left, so "whatever slot is running when they finally look" is a
-    different slot in the ordinary case: a Tuesday-evening nudge tapped on
-    Wednesday morning would book Wednesday morning — a cell nobody chose, taken
-    on the whole household's grid, while Tuesday evening stayed free. Baking the
-    cell into the ``custom_id`` is not available (a per-person, per-cell id
-    cannot be a persistent view, so the button would die at the next restart);
-    Discord already carries the one fact needed, which is when it said this.
+    Looked up by the tapped message's own id, against the note written when it
+    was sent (:meth:`assistant.LaundryAssistant.async_note_nudge_cell`). Baking
+    the cell into the ``custom_id`` is not available — a per-person, per-cell id
+    cannot be a persistent view, so the button would die at the next restart —
+    so the id is the handle, and the store holds the meaning.
 
-    A tap after the slot has ended returns None rather than the stale cell.
-    Booking a window that has closed tells the house nothing and blocks a slot
-    nobody can use, so there is nothing useful left to write — only something
-    honest left to say (:data:`_STALE_TAP`).
+    Two earlier readings of this question are gone, and both were wrong in the
+    same direction: they answered confidently about the wrong slot.
 
-    **The recorded cell is preferred over the timestamp reading**, because the
-    heads-up arrives *before* its slot opens and the reading cannot tell those
-    apart: at 19:00, PM (16:00-20:00) is running and Eve starts within the hour,
-    and there is no way to know from a timestamp which of the two a DM sent then
-    was about. Guessing wrong books a slot nobody chose on everybody's grid. The
-    note is memory only, so a restart falls through to the reading — the old
-    behaviour, kept as the fallback rather than as the rule.
+    * **The message's timestamp.** A DM sits in an inbox indefinitely, so
+      "whatever slot is running when they finally look" is a different slot in
+      the ordinary case. Worse after v0.26.0: the heads-up now goes out
+      ``nudge_lead`` minutes *before* its slot opens, so the send always lands
+      inside the **previous** slot's window — 19:00 for a 20:00 booking reads as
+      PM — and the reading is not merely stale but systematically one slot
+      early.
+    * **The last cell noted for that person.** One note per person, overwritten
+      by every DM and tied to no message, so a heads-up from Monday that nobody
+      answered — still live, because :class:`NudgeView` is persistent and its
+      buttons never expire — dispatched *Tuesday's* cell when it was finally
+      tapped. 🆓 Free it up then released a booking they still wanted, on a
+      reply that names no slot, so they could not even tell.
+
+    None means "we cannot say which slot this message meant", which covers a DM
+    older than the note, a DM from before the note existed, and a tap that beat
+    the note being written. There is nothing useful left to write in any of them
+    — only something honest left to say (:data:`_STALE_TAP`).
+
+    A tap after the slot has ended is also None, and separately: booking a
+    window that has closed tells the house nothing and blocks a slot nobody can
+    use.
     """
-    now = assistant.now()
-    remembered = assistant.nudge_cell(interaction.user.id)
-    if remembered is not None and not nudge_mod.slot_ended(remembered, now):
-        return remembered
-    sent = getattr(getattr(interaction, "message", None), "created_at", None)
-    moment = now
-    if sent is not None:
-        try:
-            moment = dt_util.as_local(sent)
-        except (AttributeError, TypeError, ValueError):
-            moment = now
-    cell = plan_mod.cell_key(
-        plan_mod.weekday_of(moment),
-        plan_mod.slot_for_hour(getattr(moment, "hour", None)),
+    cell = assistant.nudge_cell(
+        interaction.user.id, getattr(getattr(interaction, "message", None), "id", None)
     )
-    if cell is None or not nudge_mod.in_slot_now(cell, now):
+    if cell is None or nudge_mod.slot_ended(cell, assistant.now()):
         return None
     return cell
 
@@ -466,6 +464,47 @@ class LaundryReminders:
         self._coordinator = coordinator
         self._assistant = coordinator.assistant
         self._unsubs: list = []
+        # The sending passes currently in flight; see :meth:`_create_task`.
+        self._tasks: set[asyncio.Task] = set()
+
+    def _create_task(self, coro) -> None:
+        """Schedule one sending pass, and keep hold of it.
+
+        The same reasoning as :meth:`coordinator.LaundryCoordinator._create_task`
+        and the same failure it prevents: a pass created against ``hass`` alone
+        outlives :meth:`shutdown`, so unloading the entry — or reloading it on an
+        options change — left a half-finished round of DMs still going out under
+        the settings the user had just changed, against an assistant and a client
+        the new entry has replaced.
+
+        It also closes the ordinary asyncio hazard that the loop holds only a
+        weak reference to a running task; each one drops itself here when it
+        finishes.
+        """
+        task = self.hass.async_create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    @callback
+    def _task_done(self, task) -> None:
+        """Drop a finished pass, and answer for whatever it raised.
+
+        The same reasoning as :meth:`coordinator.LaundryCoordinator._task_done`,
+        and it matters slightly more here: a sending pass is scheduled from a
+        clock trigger nobody is watching, so an unretrieved ``TimeoutError``
+        would be a stack trace at ERROR every time the gateway happened to be
+        down at 05:00. That is a log line about the bot working as intended.
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if isinstance(exc, TimeoutError):
+            _LOGGER.debug("Reminder pass abandoned: gateway never became ready")
+            return
+        raise exc
 
     # ------------------------------------------------------------------ config
     def _option(self, key, default):
@@ -577,20 +616,34 @@ class LaundryReminders:
             )
         )
 
-    @callback
-    def shutdown(self) -> None:
-        """Drop every trigger and listener. Safe to call twice.
+    async def shutdown(self) -> None:
+        """Drop every trigger and listener, and stop any pass in flight.
 
-        Releases the single-owner claim too, and only if it is ours — so
-        reloading the entry that owns the loop hands it back rather than
-        leaving the household with no reminder loop at all, and unloading one
-        of the others leaves the owner alone.
+        Safe to call twice. Releases the single-owner claim too, and only if it
+        is ours — so reloading the entry that owns the loop hands it back rather
+        than leaving the household with no reminder loop at all, and unloading
+        one of the others leaves the owner alone.
+
+        Awaitable rather than a plain ``@callback`` because dropping the
+        triggers only stops *new* passes. A pass already running holds the
+        people map, the budgets and the assistant of the entry being unloaded,
+        and can sit for the full :data:`_SEND_TIMEOUT` on each person — so an
+        options change (which reloads the entry) could have DMs going out under
+        the settings somebody had just replaced. ``ConfigEntry.async_on_unload``
+        takes a coroutine function and waits for it, so this costs nothing on
+        the ordinary path where there is nothing to cancel.
         """
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
         if self.hass.data.get(DATA_REMINDER_OWNER) == self._entry.entry_id:
             self.hass.data.pop(DATA_REMINDER_OWNER, None)
+        pending = [task for task in self._tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._tasks.clear()
 
     # ---------------------------------------------------------------- triggers
     @callback
@@ -599,11 +652,11 @@ class LaundryReminders:
         # hands in, so there is exactly one definition of what day it is here.
         if self._assistant.now().weekday() != self.plan_weekday:
             return
-        self.hass.async_create_task(self._async_send_plan_dms())
+        self._create_task(self._async_send_plan_dms())
 
     @callback
     def _on_fallback_time(self, _now) -> None:
-        self.hass.async_create_task(self._async_send_nudges(released=False))
+        self._create_task(self._async_send_nudges(released=False))
 
     @callback
     def _on_washer_free(self, payload=None) -> None:
@@ -631,7 +684,7 @@ class LaundryReminders:
         data = payload if isinstance(payload, dict) else {}
         if data.get("handed_off"):
             return
-        self.hass.async_create_task(
+        self._create_task(
             self._async_send_nudges(
                 released=not data.get("hedged", False),
                 just_washed_id=data.get("claimant_id"),
@@ -765,27 +818,44 @@ class LaundryReminders:
                     self._log_drop(user_id, reason)
                     continue
                 if kind == nudge_mod.MSG_SLOT:
-                    text = nudge_mod.heads_up_text(cell, self.nudge_lead)
+                    # The *measured* distance to the slot, not the option that
+                    # decided when to look for one. Two triggers send this
+                    # message and only one of them fires at slot-start-minus-
+                    # lead; the washer coming free at 19:55 must not tell
+                    # somebody their 20:00 slot starts in an hour.
+                    text = nudge_mod.heads_up_text(
+                        cell, nudge_mod.minutes_until_slot(cell, now)
+                    )
                 else:
                     text = nudge_mod.opportunity_text(
                         cell, prediction, self._assistant.typical_gap(user_id)
                     )
                 if text is None:
                     continue
-                # Before the send, not after: the reply buttons read this to
-                # know which cell they are about, and a DM that lands before
-                # the note is written is a tap that books the wrong slot.
-                self._assistant.note_nudge_cell(user_id, cell)
-                if not await self._async_deliver(
+                message = await self._async_deliver(
                     user_id, text, NudgeView(self._assistant, kind=kind)
-                ):
+                )
+                if message is None:
                     continue
+                # After the send, because the note is keyed by the message id
+                # and there isn't one before it. That is a change of ordering
+                # from the per-person note this replaced, and the trade is worth
+                # stating: the window it opens is the tail of one HTTP round
+                # trip, and a tap inside it finds no record and is answered as
+                # stale — where the old ordering could not be *unsure*, only
+                # confidently wrong about a slot on everybody's grid.
+                await self._assistant.async_note_nudge_cell(
+                    user_id, cell, getattr(message, "id", None)
+                )
                 _LOGGER.debug("Sent the %s DM to %s", kind, user_id)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to send a nudge to %s", user_id)
 
-    async def _async_deliver(self, user_id, text: str, view) -> bool:
+    async def _async_deliver(self, user_id, text: str, view):
         """Send one reminder, or give up on it. Never waits for a reconnect.
+
+        Returns the sent message (so the caller can record what it was about)
+        or None.
 
         The one thing a reminder must not do is arrive late. Both of these
         messages are about *right now* — a slot that is running, a washer that
@@ -811,7 +881,7 @@ class LaundryReminders:
                 user_id,
                 _SEND_TIMEOUT,
             )
-            return False
+            return None
 
     def _log_drop(self, user_id, reason: str) -> None:
         """One debug line, and **only** for a message the budget ate.
