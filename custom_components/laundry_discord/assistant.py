@@ -230,6 +230,43 @@ def _parse_quiet(value) -> tuple[int | None, int | None]:
         return (None, None)
 
 
+def _message_key(message_id) -> str | None:
+    """A Discord message id in its stored form, or None for anything unusable.
+
+    The same hazard :func:`trade._id` guards: an id arrives as an ``int`` from
+    ``interaction.message.id`` and comes back off HA's JSON ``Store`` as a
+    string, and two spellings of one id would mean a reminder DM that never
+    recognises itself. ``bool`` is excluded explicitly because ``True`` is an
+    ``int`` and ``"True"`` is not a message.
+    """
+    if message_id is None or isinstance(message_id, bool):
+        return None
+    key = str(message_id).strip()
+    return key or None
+
+
+def _normalise_nudge_cells(raw) -> dict[str, dict]:
+    """The stored "which DM was about which cell" map, rebuilt off disk.
+
+    Both halves are required: a row with a cell and no message id would be the
+    per-person note this replaced, and that note answered for whichever DM
+    happened to be tapped.
+    """
+    rows: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return rows
+    for user_id, record in raw.items():
+        if not isinstance(record, dict):
+            continue
+        cell = plan_mod.normalise_cell(record.get("cell"))
+        ident = _message_key(record.get("message"))
+        key = _message_key(user_id)
+        if cell is None or ident is None or key is None:
+            continue
+        rows[key] = {"cell": cell, "message": ident}
+    return rows
+
+
 # How long a swap request DM is allowed to take to leave the building. Same
 # reasoning as :data:`reminders._SEND_TIMEOUT`: ``async_dm_user`` starts with
 # ``wait_until_ready()``, so a send attempted while the gateway is down would
@@ -1250,10 +1287,13 @@ class LaundryAssistant:
         # ♻ needs the opposite case — a cell of your own — so it needs its own
         # note. View state, memory only, like the two above.
         self._last_cell: dict[str, str] = {}
-        # Which cell the last reminder DM to each person was about. See
-        # :meth:`note_nudge_cell` — the heads-up lands before its slot opens, so
-        # the message's own timestamp can no longer identify it unambiguously.
-        self._nudge_cell: dict[str, str] = {}
+        # Which cell each person's last reminder DM was about, **and which
+        # message that was**: ``{"123": {"cell": "3-eve", "message": "140…"}}``.
+        # See :meth:`async_note_nudge_cell`. Persisted, unlike the three view
+        # notes above, because a tap on a DM has to keep meaning what the DM
+        # said across a restart — and one entry per person, overwritten, so it
+        # is bounded by the same thing ``_people`` is.
+        self._nudge_cell: dict[str, dict] = {}
         # The live load's window, pushed by the coordinator (never pulled: the
         # dependency runs one way, §14 rule 5). Two floats, memory only, and
         # deliberately *not* the cells themselves — those are worked out on
@@ -1355,6 +1395,12 @@ class LaundryAssistant:
         # running.
         raw_trades = data.get("trades") if isinstance(data, dict) else None
         self._trades = trade_mod.prune_requests(raw_trades, self._current_week())
+        # Which DM was about which cell. Rebuilt field by field like everything
+        # else off disk: a row missing either half cannot answer the one
+        # question it exists for, and a half-answer here books a slot nobody
+        # chose on the whole household's grid.
+        raw_nudges = data.get("nudges") if isinstance(data, dict) else None
+        self._nudge_cell = _normalise_nudge_cells(raw_nudges)
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
@@ -1367,6 +1413,7 @@ class LaundryAssistant:
                     "corrections": self._corrections,
                     "budgets": self._budgets,
                     "trades": self._trades,
+                    "nudges": self._nudge_cell,
                 }
             )
         except Exception:  # noqa: BLE001
@@ -1738,8 +1785,8 @@ class LaundryAssistant:
         await self._async_save()
         return True
 
-    def note_nudge_cell(self, user_id, cell) -> None:
-        """Remember which cell the DM we are about to send is about.
+    async def async_note_nudge_cell(self, user_id, cell, message_id) -> None:
+        """Record which cell **this DM** was about, keyed by the message id.
 
         The heads-up arrives *before* its slot opens, which breaks the trick the
         day-of nudge used to identify itself: at 19:00 both PM (16:00-20:00) is
@@ -1747,18 +1794,54 @@ class LaundryAssistant:
         message's own timestamp is genuinely ambiguous, and the wrong answer
         books a slot nobody chose on the whole household's grid.
 
-        Memory only, so a restart loses it — and :func:`reminders._dm_cell`
-        falls back to the timestamp reading rather than refusing the tap. That
-        is strictly better than the old behaviour, not worse: exact whenever we
-        know, and the previous best guess whenever we don't.
+        The message id is half the record and not decoration. A per-person note
+        with no message on it answered for *whichever DM was tapped*, so an
+        unanswered heads-up from Monday — still live, because
+        :class:`reminders.NudgeView` is persistent and its buttons never expire
+        — dispatched Tuesday's cell when somebody scrolled back and tapped it.
+        The day cap is one DM per person per day, so heads-ups on consecutive
+        days is the ordinary case: 🆓 Free it up released a booking they still
+        wanted, and ⏭ booked a day nobody chose. Tying the record to the message
+        makes an older DM unrecognisable rather than misidentified, which sends
+        it back through :data:`reminders._STALE_TAP`.
+
+        Persisted, for the same reason and the other half of it: the fallback
+        used to be "read the hour the DM was sent", and after v0.26.0 moved the
+        heads-up ahead of its slot that reading is *systematically* one slot
+        early — 19:00 for a 20:00 booking reads as PM. A restart between the
+        send and the tap therefore did not lose the answer, it silently changed
+        it to the wrong one. One store write per reminder DM, of which there is
+        at most one per person per day.
+
+        Written **after** the send, because there is no message id before it.
+        The window that opens is the tail of one HTTP round trip; a tap inside
+        it finds no record and is answered as stale, which is the safe way to
+        be wrong — the old ordering could not be wrong that way, only the other.
         """
         key = plan_mod.normalise_cell(cell)
-        if key is not None:
-            self._nudge_cell[str(user_id)] = key
+        ident = _message_key(message_id)
+        if key is None or ident is None:
+            return
+        row = {"cell": key, "message": ident}
+        if self._nudge_cell.get(str(user_id)) == row:
+            return
+        self._nudge_cell[str(user_id)] = row
+        await self._async_save()
 
-    def nudge_cell(self, user_id) -> str | None:
-        """The cell the last nudge DM to this person was about, if remembered."""
-        return self._nudge_cell.get(str(user_id))
+    def nudge_cell(self, user_id, message_id) -> str | None:
+        """The cell this **particular** DM was about, or None if unrecognised.
+
+        None covers three cases that all want the same answer: a DM from before
+        this record existed, an older DM whose note has since been overwritten,
+        and a tap that beat the note being written. In every one of them the
+        honest thing is that we cannot say which slot the message meant, and the
+        caller must not act on the grid.
+        """
+        row = self._nudge_cell.get(str(user_id))
+        ident = _message_key(message_id)
+        if not isinstance(row, dict) or ident is None:
+            return None
+        return row.get("cell") if row.get("message") == ident else None
 
     async def async_record_push(self, user_id, cell) -> None:
         """⏭ Push to tomorrow — a correction that is **not** a wrong guess.
@@ -1780,34 +1863,41 @@ class LaundryAssistant:
     # --------------------------------------------------------------------- DMs
     async def async_send_dm(
         self, user_id, content: str, view: discord.ui.View | None = None
-    ) -> bool:
-        """DM one person. Returns True only if it actually went out.
+    ) -> "discord.Message | None":
+        """DM one person. Returns the sent message, or None if it didn't go out.
 
         ``discord.Forbidden`` (50007) means their privacy settings refuse DMs
         from server members. That is a *user setting*, not a bug, so it logs at
         debug — the caller falls back to the channel and the panel explains it
         to the one person who can fix it.
+
+        The message rather than a bare ``True`` because a reminder DM has to be
+        identifiable later: its buttons are persistent and outlive both the slot
+        and the process, so the record of what it was about is keyed by its id
+        (:meth:`async_note_nudge_cell`). Every existing caller only asks whether
+        something was delivered, and a message object answers that question the
+        same way ``True`` did.
         """
         if user_id is None:
-            return False
+            return None
         try:
-            await self.bot.async_dm_user(user_id, content, view=view)
+            message = await self.bot.async_dm_user(user_id, content, view=view)
         except discord.Forbidden:
             _LOGGER.debug(
                 "DM to %s refused (DMs from server members are off)", user_id
             )
             self._people = people_mod.mark_dm_failed(self._people, user_id)
             await self._async_save()
-            return False
+            return None
         except Exception:  # noqa: BLE001 - never raise into HA
             _LOGGER.exception("Failed to DM %s", user_id)
-            return False
+            return None
         # Only write on a change: the completion ping runs once per load, and a
         # store write per load for no new information is pure churn.
         if people_mod.get_person(self._people, user_id)["dm_ok"] is not True:
             self._people = people_mod.mark_dm_ok(self._people, user_id)
             await self._async_save()
-        return True
+        return message
 
     async def async_route_ping(
         self, user_id, *, dm_text: str, channel_text: str
@@ -1839,8 +1929,8 @@ class LaundryAssistant:
             if user_id is None
             else people_mod.delivery(self._people, user_id)
         )
-        if mode == people_mod.REMIND_DM and await self.async_send_dm(
-            user_id, dm_text
+        if mode == people_mod.REMIND_DM and (
+            await self.async_send_dm(user_id, dm_text) is not None
         ):
             return True
         try:
@@ -2060,7 +2150,7 @@ class LaundryAssistant:
         """
         user_id = interaction.user.id
         self._grid_day[str(user_id)] = self._today()
-        self._clear_ask(user_id)
+        self._forget_tapped_cell(user_id)
         await self._async_render_grid(interaction, edit=True)
 
     async def async_pick_day(
@@ -2074,11 +2164,13 @@ class LaundryAssistant:
         if not plan_mod.is_weekday(day):
             day = self._today()
         self._grid_day[str(interaction.user.id)] = day
-        # 🔁 always refers to the cell that was last *tapped*, so changing day
-        # must retire it: a swap button pointing at a Thursday while the buttons
-        # underneath say Monday is the one way this could ask about a slot
-        # somebody didn't mean.
-        self._clear_ask(interaction.user.id)
+        # 🔁 **and ♻** always refer to the cell that was last *tapped*, so
+        # changing day must retire both: a swap button pointing at a Thursday
+        # while the buttons underneath say Monday is the one way this could ask
+        # about a slot somebody didn't mean — and ♻, which writes a standing
+        # weekly slot the whole house then sees as ║, is the same hazard with a
+        # permanent result and no confirmation step.
+        self._forget_tapped_cell(interaction.user.id)
         await self._async_render_grid(interaction, edit=True)
 
     async def async_toggle_cell(
@@ -2179,6 +2271,25 @@ class LaundryAssistant:
         key = str(user_id)
         self._ask_cell.pop(key, None)
         self._ask_offer.pop(key, None)
+
+    def _forget_tapped_cell(self, user_id) -> None:
+        """Retire **both** buttons that point at a cell rather than name one.
+
+        🔁 and ♻ share a hazard and now share a reset. Neither carries the cell
+        it acts on in its label — 🔁 says "Ask to swap", ♻ says "Every week" —
+        so the only thing tying them to a slot is the tap that armed them, and
+        the moment the grid moves to another day or is reopened on today, that
+        tap is about something the panel is no longer showing.
+
+        🔁 has always been retired here; ♻ was not, and it is the worse of the
+        two to leave armed. A swap ask is anonymous, refusable and expires in
+        48 hours. ♻ writes ``person["slots"]`` — a standing weekly commitment
+        drawn as ║ on everybody's grid every week from now on — and in the
+        demote direction one tap, with no cell tap before it in this session at
+        all, silently cancels one.
+        """
+        self._clear_ask(user_id)
+        self._last_cell.pop(str(user_id), None)
 
     def _note_ask(self, user_id, cell, week) -> None:
         """Arm 🔁 if this tap landed on a cell somebody else holds.
@@ -2424,10 +2535,13 @@ class LaundryAssistant:
            window is 3 seconds and a DM is a round trip — responding first is
            what stops a successfully-sent ask from showing the asker
            "interaction failed".
-        4. **Withdraw what could not be delivered.** An open request nobody ever
-           saw would block that slot and that person for the rest of the week
-           (:func:`trade.withdraw` lapses it without recording a refusal, which
-           would be a lie about the holder).
+        4. **Withdraw what could not be delivered — silently.** An open request
+           nobody ever saw would block that slot and that person for the rest of
+           the week (:func:`trade.withdraw` lapses it without recording a
+           refusal, which would be a lie about the holder). The asker is told
+           nothing extra about it: "the DM bounced" is a fact about the
+           holder, and an outcome only *this* holder-side condition produces is
+           a way to identify them.
         """
         user_id = interaction.user.id
         key = str(user_id)
@@ -2484,18 +2598,27 @@ class LaundryAssistant:
             # line either.
             _LOGGER.debug("Swap request sent")
             return
+        # It could not be delivered, so it lapses — and the asker is told
+        # **nothing further**. This used to post the holder-refusal sentence as
+        # a second ephemeral on top of :func:`trade.sent_text`, which no other
+        # holder-side outcome produces: swaps off, quiet hours, blocked, paused,
+        # 💬 channel, budget spent and a known-closed inbox all leave the grid
+        # note standing alone. A requester who saw "Asked..." followed a beat
+        # later by "I can't ask about that one right now" had learned, for that
+        # cell, that its holder's DMs are shut — a per-person setting attached
+        # to a cell they can watch across weeks, which is exactly the fact
+        # :data:`trade.HOLDER_REASONS` exists to render identically.
+        #
+        # The silence is not a white lie either: :func:`trade.withdraw` leaves
+        # the ask spent against this person's week (their one ask for this slot,
+        # and one of their two outstanding), so what they were told — the ask
+        # went out and lapses if nobody answers — describes what actually
+        # happens to them. The debug line is where an operator looks.
         self._trades = trade_mod.withdraw(
             self._trades, request["id"], self._now()
         )
         await self._async_save()
-        try:
-            await interaction.followup.send(
-                trade_mod.refusal_text(trade_mod.REASON_UNDELIVERED),
-                ephemeral=True,
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("Could not report an undelivered swap request",
-                          exc_info=True)
+        _LOGGER.debug("Swap request withdrawn: it could not be delivered")
 
     async def _async_deliver_request(self, request: dict) -> bool:
         """Send the anonymous ask. Returns whether it actually went out."""
@@ -2506,7 +2629,7 @@ class LaundryAssistant:
             async with asyncio.timeout(_TRADE_SEND_TIMEOUT):
                 return await self.async_send_dm(
                     request["to"], text, TradeRequestView(self)
-                )
+                ) is not None
         except TimeoutError:
             # Only the timeout. A CancelledError from outside is HA shutting
             # down and has to keep travelling.

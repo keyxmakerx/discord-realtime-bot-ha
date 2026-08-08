@@ -88,6 +88,7 @@ heads_up_text = _nudge.heads_up_text
 in_quiet_hours = _nudge.in_quiet_hours
 is_booked = _nudge.is_booked
 is_paused = _nudge.is_paused
+minutes_until_slot = _nudge.minutes_until_slot
 opportunity_cell = _nudge.opportunity_cell
 opportunity_text = _nudge.opportunity_text
 parse_clock = _nudge.parse_clock
@@ -451,6 +452,31 @@ def test_a_booking_beats_a_guess_and_the_two_are_worded_apart() -> None:
     assert opportunity_text("nonsense") is None
 
 
+def test_the_heads_up_says_how_long_it_really_is() -> None:
+    # REGRESSION: the loop rendered heads_up_text(cell, self.nudge_lead) — the
+    # *option* that decided when to look, not the distance to the slot. This
+    # message deliberately has two triggers, and only one of them fires at
+    # slot-start-minus-lead: the other is SIGNAL_WASHER_FREE, which arrives
+    # whenever the previous load happens to finish. Booked for 20:00, nothing
+    # sent at 19:00 because the washer was busy, load finishes at 19:55 — and
+    # the DM said "your slot starts in about 60 minutes" about a slot five
+    # minutes away. At the maximum lead of three hours it could be out by three
+    # hours, on the one message somebody is supposed to act on immediately.
+    assert minutes_until_slot(THU_EVE, HEADS_UP) == 30
+    assert minutes_until_slot(THU_EVE, LATE) == 5
+    assert "in about 5 minutes" in heads_up_text(
+        THU_EVE, minutes_until_slot(THU_EVE, LATE)
+    )
+    # Rounded up, so the smallest thing it ever quantifies is one minute...
+    assert minutes_until_slot(THU_EVE, at(2026, 8, 6, 19, 59)) == 1
+    # ...and a slot already open, or an unreadable moment, is not quantified at
+    # all: "soon" is the honest word for a number we do not have.
+    assert minutes_until_slot(THU_EVE, THU) is None
+    assert minutes_until_slot(THU_EVE, None) is None
+    assert minutes_until_slot("nonsense", LATE) is None
+    assert "in about" not in heads_up_text(THU_EVE, minutes_until_slot(THU_EVE, THU))
+
+
 def test_the_nudge_says_the_washer_is_free_so_it_needs_it_to_be() -> None:
     # §10.4: the washer being free is the fact the whole trigger is built on.
     # A message that says "and the washer's free right now" while somebody
@@ -789,26 +815,38 @@ def test_an_opportunity_needs_them_to_be_overdue_by_their_own_cadence() -> None:
     )
 
 
-def test_an_opportunity_is_never_about_a_slot_somebody_else_booked() -> None:
+def test_an_opportunity_is_never_about_a_slot_anybody_booked() -> None:
     # The whole claim of this message is that nobody has it — that is the bit
     # the person cannot see from their bedroom. A slot somebody else booked is
     # not an opportunity even with the drum standing empty, because the point
     # of the grid is that the booking is the thing to respect.
     prefs, guess = _person(), _guess()
     theirs = _plan.effective_week({}, {"2026-W32": {THU_EVE: ["2"]}}, "2026-W32")
-    assert opportunity_cell(guess, theirs, "1", HEADS_UP) is None
+    assert opportunity_cell(guess, theirs, HEADS_UP) is None
     assert select(
         prefs, {}, "1", HEADS_UP, prediction=guess, occupancy=theirs, due=True
     )[2] == REASON_NO_PREDICTION
-    # Their own booking of it does not disqualify it — two people can hold one
-    # cell, and this one is already partly theirs.
+    # REGRESSION: nor is one **they** booked. This used to ask only "does
+    # somebody else have it", so a person's own ║ standing slot qualified the
+    # moment slot_soon stopped offering the heads-up for it — and the message
+    # they got was "Nobody's booked this evening", about a cell the rest of the
+    # house can see drawn against their name-less █ on the shared grid. It also
+    # carries the opportunity view, so it offered to book a slot they already
+    # held and gave them no 🆓 Free it up to do the one useful thing.
     mine = _plan.effective_week({}, {"2026-W32": {THU_EVE: ["1"]}}, "2026-W32")
-    assert opportunity_cell(guess, mine, "1", HEADS_UP) == THU_EVE
+    assert opportunity_cell(guess, mine, HEADS_UP) is None
+    assert select(
+        prefs, {}, "1", HEADS_UP, prediction=guess, occupancy=mine, due=True
+    )[2] == REASON_NO_PREDICTION
+    # ...including a ♻ standing slot, which is the case that reaches this most
+    # often: it is on the grid every week without anybody re-booking it.
+    standing = _plan.effective_week({"1": {"slots": [THU_EVE]}}, {}, "2026-W32")
+    assert opportunity_cell(guess, standing, HEADS_UP) is None
     # A guess about another day is not about right now.
-    assert opportunity_cell(_guess("5-eve"), {}, "1", HEADS_UP) is None
+    assert opportunity_cell(_guess("5-eve"), {}, HEADS_UP) is None
     # ...nor is one whose window has already closed today.
-    assert opportunity_cell(_guess("3-am"), {}, "1", HEADS_UP) is None
-    assert opportunity_cell(None, {}, "1", HEADS_UP) is None
+    assert opportunity_cell(_guess("3-am"), {}, HEADS_UP) is None
+    assert opportunity_cell(None, {}, HEADS_UP) is None
 
 
 def test_only_one_message_is_ever_chosen() -> None:
@@ -861,10 +899,10 @@ def test_the_spare_slot_nudge_cannot_fire_in_the_dead_hours() -> None:
     # ...and stops when it closes, rather than lingering all afternoon.
     assert opportunity_at(12)[0] == MSG_NONE
     # The bound is the caller's lead, not a second hard-coded number.
-    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 4), 120) == "3-am"
-    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 4), 60) is None
+    assert opportunity_cell(guess, {}, at(2026, 8, 6, 4), 120) == "3-am"
+    assert opportunity_cell(guess, {}, at(2026, 8, 6, 4), 60) is None
     # An unreadable lead falls back to the default rather than opening the gate.
-    assert opportunity_cell(guess, {}, "1", at(2026, 8, 6, 2), "junk") is None
+    assert opportunity_cell(guess, {}, at(2026, 8, 6, 2), "junk") is None
 
 
 def test_a_reply_is_refused_once_its_slot_has_gone() -> None:

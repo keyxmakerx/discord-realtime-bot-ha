@@ -515,7 +515,10 @@ without you touching it, and everyone else sees `║` there instead of `▒`. Ta
 again (it now reads **Just this week**) to go back to a one-off.
 
 It targets the slot you last tapped, the same way 🔁 does, because that's the
-only cell on a 7×4 grid the panel can know you mean. Two things it deliberately
+only cell on a 7×4 grid the panel can know you mean — and, the same way 🔁 does,
+it goes away the moment that stops being obvious: change the day on the dropdown
+or reopen 📅 and the button is gone rather than quietly still pointing at
+Thursday. Two things it deliberately
 *doesn't* do: promoting doesn't re-book the week you're looking at (you already
 have it), and demoting doesn't cancel it either — *"I don't do this every week
 any more"* is not *"cancel the one I have on Thursday"*.
@@ -661,6 +664,10 @@ Your slot starts in about 60 minutes and the washer's free. Still want it?
 
 [ 👍 On it ]  [ 🆓 Free it up ]  [ ⏭ Push to tomorrow ]
 ```
+
+The minutes are measured, not assumed: if it is the washer coming free at 19:55
+that sends this, it says five minutes, not the hour it would have said at the
+clock trigger.
 
 **It arrives before your slot opens, not during it.** That sounds like a detail
 and it was the whole bug: the old nudge fired on a lead before the slot *ended*,

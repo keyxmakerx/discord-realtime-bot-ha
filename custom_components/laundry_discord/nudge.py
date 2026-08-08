@@ -498,6 +498,30 @@ def slot_soon(booked, moment, lead_minutes=HEADS_UP_LEAD_MINUTES) -> str | None:
     return best[1] if best else None
 
 
+def minutes_until_slot(cell, moment) -> int | None:
+    """How many whole minutes until this cell's slot opens, or None.
+
+    The number the heads-up should be *saying*, as opposed to the option that
+    decided when to look. Those two came apart the moment the heads-up got its
+    second trigger: the clock tick fires at slot-start-minus-lead, but
+    SIGNAL_WASHER_FREE fires whenever the previous load happens to finish, and
+    :func:`slot_soon` accepts anything inside the lead window — so a DM sent at
+    19:55 about a 20:00 slot was still rendering the configured hour. With
+    :data:`MAX_NUDGE_LEAD` at three hours the sentence could be out by three
+    hours, on the one message somebody is meant to act on immediately.
+
+    Rounded **up**, so "starts in about 1 minute" is the smallest thing this
+    ever says rather than "in about 0 minutes"; a slot already open (or a
+    moment/cell that cannot be read) is None, which
+    :func:`heads_up_text` renders as the honest, unquantified "soon".
+    """
+    start = slot_start_ts(cell, moment)
+    now = _ts(moment)
+    if start is None or now is None or start <= now:
+        return None
+    return int(-(-(start - now) // 60))
+
+
 def slot_ended(cell, moment) -> bool:
     """Whether this cell's window has already closed, relative to ``moment``.
 
@@ -542,19 +566,36 @@ def heads_up_clock(slot, lead_minutes=HEADS_UP_LEAD_MINUTES) -> tuple[int, int] 
 
 
 def opportunity_cell(
-    prediction, occupancy, user_id, moment, lead_minutes=HEADS_UP_LEAD_MINUTES
+    prediction, occupancy, moment, lead_minutes=HEADS_UP_LEAD_MINUTES
 ) -> str | None:
     """The cell an opportunity nudge would be about, or None.
 
     Their predicted usual slot, but only when it is **starting soon and nobody
-    else has it**. Both halves matter, and they are what make this message the
-    bot's private information rather than an opinion about somebody's laundry:
-    it knows the slot is unbooked and they cannot see that from their bedroom.
+    has it**. Both halves matter, and they are what make this message the bot's
+    private information rather than an opinion about somebody's laundry: it
+    knows the slot is unbooked and they cannot see that from their bedroom.
+
+    Takes no viewer id, and that absence is the fix rather than a tidy-up: the
+    occupancy question here is "is this cell free", which has one answer for
+    the whole house, not "is it free *for you*".
 
     Deliberately *not* "the machine is free right now" — the caller checks that
-    separately. A slot somebody else has booked is not an opportunity even with
-    the drum standing empty, because the whole point of the grid is that the
-    booking is the thing to respect.
+    separately. A slot somebody has booked is not an opportunity even with the
+    drum standing empty, because the whole point of the grid is that the booking
+    is the thing to respect.
+
+    **"Nobody" means nobody, the recipient included.** This used to ask only
+    :func:`plan.is_taken_by_other`, on the reasoning that your own booking
+    cannot be in your way — but the message this cell feeds says "Nobody's
+    booked <when>", and it says it to somebody whose own ║ or █ is drawn on
+    that exact cell for the rest of the house to see. It is reachable in the
+    ordinary case rather than a corner: :func:`slot_soon` stops offering a
+    booking the moment its window opens, so from 06:00 on a Thursday a standing
+    Thursday-AM slot no longer produces a heads-up and this branch is what runs
+    instead. README's precondition for this DM is "nobody has booked the slot
+    you normally use", full stop, and the ⏰ heads-up is the message that exists
+    for a slot they *do* hold — with 🆓 Free it up on it, which this one has
+    nowhere to put.
     """
     cell = plan.normalise_cell(
         prediction.get("cell") if isinstance(prediction, dict) else None
@@ -592,7 +633,7 @@ def opportunity_cell(
         lead = HEADS_UP_LEAD_MINUTES * 60
     if now < start - lead:
         return None
-    if plan.is_taken_by_other(occupancy or {}, cell, user_id):
+    if plan.is_taken(occupancy or {}, cell):
         return None
     return cell
 
@@ -658,9 +699,7 @@ def select(
         # be wrong for the twice-a-week washer and the fortnightly one alike.
         if not due:
             return (MSG_NONE, None, REASON_NOT_DUE)
-        cell = opportunity_cell(
-            prediction, occupancy, user_id, moment, lead_minutes
-        )
+        cell = opportunity_cell(prediction, occupancy, moment, lead_minutes)
         kind = MSG_OPPORTUNITY
     if cell is None:
         return (MSG_NONE, None, REASON_NO_PREDICTION)

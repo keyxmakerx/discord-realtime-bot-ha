@@ -942,9 +942,35 @@ def test_a_load_with_no_eta_lights_only_where_it_started() -> None:
 
 
 def test_a_load_starting_in_the_dead_hours_lights_nothing() -> None:
+    # Nothing *while it is still in them*, and nothing at all when there is no
+    # ETA to say it will leave them — how long a load runs is the guess this
+    # glyph must not make.
     assert cells_between(datetime.datetime(2026, 8, 8, 3, 0), None) == []
+    assert cells_between(
+        datetime.datetime(2026, 8, 8, 2, 0), datetime.datetime(2026, 8, 8, 5, 0)
+    ) == []
     assert cells_between(None, None) == []
     assert cells_between("junk", "junk") == []
+
+
+def test_a_load_that_starts_before_dawn_still_lights_the_morning() -> None:
+    # REGRESSION: the scan bailed out entirely the moment the *starting* hour
+    # fell in the 00:00-06:00 gap, so a wash put on at 05:00 with a 09:00 ETA
+    # drew nothing for its whole life — at 08:00 the machine was unambiguously
+    # mid-load in the AM slot and the grid still said `·`. The identical load
+    # started at 07:00 drew `*` correctly, which made the six hours where the
+    # reason is invisible the only six where it was wrong. The same function
+    # already documents dead hours *inside* a load as "simply absent"; a start
+    # inside them is the same case.
+    assert cells_between(
+        datetime.datetime(2026, 8, 6, 5, 0), datetime.datetime(2026, 8, 6, 9, 0)
+    ) == ["3-am"]
+    # Every hour of the gap, not just the one next to dawn.
+    for hour in range(0, 6):
+        assert cells_between(
+            datetime.datetime(2026, 8, 6, hour, 0),
+            datetime.datetime(2026, 8, 6, 13, 0),
+        ) == ["3-am", "3-mid"], hour
 
 
 def test_a_wedged_session_cannot_black_out_the_grid() -> None:

@@ -211,6 +211,79 @@ class LaundryCoordinator:
         self._selfclean_unsub = None
         # Pending handoff-fallback timer (nobody tapped "Emptied it").
         self._handoff_unsub = None
+        # Every task this coordinator has in flight. Held so :meth:`async_shutdown`
+        # can end them; see :meth:`_create_task`.
+        self._tasks: set[asyncio.Task] = set()
+
+    def _create_task(self, coro) -> None:
+        """Schedule one piece of session work, and keep hold of it.
+
+        Every ``@callback`` here that needs to await something goes through this
+        rather than ``hass.async_create_task`` directly, and the difference is
+        what happens at unload. A task created against ``hass`` is tied to
+        nothing this entry owns: ``async_shutdown`` dropped its listeners and
+        timers and closed the gateway, and anything already running carried on —
+        holding the old session lock, pinning the coordinator, its ``Store`` and
+        a closed client, and keeping ``hass.async_block_till_done()`` from ever
+        returning. ``Client.close()`` makes it unrecoverable rather than merely
+        slow: it *clears* ``_ready`` and drops the loop, so a task waiting on the
+        gateway at that moment can never be woken by anything.
+
+        The set is also the answer to the ordinary asyncio hazard that the loop
+        keeps only a weak reference to a running task, so one nobody holds can
+        be collected mid-flight. Each task removes itself when it finishes, so
+        this is a live view rather than a log.
+        """
+        task = self.hass.async_create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    @callback
+    def _task_done(self, task) -> None:
+        """Drop a finished task, and answer for whatever it raised.
+
+        Bounding the gateway wait turned "hangs forever" into "raises
+        ``TimeoutError``", which is the right trade — the session lock is
+        released either way now. But nothing was *retrieving* that exception, so
+        asyncio logged ``Task exception was never retrieved`` with a full
+        traceback at ERROR, and on a washer whose cloud drops roughly hourly
+        that is a stack trace an hour for a condition the bot handles correctly
+        and by design.
+
+        So the expected one is retrieved and logged at debug, and everything
+        else is re-raised into HA's own handler rather than swallowed: a gateway
+        that was not ready is ordinary, and a ``KeyError`` in the embed builder
+        is not, and quietly eating the second to silence the first is how a real
+        bug hides for a month.
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if isinstance(exc, TimeoutError):
+            _LOGGER.debug("Session work abandoned: gateway never became ready")
+            return
+        raise exc
+
+    async def _async_cancel_tasks(self) -> None:
+        """Stop everything in flight and wait for it to actually be stopped.
+
+        Awaited rather than fired and forgotten: the point is that when
+        ``async_shutdown`` returns, nothing is left holding this entry's lock or
+        talking to a client that is about to be closed. Cancellation is
+        cooperative, so a task parked on a bot call unwinds through its own
+        ``except`` — which is why the gateway wait is bounded too
+        (:data:`discord_bot._READY_TIMEOUT`); a wait that never returns cannot
+        be cancelled either.
+        """
+        pending = [task for task in self._tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._tasks.clear()
 
     # ------------------------------------------------------------------ config
     @property
@@ -396,7 +469,16 @@ class LaundryCoordinator:
             _LOGGER.exception("Laundry Discord bot stopped unexpectedly")
 
     async def async_shutdown(self) -> None:
-        """Tear down listeners, timers and the gateway connection."""
+        """Tear down listeners, timers, in-flight work and the connection.
+
+        Order matters. Listeners and timers go first so nothing new is
+        scheduled, then whatever is already running is cancelled and waited for,
+        and only then is the client closed. Closing first is what made an
+        in-flight task unkillable: ``Client.close()`` clears the ready event and
+        drops the loop, so a task waiting on the gateway had nothing left that
+        could ever wake it — it simply stayed pending for the life of the HA
+        process, holding a lock on an entry that no longer exists.
+        """
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -409,6 +491,7 @@ class LaundryCoordinator:
             self._selfclean_unsub()
             self._selfclean_unsub = None
         self._cancel_handoff_timer()
+        await self._async_cancel_tasks()
         try:
             await self.bot.async_close()
         except Exception:  # noqa: BLE001
@@ -431,6 +514,26 @@ class LaundryCoordinator:
             # while HA was down. One feed covers both; the restored state is
             # settled, so the job fast-paths are safe to use here.
             self._feed_detector(job_accel=True)
+            # ...and a *claimed* load still sitting in done_waiting is owed its
+            # handoff backstop. It is armed in exactly one place — the
+            # completion that put it here — so a restart in the window between
+            # "done" and the claimant tapping ✅ dropped it on the floor, and
+            # with it the only remaining route to SIGNAL_WASHER_FREE for this
+            # load, so reminders never heard about it either. The head of the 🔜
+            # line then learned nothing until the *next* load completed, which
+            # can be a day later.
+            #
+            # The full delay restarts from now rather than from the completion:
+            # nothing persists when the load finished, and a backstop that is
+            # late is the thing it is for. The callback re-checks the stage and
+            # `emptied`, and a new load cancels it, so arming it here cannot
+            # fire against a session this one no longer describes.
+            if (
+                self.stage == STAGE_DONE_WAITING
+                and not self.emptied
+                and self.claimed_by_id is not None
+            ):
+                self._arm_handoff_timer()
         # DONE_WAITING also keeps its claim/unclaim button working via the
         # persistent ClaimView re-registered in on_ready.
         self._notify_entities()
@@ -651,12 +754,32 @@ class LaundryCoordinator:
         - **Offline completion:** the washer has been unavailable a long time AND
           its last-known ETA has passed (+grace) — finish, flagged *unverified*.
         - **Max-session:** absolute safety net so a stuck session can't live on.
+
+        **A self-clean gets both nets too**, which it did not before, and the
+        omission left it as the one session with no time-based way to end at
+        all. Its only two endings are the energy detector and
+        :meth:`_schedule_selfclean_end`, and an outage silences both together:
+        the detector's flat-energy backstop is guarded by ``energy is not None``
+        so it sees nothing while the meter is unavailable, and the end timer is
+        armed by ``running -> "off"`` or ``machine_state -> "stop"``, neither of
+        which is the value ``"unavailable"``. A cloud drop that outlasts the
+        cycle therefore held the session open indefinitely — and, because
+        :meth:`_on_detector_started` returns early on ``self_clean``, swallowed
+        every real load after it: no card, no claim button, no completion ping.
+        A normal load had two independent nets for exactly this; a self-clean
+        had none.
         """
         # Before the stage guard: an idle machine is exactly when the planner
         # most needs telling there is nothing running.
         self._publish_running()
-        if self.stage not in (STAGE_WASHING, STAGE_DRYING):
+        if self.stage not in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             return
+        # Which ending applies is the stage's business, not the net's: a
+        # self-clean has no claimant, no queue and no card to announce, so it
+        # closes through its own finisher. Routing it through
+        # ``_async_handle_finished`` would be a no-op — that method refuses any
+        # stage but washing/drying — which is how this was silently missing.
+        selfclean = self.stage == STAGE_SELF_CLEAN
         now = dt_util.utcnow().timestamp()
         if offline_completion_due(
             offline_since=self._offline_since,
@@ -666,12 +789,21 @@ class LaundryCoordinator:
             eta_grace=float(self.offline_complete_grace),
         ):
             _LOGGER.debug("Offline completion (washer unavailable, ETA passed)")
+            if selfclean:
+                self._create_task(self._async_finish_selfclean())
+                return
+            # Only a load has a card that hedges its wording; the self-clean
+            # embed says "the drum is clean" either way.
             self._offline_unverified = True
-            self.hass.async_create_task(self._async_handle_finished())
+            self._create_task(self._async_handle_finished())
             return
         if session_too_long(self._session_started_ts, now, float(self.max_session)):
             _LOGGER.debug("Max-session safety completion (stage=%s)", self.stage)
-            self.hass.async_create_task(self._async_handle_finished())
+            self._create_task(
+                self._async_finish_selfclean()
+                if selfclean
+                else self._async_handle_finished()
+            )
 
     @callback
     def _feed_detector(self, _now=None, *, job_accel: bool = False) -> None:
@@ -710,7 +842,7 @@ class LaundryCoordinator:
             self._on_detector_finished()
         elif (self._detector.last_energy, self._detector.last_rise_ts) != before:
             # No transition, but the baseline advanced — persist it.
-            self.hass.async_create_task(self._async_save())
+            self._create_task(self._async_save())
 
     @callback
     def _on_detector_started(self, phase: str | None) -> None:
@@ -722,21 +854,21 @@ class LaundryCoordinator:
         # arrived after the fact (offline) => a normal catch-up load.
         if phase in REAL_PHASES:
             _LOGGER.debug("Detector: load started (job=%s)", phase)
-            self.hass.async_create_task(self._async_start_session())
+            self._create_task(self._async_start_session())
         elif self._looks_like_selfclean():
             _LOGGER.debug("Detector: self-clean started")
-            self.hass.async_create_task(self._async_start_selfclean())
+            self._create_task(self._async_start_selfclean())
         else:
             _LOGGER.debug("Detector: offline load started (job dark)")
-            self.hass.async_create_task(self._async_start_session(offline=True))
+            self._create_task(self._async_start_session(offline=True))
 
     @callback
     def _on_detector_finished(self) -> None:
         """The active cycle's energy went flat (or job hit 'finish')."""
         if self.stage == STAGE_SELF_CLEAN:
-            self.hass.async_create_task(self._async_finish_selfclean())
+            self._create_task(self._async_finish_selfclean())
         elif self.stage in (STAGE_WASHING, STAGE_DRYING):
-            self.hass.async_create_task(self._async_handle_finished())
+            self._create_task(self._async_handle_finished())
 
     @callback
     def _on_energy(self, event: Event) -> None:
@@ -783,10 +915,10 @@ class LaundryCoordinator:
         if self.stage in (STAGE_WASHING, STAGE_DRYING):
             if new_s == MACHINE_PAUSE and not self.paused:
                 self.paused = True
-                self.hass.async_create_task(self._async_render_active("paused"))
+                self._create_task(self._async_render_active("paused"))
             elif new_s == MACHINE_RUN and self.paused:
                 self.paused = False
-                self.hass.async_create_task(self._async_render_active("resumed"))
+                self._create_task(self._async_render_active("resumed"))
             elif new_s == MACHINE_STOP and self.paused:
                 # Cancelling is Start/Pause then Stop on most combo units, so
                 # `pause -> stop` is the *ordinary* cancel. Clear the flag at
@@ -878,7 +1010,7 @@ class LaundryCoordinator:
                 and job == JOB_STATE_DRYING
                 and self._last_real_phase not in (None, JOB_STATE_DRYING)
             ):
-                self.hass.async_create_task(self._async_handle_drying())
+                self._create_task(self._async_handle_drying())
             self._last_real_phase = job
         elif job == JOB_STATE_NONE:
             self._last_real_phase = None
@@ -953,7 +1085,7 @@ class LaundryCoordinator:
             else None
         )
         _LOGGER.debug("Washer reports stopped mid-load (verdict=%s)", verdict)
-        self.hass.async_create_task(
+        self._create_task(
             self._async_handle_finished(
                 cancelled=verdict == cancel_mod.VERDICT_STOPPED,
                 # Deliberately *not* the same boolean as the wording. Deleting
@@ -998,7 +1130,7 @@ class LaundryCoordinator:
         running = self.hass.states.get(self.running_entity)
         running_on = running is not None and running.state == "on"
         if not running_on and self._machine_state() != MACHINE_RUN:
-            self.hass.async_create_task(self._async_finish_selfclean())
+            self._create_task(self._async_finish_selfclean())
 
     @callback
     def _record_flap(self) -> None:
@@ -1008,7 +1140,7 @@ class LaundryCoordinator:
         self._flap_times = [t for t in self._flap_times if t >= cutoff]
         self._flap_times.append(now)
         self._notify_entities()
-        self.hass.async_create_task(self._async_save())
+        self._create_task(self._async_save())
 
     def _entity_float(self, entity_id: str | None) -> float | None:
         if not entity_id:
@@ -1127,8 +1259,29 @@ class LaundryCoordinator:
             self._notify_entities()
 
     async def _async_handle_drying(self) -> None:
+        """Flip the live card to 'Drying'. **Display only** — it starts nothing.
+
+        The guard is a whitelist, and it has to be. It used to refuse only
+        ``STAGE_IDLE``, which reads as "refuse when nothing is happening" and is
+        not the same thing: this method is queued from
+        :meth:`_async_job_confirmed`, which first calls ``_feed_detector`` — and
+        that call can emit ``EV_FINISHED`` and queue :meth:`_async_handle_finished`
+        against the same lock. The two tasks run FIFO, so the drying edit lands
+        *after* the completion, and the stage it was scheduled on is stale.
+
+        Putting a ``done_waiting`` session back into ``drying`` wedged the state
+        machine permanently, and every escape route with it: the detector had
+        already been reset to idle so it could not emit another finish,
+        ``_session_started_ts`` had been cleared so the 12-hour max-session net
+        read False, ``_last_eta_ts`` had been cleared so the offline completion
+        read False, and :meth:`_on_detector_started` and
+        :meth:`_async_start_session` both return early on ``drying`` — so no
+        later load ever posted a card either. Only ``reset_session`` recovered
+        it, after somebody had been DMed "your laundry's done" and then watched
+        the card go back to "🌀 Drying".
+        """
         async with self._lock:
-            if self.stage == STAGE_IDLE:
+            if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 return
             self.stage = STAGE_DRYING
             # Silent edit; the button (claim/unclaim) is preserved.
@@ -1438,7 +1591,7 @@ class LaundryCoordinator:
         # bucket and the token is dead, leaving the tapper with "interaction
         # failed" and a card that still offers ✅. State is already saved, so
         # the ping is safe to finish on its own.
-        self.hass.async_create_task(
+        self._create_task(
             self._async_ping_next(hedged=False, expect_emptied=True)
         )
         return True
@@ -1570,7 +1723,7 @@ class LaundryCoordinator:
         # reason to exist a moment before it fired.
         if self.stage != STAGE_DONE_WAITING or self.emptied:
             return
-        self.hass.async_create_task(
+        self._create_task(
             self._async_ping_next(hedged=True, expect_emptied=False)
         )
 

@@ -165,7 +165,13 @@ REASON_SWAPS_OFF = "swaps_off"  # 🔁 off on *their* record — not the house s
 REASON_QUIET = "quiet"  # inside their overnight quiet window
 REASON_HOLDER_BUSY = "holder_busy"  # they already have an ask waiting
 REASON_BUDGET_DAY = "budget_day"  # their 1-DM-a-day cap
-REASON_UNDELIVERED = "undelivered"  # the DM did not leave the building
+# The DM did not leave the building. Nothing renders this any more — the caller
+# withdraws the ask and says nothing extra, because an outcome only *this*
+# holder-side condition produces would identify that holder as one with DMs
+# closed. It stays in :data:`HOLDER_REASONS` so the "these must all read
+# identically" test keeps covering it, and so the reason the withdrawal exists
+# is still named somewhere.
+REASON_UNDELIVERED = "undelivered"
 
 REASONS = (
     REASON_OK,
@@ -262,10 +268,19 @@ def request_id(week, requester, want) -> str | None:
 def new_request(requester, holder, want, offer, week, moment) -> dict | None:
     """One request row, or None if it could not be a usable one.
 
-    ``{"id", "from", "to", "want", "offer", "week", "ts", "state"}`` — §12's
-    shape plus the ISO week, which the doc's sketch leaves out and every
-    once-per-week rule in here needs: a bare timestamp cannot say which week it
-    belongs to without redoing the week maths at every read.
+    ``{"id", "from", "to", "want", "offer", "week", "ts", "made", "state"}`` —
+    §12's shape plus the ISO week, which the doc's sketch leaves out and every
+    once-per-week rule in here needs (a bare timestamp cannot say which week it
+    belongs to without redoing the week maths at every read), plus ``made``.
+
+    ``ts`` and ``made`` are the same number on a fresh row and diverge on
+    exactly two paths: :func:`_lapsed_request` and :func:`withdraw` both age
+    ``ts`` past the TTL so the row is born, or becomes, inert. ``ts`` is
+    therefore *liveness* — is anybody waiting on an answer — and ``made`` is
+    *when this person asked*, which is the only honest basis for a cap on their
+    own outstanding asks. Keeping one field for both is what let a holder-side
+    refusal refund the asker's cap and turn :data:`REASON_TOO_MANY_OPEN` into
+    an oracle; see :func:`pending_from`.
     """
     ident = request_id(week, requester, want)
     who = _id(requester)
@@ -285,6 +300,7 @@ def new_request(requester, holder, want, offer, week, moment) -> dict | None:
         "offer": offered,
         "week": _week(week),
         "ts": ts,
+        "made": ts,
         "state": STATE_OPEN,
     }
 
@@ -310,6 +326,11 @@ def normalise_request(record) -> dict | None:
         return None
     state = record.get("state")
     ident = record.get("id")
+    # A row written before ``made`` existed falls back to ``ts``, which is what
+    # it meant at the time. That reads a *stored* lapsed row as older than it
+    # is, so the very first upgrade can under-count somebody's cap by one ask
+    # for at most two days — the alternative is refusing to read the store.
+    made = _ts(record.get("made"))
     return {
         "id": ident if isinstance(ident, str) and ident else request_id(
             week, who, wanted
@@ -320,6 +341,7 @@ def normalise_request(record) -> dict | None:
         "offer": offered,
         "week": week,
         "ts": ts,
+        "made": ts if made is None else made,
         "state": state if state in STORED_STATES else STATE_OPEN,
     }
 
@@ -416,6 +438,49 @@ def open_from(requests, requester, moment) -> list[dict]:
         row
         for row in normalise_requests(requests)
         if key is not None and row["from"] == key and is_open(row, moment)
+    ]
+
+
+def pending_from(requests, requester, moment) -> list[dict]:
+    """The asks this person has spent, for :data:`MAX_OPEN_PER_REQUESTER`.
+
+    :func:`open_from` with one difference, and the difference is the whole
+    reason this exists: it ages a row by **``made``** rather than by ``ts``, so
+    an ask that was silently refused (:func:`claim_request`) or could not be
+    delivered (:func:`withdraw`) still occupies one of the asker's two slots for
+    the full TTL, exactly as a delivered one does.
+
+    Counting those by liveness made the cap leak the one fact the flat refusal
+    text and the lapsed row exist to hide. A delivered ask holds the cap; a
+    holder-side refusal writes a row that is inert by construction and held
+    nothing — so a requester who fired three asks and got the distinctive "you
+    have 2 asks waiting already" on the third had learned that the first two
+    were genuinely delivered, and one who sailed through had learned that they
+    were not. Repeat with different cells and the grid partitions by who
+    refuses, which is precisely the oracle :func:`_lapsed_request` was written
+    to close. :func:`check_request`'s docstring promises that every reason it
+    returns is a fact about the asker's own week; ``made`` is what makes that
+    true of this one.
+
+    An *answered* ask still frees the cap immediately, and must: the asker was
+    told the answer, so nothing is being hidden, and holding their slot after a
+    "no" would be a second punishment for having asked.
+    """
+    key = _id(requester)
+    now = habit.moment_ts(moment)
+    if key is None:
+        return []
+    ttl = REQUEST_TTL_HOURS * SECONDS_PER_HOUR
+    return [
+        row
+        for row in normalise_requests(requests)
+        if row["from"] == key
+        and row["state"] == STATE_OPEN
+        # An unreadable clock reads as "still pending", the same direction
+        # :func:`is_expired` errs in: refusing one more ask costs a tap, and
+        # the other way round hands out unlimited probes to anybody whose HA
+        # host cannot tell the time.
+        and (now is None or now < row["made"] + ttl)
     ]
 
 
@@ -765,7 +830,10 @@ def check_request(
         return REASON_ALREADY_ASKED
     if slot_refused(requests, wanted, stamp):
         return REASON_SLOT_REFUSED
-    if len(open_from(requests, requester, moment)) >= MAX_OPEN_PER_REQUESTER:
+    # :func:`pending_from`, not :func:`open_from`: what this cap may depend on
+    # is how many asks *this person* has spent, and nothing about what happened
+    # to them at the other end.
+    if len(pending_from(requests, requester, moment)) >= MAX_OPEN_PER_REQUESTER:
         return REASON_TOO_MANY_OPEN
     return REASON_OK
 
@@ -889,11 +957,16 @@ def _lapsed_request(requester, holders, want, offer, week, moment) -> dict | Non
 
     Born already past its TTL, so :func:`state_of` reads it as expired the
     moment it is written: it is never open, so it holds nobody's slot and
-    occupies neither :data:`MAX_OPEN_PER_HOLDER` nor
-    :data:`MAX_OPEN_PER_REQUESTER`, and its state is not one of
+    occupies no room in :data:`MAX_OPEN_PER_HOLDER`, and its state is not one of
     :data:`REFUSED_STATES`, so it does not shut the slot to the rest of the
-    house on an answer nobody gave. The single thing it does is count against
-    :func:`asked_this_week` — which is the entire point.
+    house on an answer nobody gave.
+
+    What it *does* do is cost its author exactly what a delivered ask costs
+    them: one of their :data:`MAX_OPEN_PER_REQUESTER` slots, via ``made``, which
+    is not aged — see :func:`pending_from` — and their one ask for that slot
+    this week, via :func:`asked_this_week`. Both halves are the point. The row
+    is inert towards everybody else and identical towards the person who wrote
+    it, which is what makes a probe cost exactly what a real ask costs.
     """
     who = _id(requester)
     holder = next(
@@ -1041,14 +1114,18 @@ def withdraw(requests, ident, moment) -> list[dict]:
     """Retire one ask without answering it — it lapses, here and now.
 
     The row stays in the list, so it still counts as the one ask its author gets
-    for that slot this week; only its liveness changes, by ageing its timestamp
-    past the TTL that :func:`state_of` reads. Recording it as a *decline* would
-    be a lie about the holder — it would shut the slot to the whole house for
-    the week on the strength of an answer nobody gave.
+    for that slot this week **and still occupies one of their two outstanding
+    asks** (:func:`pending_from` reads ``made``, which this leaves alone); only
+    its liveness changes, by ageing ``ts`` past the TTL that :func:`state_of`
+    reads. Recording it as a *decline* would be a lie about the holder — it
+    would shut the slot to the whole house for the week on the strength of an
+    answer nobody gave.
 
     The caller for this is a request DM that could not be delivered. Leaving it
     open would block the holder and the slot for a week over a message nobody
-    ever saw.
+    ever saw — and refunding the *asker* would be the same leak the lapsed row
+    closes, since "the DM bounced" is a fact about the holder's privacy
+    settings and nothing else.
     """
     rows = normalise_requests(requests)
     now = habit.moment_ts(moment)

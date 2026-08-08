@@ -124,6 +124,7 @@ new_request = _trade.new_request
 normalise_request = _trade.normalise_request
 normalise_requests = _trade.normalise_requests
 open_from = _trade.open_from
+pending_from = _trade.pending_from
 open_to = _trade.open_to
 pass_ack_text = _trade.pass_ack_text
 passed_text = _trade.passed_text
@@ -592,20 +593,65 @@ def test_a_requester_can_only_have_so_many_asks_out() -> None:
         for index in range(MAX_OPEN_PER_REQUESTER)
     ]
     assert len(open_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
+    assert len(pending_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
     assert _ask(requests=rows, want=WANT) == REASON_TOO_MANY_OPEN
-    # Answered ones don't count against it; nor do lapsed ones.
+    # Answered ones don't count against it — the asker was told the answer, so
+    # nothing is being hidden, and holding their slot after a "no" would be a
+    # second punishment for having asked.
     answered = [{**row, "state": STATE_DECLINED} for row in rows]
     assert _ask(requests=answered, want=WANT) == REASON_OK
+    # ...and neither do asks old enough to have aged out on their own.
+    later = NOW + datetime.timedelta(hours=REQUEST_TTL_HOURS + 1)
+    assert pending_from(rows, ASKER, later) == []
 
 
-def test_withdrawing_frees_the_cap_without_claiming_they_said_no() -> None:
+def test_the_open_ask_cap_cannot_be_read_as_an_oracle() -> None:
+    # REGRESSION: the cap counted *liveness*, so a holder-side refusal — which
+    # writes an already-lapsed row — refunded the asker's slot while a delivered
+    # ask held it. R taps 🔁 on three cells in a week: if the holders were
+    # reachable the third is refused with the distinctive "you've got 2 asks
+    # waiting already"; if they silently refused, the third sails through and a
+    # DM goes out. Repeat with different cells and the grid partitions by who
+    # refuses — the exact free, repeatable oracle claim_request's own comment
+    # says the lapsed row exists to prevent, and a flat contradiction of
+    # check_request's promise that every reason it returns is a fact about the
+    # asker's own week.
+    prefs = _prefs(holder_changes={"reminders": _people.REMIND_OFF})
+    rows: list = []
+    for index in range(MAX_OPEN_PER_REQUESTER):
+        reason, _row, rows, _budgets = claim_request(
+            prefs, rows, {}, ASKER, [HOLDER], f"{index}-am", OFFER, WEEK, NOW,
+            mine=(OFFER,),
+        )
+        assert reason == REASON_SILENT
+    # Two probes spent, so the third is refused for the asker's own reason —
+    # identically to two delivered asks.
+    assert len(pending_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
+    assert _ask(requests=rows, want=WANT) == REASON_TOO_MANY_OPEN
+    # ...and the row is still inert towards everybody else, which is the half of
+    # the lapsed trick that has to keep working.
+    assert all(is_open(row, NOW) is False for row in rows)
+    assert open_to(rows, HOLDER, NOW) == []
+    assert all(slot_refused(rows, row["want"], WEEK) is False for row in rows)
+    # An undeliverable ask is the same fact about the same holder and costs the
+    # same: a withdrawal lapses the row for the holder, never for the asker.
+    delivered = [_request(want=OTHER, holder=THIRD), _request()]
+    lapsed = withdraw(delivered, delivered[0]["id"], NOW)
+    assert len(pending_from(lapsed, ASKER, NOW)) == 2
+
+
+def test_withdrawing_lapses_an_ask_without_claiming_they_said_no() -> None:
     rows = [_request(want=OTHER, holder=THIRD), _request()]
     lapsed = withdraw(rows, rows[0]["id"], NOW)
+    # Dead to the holder, whose slot and inbox it must not block over a message
+    # nobody ever saw...
     assert [row["id"] for row in open_from(lapsed, ASKER, NOW)] == [rows[1]["id"]]
+    assert open_to(lapsed, THIRD, NOW) == []
     assert state_of(lapsed[0], NOW) == STATE_EXPIRED
-    # ...but the ask still counts as this week's ask for that slot, and it is
-    # emphatically NOT recorded as a refusal — nobody said no.
+    # ...but still this week's ask for that slot, still one of the asker's two
+    # outstanding, and emphatically NOT recorded as a refusal — nobody said no.
     assert asked_this_week(lapsed, ASKER, OTHER, WEEK) is True
+    assert len(pending_from(lapsed, ASKER, NOW)) == 2
     assert slot_refused(lapsed, OTHER, WEEK) is False
     assert withdraw(rows, "no such id", NOW) == normalise_requests(rows)
 
@@ -1054,6 +1100,9 @@ def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
         # rest of the house on an answer nobody gave.
         assert is_open(rows[0], NOW) is False
         assert open_to(rows, HOLDER, NOW) == [] and open_from(rows, ASKER, NOW) == []
+        # ...but it costs its author exactly what a delivered ask costs them,
+        # or the difference is readable — see the oracle test above.
+        assert len(pending_from(rows, ASKER, NOW)) == 1
         assert slot_refused(rows, WANT, WEEK) is False
         # No DM went out, so no DM was charged for.
         assert _habit.budget_for(budgets, HOLDER)["nudges_today"] == 0
