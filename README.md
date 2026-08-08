@@ -273,7 +273,7 @@ How should I reach you when something's actually for you?
 
   Pings        💬 In the channel, with an @mention
   Monitoring   👁 on — when you tap Claim I note the day and time
-  Guessing     🔮 on — I'll mark your usual days as ░ on your week
+  Guessing     🔮 on — I'll mark your usual days with ? on your week
 
 [ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ]
 [ 👁 Monitoring: on ] [ 📅 My week ] [ 🔮 Fix a guess ]
@@ -350,12 +350,12 @@ Behind **📅 My week** on the assistant panel is the whole week at a glance:
 
 ```
       Mo Tu We Th Fr Sa Su
-AM     ·  ·  ▓  ·  ·  ▓  ·
-Mid    ·  ·  ·  ▓  ·  ·  ·
-PM     ▓  ·  ·  ▓  ·  ·  ▓
-Eve    ·  ▓  ·  █  ·  ▓  ·
+AM     ·  ·  ▒  ·  ·  ║  ·
+Mid    ·  ·  ·  ▒  ·  ·  ·
+PM     ▒  ·  ·  ║  ·  ·  ▒
+Eve    ·  ▒  ·  █  ·  ▒  ·
 
-█ yours  ▓ taken  · free
+█ yours  ▒ taken  ║ taken, every week  · free
 ```
 
 **Four slots a day, because at 4–5 hours a cycle one slot is about one load.**
@@ -370,9 +370,58 @@ Mid 12:00–16:00, PM 16:00–20:00, Eve 20:00–00:00.
 >
 > That anonymity is exactly why the grid is **ephemeral** and not a pinned
 > channel message: your own cells have to render differently from everyone
-> else's (`█` vs `▓`), and one shared message can only have one rendering. So
+> else's (`█` vs `▒`), and one shared message can only have one rendering. So
 > each person gets their own private view — "only you can see this" — and the
 > channel stays at one card per load.
+
+#### Reading it: shape means *what*, weight means *whose*
+
+| Glyph | Code point | Means |
+|-------|-----------|-------|
+| `·` | U+00B7 | **free** |
+| `█` | U+2588 | **yours** |
+| `▒` | U+2592 | somebody else's, **this week only** |
+| `║` | U+2551 | somebody else's, **every week** — a standing slot |
+| `?` | ASCII | the bot's **guess** at your usual days. Yours alone, never on anybody else's view |
+
+This used to be `·` → `░` → `▓` → `█`: four steps of a single shading ramp, from
+faint to solid. It looked tidy and it was **the wrong encoding**, which is why
+the first person to use it in anger couldn't read it.
+
+A density ramp encodes **magnitude** — more of something, less of something. But
+these aren't magnitudes. "The bot's guess", "somebody else's booking" and "your
+booking" are different *kinds* of thing, and asking *how dark is this square?*
+answers a question nobody was asking. You had to translate every glyph through a
+legend instead of just seeing it, and the ramp had run out of room: it was
+already at solid black, so a fifth state had nowhere to go.
+
+So the ramp is gone. Exactly **two** block weights survive and between them they
+now mean one thing: `▒` somebody else, `█` you. Everything else is a different
+**shape** rather than a different darkness — `?` is a question mark because it
+*is* a question, `║` is two vertical rules because a standing booking is a rail
+running through every week.
+
+**Why cadence gets a glyph at all.** `║` is shown for other people because it
+changes what you'd do next: a slot somebody stands on every week is far less
+likely to move than a one-off, so it's the difference between *worth asking for
+a swap* and *pick another evening*. It gives away nothing a booking doesn't
+already — still no name, still no count, just how often the cell is spoken for.
+**Your own** cadence doesn't get a sixth glyph: `█` already says "yours", so it
+goes in the **Yours this week** line as words (`Th Eve (every week) · Su AM`),
+which is where you read back what you've actually committed to.
+
+Colour was the obvious alternative and it's not available: Discord code blocks
+only do colour through ANSI escape sequences, and clients that don't support
+them render the escapes as visible garbage. Seven people means mixed devices.
+The characters themselves are all single-width and share the width class of the
+`·`/`█` that already render correctly here, so the columns stay aligned.
+
+The buttons under the grid carry the same information the glyphs do — green for
+yours, blurple for a guess, red for a slot somebody else is down for, grey for
+free. Red is not a veto: the button stays live, because booking a taken slot is
+allowed and always has been. It just stops the button row saying *free*,
+*taken* and *guessed* in one identical grey while the block above distinguishes
+all three.
 
 **It's information, not permission.** Booking a slot says *I'm planning to wash
 then*. It doesn't reserve the machine, nothing stops anyone else using it, and
@@ -394,7 +443,7 @@ characters wide for the same reason, and everything decorative lives outside the
 code fence, since an emoji inside one breaks the column alignment the whole grid
 depends on.
 
-### The 🔮 day guesses (`░`)
+### The 🔮 day guesses (`?`)
 
 Turn on **Learn the days each person washes** in the options and the bot starts
 noticing something it has always had and never used: **every 🧺 Claim tap is a
@@ -402,27 +451,29 @@ labelled data point** — this person ran a load, at this time, on this day. Six
 weeks of that is a per-person histogram of when you actually do laundry, for
 free, with nothing to fill in and nothing to ask.
 
-A fourth character then appears on **your own** grid:
+One more character then appears on **your own** grid:
 
 ```
       Mo Tu We Th Fr Sa Su
-AM     ·  ·  ▓  ·  ·  ▓  ·
-Mid    ·  ·  ·  ▓  ·  ·  ·
-PM     ▓  ·  ·  ▓  ·  ·  ▓
-Eve    ·  ▓  ·  ░  ·  ▓  ·
+AM     ·  ·  ▒  ·  ·  ║  ·
+Mid    ·  ·  ·  ▒  ·  ·  ·
+PM     ▒  ·  ·  ║  ·  ·  ▒
+Eve    ·  ▒  ·  ?  ·  ▒  ·
 
-█ yours  ▓ taken  ░ expected  · free
+█ yours  ▒ taken  ║ taken, every week  ? expected  · free
 ```
 
-**`░` means "I think you usually wash then."** It is a guess from your own past
+**`?` means "I think you usually wash then."** It is a guess from your own past
 loads — not a booking, not something anybody asked for, and not something you
-have to act on. It appears only where a slot is otherwise **free**: a real
-booking, yours or anyone else's, always wins, so a guess can never sit on top of
-`▓` or `█` and hide it. The grid's job is to show you what the house has
-actually planned; the bot's opinion is strictly the layer underneath.
+have to act on. A question mark rather than a shade, because it is literally the
+one cell state on the grid that is a question and not a fact. It appears only
+where a slot is otherwise **free**: a real booking, yours or anyone else's,
+always wins, so a guess can never sit on top of `▒`, `║` or `█` and hide it. The
+grid's job is to show you what the house has actually planned; the bot's opinion
+is strictly the layer underneath.
 
 > **Your guesses are yours alone.** Nobody else ever sees them — not on their
-> grid, not on the pinned board (which has no viewer and therefore no `░` at
+> grid, not on the pinned board (which has no viewer and therefore no `?` at
 > all), not in the channel, not in a DM to anyone. This is a stricter rule than
 > the one covering bookings, and deliberately so: a booking is something you
 > chose to put on a shared board, while a guess is the bot telling other people
@@ -434,7 +485,7 @@ when *all three* of these hold: at least **3 loads** in that same slot, that slo
 is at least **30%** of your loads, and there are at least **4 weeks** of history
 for you. Miss one and you get nothing — not a hedged "maybe Thursdays?", which is
 the sort of thing you stop believing after reading it once. For the first few
-weeks after switching this on, **no `░` anywhere is the correct behaviour.**
+weeks after switching this on, **no `?` anywhere is the correct behaviour.**
 
 #### Arguing with it
 
@@ -455,7 +506,7 @@ I think you wash Thursday evenings — 5 of your last 8 loads.
   forever: the only thing that brings it back is you actually washing then
   again. Being told "no" and then arguing from the same loads would be the model
   learning from itself with extra steps.
-- **🚫 Stop guessing** — no more `░` for you, ever, and no guessing done on your
+- **🚫 Stop guessing** — no more `?` for you, ever, and no guessing done on your
   behalf. It is also the permanent opt-out from the reminder DMs below, and the
   same switch **🔕 Stop asking** flips when you tap it on one of them. Tapping it
   again (**🔮 Start guessing**) puts it back; the loads already noted are still
@@ -470,7 +521,7 @@ Three independent switches, any of which stops it:
 
 | Switch | Where | Effect |
 |--------|-------|--------|
-| **Learn the days each person washes** | integration options | The house-wide master. **Off by default.** Nothing is logged for anybody and no `░` is drawn. |
+| **Learn the days each person washes** | integration options | The house-wide master. **Off by default.** Nothing is logged for anybody and no `?` is drawn. |
 | **👁 Monitoring** | 🤖 panel, per person | Your loads are never written to history at all — not written and then filtered, simply not written. Also stops any guessing about you, so switching it off makes the existing history stop being read too (it isn't deleted; a toggle you flipped to see what it does shouldn't destroy three months of data). |
 | **🔮 Stop guessing** | 🔮 panel, per person | Keeps logging, stops guessing — and stops the reminder DMs, since there is nothing left to remind you about. Same switch as **🔕 Stop asking** on a DM. |
 
@@ -491,7 +542,7 @@ a user id and a slot; there is nowhere in it to put a name.
 > _Send reminder DMs_**. Off means off: with it off, nothing here is scheduled,
 > nothing is evaluated and nothing is sent.
 
-It ships with the guesses deliberately behind it, so `░` was correctable for a
+It ships with the guesses deliberately behind it, so `?` was correctable for a
 while *before* anything reached a phone. Two messages, both DMs, both with an
 opt-out button on them.
 
@@ -509,7 +560,7 @@ Look right?
   a confirmation isn't evidence, and the loads behind the guess are already
   counted).
 - **📅 Change** — opens your week grid, right there in the DM.
-- **🔕 Stop asking** — permanent. No check-in, no day-of nudge, no `░`. **🔮 Start
+- **🔕 Stop asking** — permanent. No check-in, no day-of nudge, no `?`. **🔮 Start
   guessing** in the panel is the way back if you change your mind.
 
 **If the bot isn't confident about your days, you get no check-in at all** — not
@@ -602,10 +653,10 @@ books you in alongside them. This is the other option: **ask.**
 ```
 📅 The week
       Mo Tu We Th Fr Sa Su
-AM     ·  ·  ▓  ·  ·  ▓  ·
-Mid    ·  ·  ·  ▓  ·  ·  ·
-PM     ▓  ·  ·  ▓  ·  ·  ▓
-Eve    ·  █  ·  █  ·  ▓  ·
+AM     ·  ·  ▒  ·  ·  ║  ·
+Mid    ·  ·  ·  ▒  ·  ·  ·
+PM     ▒  ·  ·  ║  ·  ·  ▒
+Eve    ·  █  ·  █  ·  ▒  ·
 
 🔁 Thursday Eve
 That one's spoken for. Want me to ask? You're down for it either way —
@@ -772,7 +823,7 @@ Collected in the UI config flow (options can be changed later without re-adding)
 | Handoff backstop *(options)* | `25` min | Ping whoever's next this long after a load finishes if the claimant never tapped **✅ Emptied it**. `0` disables the backstop — the tap still works. |
 | "I'm next" expiry *(options)* | `12` h | How long a 🔜 tap stays in the line before it ages out. |
 | Show the 🤖 assistant button *(options)* | `true` | Puts the 🤖 button on the card. It's inert until tapped — no pings, no channel lines, nothing stored — and it's the only place a newcomer finds out what the other buttons do. Turning it off hides the button; anything already chosen in the panel keeps working. |
-| Learn the days each person washes *(options)* | `false` | The habit model: logs each 🧺 Claim and draws `░` on that person's own grid. See [The 🔮 day guesses](#the--day-guesses-). |
+| Learn the days each person washes *(options)* | `false` | The habit model: logs each 🧺 Claim and draws `?` on that person's own grid. See [The 🔮 day guesses](#the--day-guesses-). |
 | **Send reminder DMs** *(options)* | `false` | **The only setting that lets the bot decide on its own to message somebody who didn't tap anything first.** Needs day-learning on as well, and only ever DMs a person who chose **📬 DM me** in 🤖. Max 1 DM per person per day, 2 per week. See [The reminder DMs](#the-reminder-dms-the-one-thing-here-that-messages-you-first). |
 | Weekly plan DM — day / time *(options)* | Sunday, `18:00` | When the weekly check-in goes out. Ignored while reminder DMs are off. |
 | Day-of nudge backstop *(options)* | `60` min | How long before the **end of somebody's slot** to nudge them if the washer never came free during it. The nudge normally fires the moment the washer is actually free inside their slot; whichever happens first wins and only one is ever sent. |
@@ -874,7 +925,7 @@ different library. If HA ever reports a dependency clash, adjust the pin in
   lived with the ephemeral grid for a week.
 - ~~A model of the days each person usually washes.~~ **Shipped** as the first
   half of Phase 4 — 🔮 above: history from Claim taps, confidence-gated guesses
-  drawn as `░` on your own grid, and the corrections that train it.
+  drawn as `?` on your own grid, and the corrections that train it.
 - ~~The DM reminders those guesses are *for*.~~ **Shipped** as the second half of
   Phase 4 — 📬 above: a weekly check-in, and a day-of nudge that fires on the
   washer actually coming free rather than on a clock, under a hard budget of 1 DM

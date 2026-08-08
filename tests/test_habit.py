@@ -1081,11 +1081,11 @@ def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> Non
 
 
 def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
-    """P4: a ░ nobody can argue with is not a correctable guess.
+    """P4: a ? nobody can argue with is not a correctable guess.
 
     ``predictions`` can return up to three cells — at 30% a piece there is room
     for exactly that — but the 🔮 panel renders ``predict`` (the top one) and
-    ❌ Wrong retires ``predict``. Drawing all three would put ░ on cells the
+    ❌ Wrong retires ``predict``. Drawing all three would put ? on cells the
     panel cannot mention, and tapping Wrong about one of them would silently
     discard a different guess. This is ``assistant._predicted_cells``.
     """
@@ -1114,7 +1114,7 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
         return guess["cell"] if guess else None
 
     # Every cell drawn is one the panel names, so ❌ Wrong always acts on the
-    # ░ the person is actually looking at.
+    # the ? the person is actually looking at.
     assert rendered([]) == [panel([])] == [THU_EVE]
     # ...and it keeps holding as guesses are retired one at a time: the next
     # one down becomes both the drawn cell and the named one, together.

@@ -772,7 +772,8 @@ def test_the_swap_leaves_everybody_else_where_they_were() -> None:
     overrides = {WEEK: {WANT: [HOLDER, THIRD], OFFER: [ASKER], OTHER: [THIRD]}}
     swapped = apply_swap(prefs, overrides, _request(STATE_ACCEPTED))
     week = _plan.effective_week(prefs, swapped, WEEK)
-    assert week[WANT] == [THIRD, ASKER]
+    # Order matters as much as membership: the third party keeps their place.
+    assert _plan.holders(week, WANT) == [THIRD, ASKER]
     assert _plan.holders(week, OFFER) == [HOLDER]
     assert _plan.holders(week, OTHER) == [THIRD]
 

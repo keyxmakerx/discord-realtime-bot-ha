@@ -12,5 +12,5 @@
   "requirements": [
     "discord.py==2.7.1"
   ],
-  "version": "0.23.0"
+  "version": "0.24.0"
 }

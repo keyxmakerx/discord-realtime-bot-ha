@@ -179,7 +179,7 @@ class _PlanStopButton(_ReminderButton):
     """🔕 Stop asking — permanent, and never re-prompted.
 
     Sets the person's ``predict`` preference off, which :func:`nudge.eligible`
-    refuses outright: no Sunday DM, no day-of nudge, and no ░ on their grid
+    refuses outright: no Sunday DM, no day-of nudge, and no ? on their grid
     either. The 🔮 panel's own button is the way back, so this is an opt-out
     rather than a one-way door (P7).
     """

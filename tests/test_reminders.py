@@ -565,7 +565,7 @@ def test_push_to_tomorrow_is_where_the_nudge_moves_to() -> None:
 
 def test_nothing_is_sent_about_a_guess_the_person_cannot_argue_with() -> None:
     # 🔕 Stop asking sets `predict` off, and that is the permanent opt-out from
-    # this whole feature: no Sunday DM, no day-of nudge, and no ░ on the grid
+    # this whole feature: no Sunday DM, no day-of nudge, and no ? on the grid
     # either. It must hold even when a prediction is handed straight in.
     off = _person(predict=False)
     assert plan_dm(off, {}, "1", _guess(), THU) == REASON_PREDICT_OFF

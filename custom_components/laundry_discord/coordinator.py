@@ -97,11 +97,15 @@ from .discord_bot import ClaimView, DiscordBot, view_for
 
 _LOGGER = logging.getLogger(__name__)
 
-# Colors per stage.
+# Colors per stage. One colour, one meaning: grey used to serve **both**
+# "somebody has claimed this load" and "nothing is happening", which are the two
+# states a glance at the channel most needs to tell apart — a claimed load is
+# waiting on a person, an idle card is waiting on nobody. They are split here.
 _COLOR_WASHING = 0x3498DB
 _COLOR_DRYING = 0xE67E22
 _COLOR_DONE = 0x2ECC71
-_COLOR_CLAIMED = 0x95A5A6
+_COLOR_CLAIMED = 0xF1C40F  # amber — this load has an owner and they're not done
+_COLOR_IDLE = 0x95A5A6  # grey — nothing running, nobody waited on
 _COLOR_TEST = 0x9B59B6
 _COLOR_SELFCLEAN = 0x1ABC9C
 
@@ -1602,7 +1606,7 @@ class LaundryCoordinator:
                                 "This card was closed by hand — I'm not tracking "
                                 "a load right now. The next one posts a new card."
                             ),
-                            color=_COLOR_CLAIMED,
+                            color=_COLOR_IDLE,
                         ),
                         view=None,
                     )
@@ -1829,7 +1833,10 @@ class LaundryCoordinator:
                         "rather than finishing.\nThe washer's free — whatever's "
                         "in the drum still needs moving."
                     ),
-                    color=_COLOR_CLAIMED,
+                    # Grey rather than amber: the machine is idle and the bot is
+                    # not waiting on anybody. It deliberately does not borrow the
+                    # green of a finished load — this cycle did not finish.
+                    color=_COLOR_IDLE,
                 )
             elif self.claimed_by and self.claimed_by != UNCLAIMED:
                 embed = discord.Embed(
@@ -1865,7 +1872,7 @@ class LaundryCoordinator:
                 )
         else:
             embed = discord.Embed(
-                title="Laundry", description="Idle.", color=_COLOR_CLAIMED
+                title="Laundry", description="Idle.", color=_COLOR_IDLE
             )
 
         embed.set_footer(text=_FOOTER)

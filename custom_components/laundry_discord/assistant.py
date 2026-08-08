@@ -97,7 +97,17 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-_COLOR_PANEL = 0x5865F2  # Discord blurple — reads as "this is the bot talking"
+# One colour per panel. All five of these used to be blurple, which meant the
+# stripe down the left of an ephemeral message carried no information at all:
+# grid, ask-to-swap, welcome, settings and guess were indistinguishable at a
+# glance, and these panels *replace each other in place*, so the stripe is the
+# only thing that doesn't move between one and the next. Discord's own brand
+# palette, so they still read as one bot rather than five.
+_COLOR_PANEL = 0x5865F2  # blurple — 🤖 the hub everything comes back to
+_COLOR_WELCOME = 0xFEE75C  # yellow — 👋 the one panel you see exactly once
+_COLOR_GRID = 0x57F287  # green — 📅 the week
+_COLOR_TRADE = 0xEB459E  # fuchsia — 🔁 the only panel that messages a person
+_COLOR_GUESS = 0xC77DFF  # violet — 🔮 the model's opinion, not a fact
 
 # The §10.5 explainer, shown once at the top of the panel after a refused DM.
 # Both settings are listed because either one can be the culprit and neither is
@@ -410,23 +420,54 @@ class _GridDaySelect(discord.ui.Select):
             await self.assistant.async_report_error(interaction)
 
 
+# Which button style carries which cell state. The button row sits directly
+# under the grid and until now said far less than it: it was binary — green for
+# yours, grey for *everything else* — so free, taken and guessed were one
+# appearance while the block above distinguished all three. Somebody reading the
+# buttons rather than the grid could not see they were about to book themselves
+# into a slot two other people already wanted.
+#
+# discord.py offers four styles and there are six states, so the mapping is not
+# one to one and the two collisions are chosen rather than accidental:
+#
+# * **danger** — somebody else has this. One style for ▒ and ║ both, because
+#   red already carries the fact that matters at the moment of tapping ("this
+#   is contended"); *how often* they have it is what decides whether to ask for
+#   a swap, and that is a decision you make reading the grid, not the row.
+#   Red is not a veto — the button stays enabled, see below — it is the only
+#   style left that reads as "not free", and this codebase had not used it.
+# * **primary** — the model's guess. Blurple is the "suggested" accent, which
+#   is exactly what a guess is.
+# * **success** — yours. Unchanged.
+# * **secondary** — free. Unchanged.
+#
+# ``*`` running has no style of its own: nothing produces it yet (Phase 4), and
+# it falls back to secondary until something does.
+_SLOT_BUTTON_STYLES = {
+    plan_mod.STATE_MINE: discord.ButtonStyle.success,
+    plan_mod.STATE_TAKEN: discord.ButtonStyle.danger,
+    plan_mod.STATE_TAKEN_EVERY_WEEK: discord.ButtonStyle.danger,
+    plan_mod.STATE_EXPECTED: discord.ButtonStyle.primary,
+}
+
+
 class _GridSlotButton(discord.ui.Button):
     """Book or free one slot on the selected day.
 
-    Green when it's yours, grey otherwise. It is deliberately **not** disabled
-    when somebody else holds the cell: the plan is information, not permission
-    (§8), so two people can want the same slot and the grid's job is to make
-    that visible rather than to arbitrate it.
+    Styled to say the same thing the cell above it says (see
+    :data:`_SLOT_BUTTON_STYLES`). It is deliberately **not** disabled when
+    somebody else holds the cell: the plan is information, not permission (§8),
+    so two people can want the same slot and the grid's job is to make that
+    visible rather than to arbitrate it. Red here means "somebody's already down
+    for this", not "you may not".
     """
 
     def __init__(
-        self, assistant: "LaundryAssistant", slot: str, *, mine: bool
+        self, assistant: "LaundryAssistant", slot: str, *, state: str
     ) -> None:
         super().__init__(
             label=plan_mod.slot_label(slot),
-            style=(
-                discord.ButtonStyle.success if mine else discord.ButtonStyle.secondary
-            ),
+            style=_SLOT_BUTTON_STYLES.get(state, discord.ButtonStyle.secondary),
             custom_id=GRID_SLOT_CUSTOM_IDS[slot],
             row=1,
         )
@@ -503,6 +544,11 @@ class GridView(discord.ui.View):
     doesn't error, it silently stops dispatching, and this integration has
     already been bitten by that. That is why 🔁 is added for the template even
     though a template has no tapped cell to ask about.
+
+    ``expected`` and ``running`` are passed straight through to
+    :func:`plan.cell_state` so a button and the cell above it can never disagree
+    about what state that cell is in — one question, asked once, answered in the
+    module that owns the precedence rule.
     """
 
     def __init__(
@@ -513,17 +559,19 @@ class GridView(discord.ui.View):
         day: int = 0,
         viewer_id=None,
         ask: bool = False,
+        expected=None,
+        running=None,
     ) -> None:
         super().__init__(timeout=None)
         self.add_item(_GridDaySelect(assistant, day))
         for slot in plan_mod.SLOTS:
             cell = plan_mod.cell_key(day, slot)
-            mine = bool(
-                occupancy is not None
-                and cell is not None
-                and plan_mod.is_mine(occupancy, cell, viewer_id)
+            state = (
+                plan_mod.cell_state(occupancy, cell, viewer_id, expected, running)
+                if occupancy is not None and cell is not None
+                else plan_mod.STATE_FREE
             )
-            self.add_item(_GridSlotButton(assistant, slot, mine=mine))
+            self.add_item(_GridSlotButton(assistant, slot, state=state))
         self.add_item(_GridBackButton(assistant))
         if ask or occupancy is None:
             self.add_item(_TradeAskButton(assistant))
@@ -877,7 +925,7 @@ class LaundryAssistant:
     def learn_habits(self) -> bool:
         """Whether the house has day-learning switched on at all.
 
-        The outer of the two gates on every history write and every ``░``; the
+        The outer of the two gates on every history write and every ``?``; the
         inner one is the person's own 👁 Monitoring consent. Off by default
         (§14 rule 7), and off means nothing is written *and* nothing is drawn.
         """
@@ -1050,7 +1098,7 @@ class LaundryAssistant:
 
         Both gates again, plus the person's ``predict`` preference. Monitoring
         is included on the *read* side deliberately: turning it off stops new
-        rows, but rows already stored would otherwise keep producing ``░`` for
+        rows, but rows already stored would otherwise keep producing ``?`` for
         somebody who just said stop watching me. Nothing is deleted — a toggle
         somebody flips to see what it does must not destroy three months of
         history — it simply stops being read.
@@ -1069,7 +1117,7 @@ class LaundryAssistant:
         )
 
     def _predicted_cells(self, user_id) -> list[str]:
-        """The cells to draw as ``░`` — **only ever the viewer's own** (§11).
+        """The cells to draw as ``?`` — **only ever the viewer's own** (§11).
 
         Every read in :mod:`habit` is scoped to one id, and the only id this is
         ever called with is ``interaction.user.id``: the person looking at the
@@ -1079,9 +1127,9 @@ class LaundryAssistant:
         Deliberately the **top** guess alone, not every cell that clears the
         gate. :func:`habit.predictions` can return up to three (4/3/3 of ten
         loads all pass at 30%), but the 🔮 panel names exactly one and ❌ Wrong
-        retires exactly that one. Drawing the other two would put a ``░`` on
+        retires exactly that one. Drawing the other two would put a ``?`` on
         the grid that the only button for arguing with it cannot even mention,
-        let alone remove — and tapping Wrong about the Monday ``░`` would
+        let alone remove — and tapping Wrong about the Monday ``?`` would
         silently discard the Thursday guess instead. P4 says the guesses are
         visible *and correctable*; until the panel grows the doc's "📅 Wrong —
         pick" step (§7.3), what is rendered is held to what can be corrected.
@@ -1543,8 +1591,9 @@ class LaundryAssistant:
         week = self._current_week()
         occupancy = plan_mod.effective_week(self._people, self._overrides, week)
         ask_cell = self._ask_cell.get(str(user_id))
+        expected = self._predicted_cells(user_id)
         embed = self._grid_embed(
-            occupancy, user_id, day, ask_cell=ask_cell, note=note
+            occupancy, user_id, day, expected=expected, ask_cell=ask_cell, note=note
         )
         view = GridView(
             self,
@@ -1552,6 +1601,7 @@ class LaundryAssistant:
             day=day,
             viewer_id=user_id,
             ask=ask_cell is not None,
+            expected=expected,
         )
         await self._async_respond(interaction, embed, view, edit=edit)
 
@@ -1561,6 +1611,7 @@ class LaundryAssistant:
         user_id,
         day: int,
         *,
+        expected=None,
         ask_cell: str | None = None,
         note: str | None = None,
     ) -> discord.Embed:
@@ -1573,24 +1624,26 @@ class LaundryAssistant:
         display depends on.
 
         ``expected`` is this viewer's own predicted cells and nobody else's.
-        The legend and the explainer both key off whether a ``░`` is *actually
-        on the block* rather than off whether a prediction exists, because
-        those differ: a guess whose cells have all been booked by somebody else
-        loses to those bookings and renders nothing. Asking the rendered string
-        is the one test that cannot drift from the renderer.
+        The legend and the explainer both key off whether a ``?`` is *actually
+        on the block* rather than off whether a prediction exists, because those
+        differ: a guess whose cells have all been booked by somebody else loses
+        to those bookings and renders nothing. That answer now comes back from
+        :func:`plan.render_week` alongside the grid. It used to be read out of
+        the rendered string — ``CELL_EXPECTED in grid`` — which was fragile in a
+        way that only looked harmless while the glyph was ``░``: the moment the
+        guess became ``?``, any question mark anywhere in the block would have
+        lit up an explainer for a guess nobody had made.
         """
-        expected = self._predicted_cells(user_id)
-        grid = plan_mod.render_grid(occupancy, viewer_id=user_id, expected=expected)
-        guessed = plan_mod.CELL_EXPECTED in grid
+        drawn = plan_mod.render_week(occupancy, viewer_id=user_id, expected=expected)
         embed = discord.Embed(
             title="📅 The week",
             description=(
                 (f"{note}\n\n" if note else "")
-                + f"```\n{grid}\n```\n"
-                + plan_mod.render_legend(expected=guessed)
+                + f"```\n{drawn.grid}\n```\n"
+                + drawn.legend
                 + f"\n-# {plan_mod.render_windows()}"
             ),
-            color=_COLOR_PANEL,
+            color=_COLOR_GRID,
         )
         mine = plan_mod.describe_cells(occupancy, user_id)
         embed.add_field(
@@ -1598,9 +1651,25 @@ class LaundryAssistant:
             value=mine or "nothing booked — tap a slot below",
             inline=False,
         )
-        if guessed:
+        if drawn.standing:
+            # Only when a ║ is actually on the block, same rule as the guess
+            # below: a note explaining a character nobody can see is noise.
             embed.add_field(
-                name="░ My guess at your usual days",
+                name=(
+                    f"{plan_mod.CELL_TAKEN_EVERY_WEEK} Somebody's down for that "
+                    "every week"
+                ),
+                value=(
+                    "A standing slot rather than a one-off, so it's the least "
+                    "likely thing on the grid to move — worth knowing before "
+                    "you ask. Still no name and no count: only that the cell is "
+                    "spoken for, and how often."
+                ),
+                inline=False,
+            )
+        if drawn.guessed:
+            embed.add_field(
+                name=f"{plan_mod.CELL_EXPECTED} My guess at your usual days",
                 value=(
                     "Worked out from your own loads, shown **only to you**, and "
                     "never on a cell somebody has actually booked. Tap 🔮 on the "
@@ -1952,7 +2021,7 @@ class LaundryAssistant:
                 (f"{note}\n\n" if note else "")
                 + (trade_mod.ask_panel_text(want, offer) or trade_mod.ASK_PROMPT)
             ),
-            color=_COLOR_PANEL,
+            color=_COLOR_TRADE,
         )
         preview = trade_mod.request_dm_text(want, offer)
         if preview:
@@ -2163,7 +2232,7 @@ class LaundryAssistant:
                 "**How should I reach you** when something's actually for you — "
                 "your load finishing, or the washer coming free?"
             ),
-            color=_COLOR_PANEL,
+            color=_COLOR_WELCOME,
         )
         embed.set_footer(text="You can change this any time from 🤖.")
         return embed
@@ -2212,8 +2281,9 @@ class LaundryAssistant:
             embed.add_field(
                 name="Guessing",
                 value=(
-                    "🔮 on — I'll mark the days I think you usually wash as ░ on "
-                    "**your** week, and nowhere else"
+                    "🔮 on — I'll mark the days I think you usually wash with "
+                    f"{plan_mod.CELL_EXPECTED} on **your** week, and nowhere "
+                    "else"
                     if person["predict"]
                     else "🚫 off — I won't guess your days"
                 ),
@@ -2239,7 +2309,7 @@ class LaundryAssistant:
         said out loud, so the DM this becomes in the next phase can't drift
         from the panel.
         """
-        embed = discord.Embed(title="🔮 What I think", color=_COLOR_PANEL)
+        embed = discord.Embed(title="🔮 What I think", color=_COLOR_GUESS)
         if prediction is not None:
             where = habit_mod.describe_prediction(prediction)
             why = habit_mod.explain(prediction)
@@ -2263,9 +2333,9 @@ class LaundryAssistant:
             )
         elif not person["predict"]:
             body = (
-                "Guessing is off — no ░ on your week, and I won't work out "
-                "your days. **Start guessing** puts it back; the loads I "
-                "already noted are still there."
+                f"Guessing is off — no {plan_mod.CELL_EXPECTED} on your week, "
+                "and I won't work out your days. **Start guessing** puts it "
+                "back; the loads I already noted are still there."
             )
         else:
             body = self._thin_data_text(user_id)

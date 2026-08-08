@@ -721,7 +721,7 @@ def predict(history, user_id, moment, corrections=None) -> dict | None:
     """This person's one predicted slot, or **None** — the common answer.
 
     None is not a failure and must not be rendered as a hedge: no prediction
-    means no ``░``, no Sunday sentence and no nudge (P6). The person's
+    means no ``?``, no Sunday sentence and no nudge (P6). The person's
     ``predict`` preference is deliberately not consulted here — this is
     arithmetic about their own history, and whether to *act* on it is the
     panel's call (unlike ``monitor``, which has to be enforced at the write or
@@ -732,7 +732,7 @@ def predict(history, user_id, moment, corrections=None) -> dict | None:
 
 
 def predicted_cells(history, user_id, moment, corrections=None) -> list[str]:
-    """Just the cell keys — what a grid would draw as ``░`` for this viewer.
+    """Just the cell keys — what a grid would draw as ``?`` for this viewer.
 
     Only ever this person's own, so a rendered grid still shows nothing about
     anybody else (P5).

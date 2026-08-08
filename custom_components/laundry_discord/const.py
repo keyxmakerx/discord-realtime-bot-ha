@@ -110,7 +110,7 @@ MAX_QUEUE_EXPIRY = 72
 # do. Turning it off hides the button entirely — existing prefs are kept.
 DEFAULT_SHOW_ASSISTANT = True
 # Whether the habit model runs at all: logging a Claim tap to history, and
-# drawing ░ on somebody's own week where it thinks they usually wash.
+# drawing ? on somebody's own week where it thinks they usually wash.
 #
 # **Default off**, per design doc §14 rule 7 — every new behaviour is behind an
 # option and starts off, so anything misbehaving is one toggle away from gone.

@@ -314,7 +314,7 @@ def current_cell(booked, prediction, moment) -> str | None:
     somebody down for both Saturday morning and Saturday night gets the right
     one of the two rather than whichever sorted first.
 
-    Two sources, in the same precedence :func:`plan.cell_char` draws them in:
+    Two sources, in the same precedence :func:`plan.cell_state` draws them in:
 
     1. **A booking** — they tapped a slot on their own week. A fact, and how ⏭
        "push to tomorrow" moves a nudge: the push books tomorrow's slot, so
