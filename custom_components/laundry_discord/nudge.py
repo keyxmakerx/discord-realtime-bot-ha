@@ -19,6 +19,12 @@ across an HA callback where a stray ``return`` is invisible:
   get nothing (design doc P1).
 * **Every preference gates independently**, and each has its own reason string,
   so "why was nothing sent" is answerable without a log line per evaluation.
+* **Two of those gates have to know which message it is.** The 🔔 per-kind
+  switches and the quiet window are facts about *this message*, not about the
+  person, so :func:`eligible` applies them only when it is handed a kind — and
+  :func:`select` cannot hand it one until it has chosen between the heads-up and
+  the opportunity. Every caller that predates them, the reminder loop's own
+  cheap pre-filter included, keeps exactly the answer it always had.
 * **The budget is claimed, never merely checked** (P2). :func:`claim_plan_dm`
   and :func:`claim_select` return the *new* accounting alongside the verdict,
   exactly as :func:`habit.claim_nudge_for` does and for the same reason: two
@@ -74,6 +80,8 @@ REASON_DM_CLOSED = "dm_closed"  # a previous DM bounced (50007)
 REASON_PREDICT_OFF = "predict_off"  # 🔕 Stop asking / 🚫 Stop guessing
 REASON_MONITOR_OFF = "monitor_off"  # 👁 off — we aren't watching them at all
 REASON_PAUSED = "paused"  # ⏸, or ⏭ Skip this week
+REASON_KIND_OFF = "kind_off"  # 🔔 this *kind* of message is switched off
+REASON_QUIET = "quiet"  # inside their overnight quiet window
 REASON_NO_PREDICTION = "no_prediction"  # P6: thin data says nothing
 REASON_NOTHING_TODAY = "nothing_today"  # not their day
 REASON_OUTSIDE_SLOT = "outside_slot"  # their day, wrong part of it
@@ -94,6 +102,8 @@ REASONS = (
     REASON_PREDICT_OFF,
     REASON_MONITOR_OFF,
     REASON_PAUSED,
+    REASON_KIND_OFF,
+    REASON_QUIET,
     REASON_NO_PREDICTION,
     REASON_NOTHING_TODAY,
     REASON_OUTSIDE_SLOT,
@@ -226,7 +236,41 @@ def is_paused(person, moment) -> bool:
     return now is None or now < until
 
 
-def eligible(people_map, user_id, moment) -> str:
+def in_quiet_hours(person, moment) -> bool:
+    """Whether ``moment`` falls inside this person's overnight quiet window.
+
+    **The window wraps midnight**, and that is the one bit of arithmetic in this
+    file worth its own test. ``22 -> 8`` is not an interval on the number line,
+    it is two arcs of a clock face: everything from 22:00 to the end of the day
+    *and* everything from midnight to 08:00. So the containment test flips
+    depending on which end is larger, and getting it backwards would silence
+    somebody all day and message them all night — the exact inverse of what they
+    asked for, which is a bug that reads as malice.
+
+    Read through :func:`people.quiet_hours`, so "they have no window", "they have
+    half a window" and "both ends are the same hour" are decided in one place
+    rather than here as well (the way :func:`is_paused` is the one definition of
+    paused for this module and :mod:`trade` alike).
+
+    An unreadable moment counts as quiet, and only ever for somebody who *set* a
+    window: :func:`is_paused` takes the same direction for the same reason — if
+    we cannot tell what time it is, the safe answer about a message somebody
+    asked us to hold is to hold it. Nobody without a window is affected, so one
+    bad datetime cannot silence the house.
+    """
+    window = people.quiet_hours(person)
+    if window is None:
+        return False
+    hour = getattr(moment, "hour", None)
+    if _ts(moment) is None or not isinstance(hour, int) or isinstance(hour, bool):
+        return True
+    start, end = window
+    if start > end:
+        return hour >= start or hour < end
+    return start <= hour < end
+
+
+def eligible(people_map, user_id, moment, kind=None) -> str:
     """Whether this person may be sent a reminder DM at all.
 
     Returns :data:`REASON_OK` or the **first** gate that said no. Order is
@@ -248,6 +292,13 @@ def eligible(people_map, user_id, moment) -> str:
     * **👁 Monitoring off** — the bot isn't watching them, so it has nothing
       honest to say about their days.
     * **⏸ Paused / ⏭ Skip this week** — quiet until the timestamp passes.
+
+    ``kind`` is one of :data:`people.KINDS`, and passing one adds the two gates
+    that can only be answered once you know *which* message this is: the 🔔
+    switch for that kind, and their quiet hours. Leaving it out asks the older,
+    broader question — "may this person be messaged at all" — and gets exactly
+    the answer it always did, which is what lets the reminder loop keep using
+    this as a cheap pre-filter before it knows what it would say.
     """
     if _ts(moment) is None:
         return REASON_MOMENT
@@ -269,6 +320,16 @@ def eligible(people_map, user_id, moment) -> str:
         return REASON_MONITOR_OFF
     if is_paused(person, moment):
         return REASON_PAUSED
+    # Everything above is a fact about the person; everything below depends on
+    # which message is being weighed. A caller that names no kind is asking the
+    # question this function has always answered, so it gets the old answer
+    # untouched — no existing caller can start suppressing anything by upgrading.
+    if kind is None:
+        return REASON_OK
+    if not people.wants_kind(person, kind):
+        return REASON_KIND_OFF
+    if in_quiet_hours(person, moment):
+        return REASON_QUIET
     return REASON_OK
 
 
@@ -393,8 +454,14 @@ HEADS_UP_LEAD_MINUTES = 60
 # the whole point of routing them through one decision is that four independent
 # triggers cannot race each other into four DMs.
 MSG_NONE = "none"
-MSG_SLOT = "slot"  # you booked this, it starts within the hour
-MSG_OPPORTUNITY = "opportunity"  # you're overdue and your usual slot is clear
+# Taken from :data:`people.KINDS` rather than spelled again, because a message
+# kind and the switch that governs it are one thing named twice: ⏰ Slot heads-up
+# *is* the setting for MSG_SLOT. Sharing the string means :func:`select` can hand
+# the kind it just worked out straight to :func:`eligible` with no lookup table
+# in between — and a table between two constants is a table that can fall out of
+# step, which here would silently gate the wrong message.
+MSG_SLOT = people.KIND_SLOT  # you booked this, it starts within the hour
+MSG_OPPORTUNITY = people.KIND_OPPORTUNITY  # you're overdue and your slot is clear
 MESSAGES = (MSG_NONE, MSG_SLOT, MSG_OPPORTUNITY)
 
 
@@ -541,6 +608,9 @@ def select(
     - the machine is busy (nothing useful to say about a slot you can't use)
     - they already washed today, or the caller knows the load that just finished
       was theirs
+    - they switched this *kind* of message off, or it would land inside their
+      quiet hours — both of which can only be asked once the branch below has
+      chosen which message this would be
     - they have already heard from the bot today (the 1/day budget, but checked
       as a rule rather than as an accident of the number)
 
@@ -570,6 +640,20 @@ def select(
         kind = MSG_OPPORTUNITY
     if cell is None:
         return (MSG_NONE, None, REASON_NO_PREDICTION)
+    # The 🔔 gate goes **here**, not in the call at the top, because until this
+    # point there was no kind to gate on. ⏰ and 💡 are separate switches, and
+    # asking about them before the branch above would have to ask about both —
+    # which is precisely how somebody who switched the heads-up off would stop
+    # getting the opportunity they left on.
+    #
+    # A heads-up refused here deliberately does *not* fall through to the
+    # opportunity, even when one is available. These settings may only ever
+    # subtract: handing somebody a differently-worded message about the same
+    # evening because they switched the first one off is routing around the tap
+    # they just made.
+    verdict = eligible(people_map, user_id, moment, kind=kind)
+    if verdict != REASON_OK:
+        return (MSG_NONE, None, verdict)
     if already_nudged_in_slot(budgets, user_id, cell, moment, lead_minutes):
         return (MSG_NONE, None, REASON_ALREADY)
     spend = _budget_verdict(budgets, user_id, moment)
@@ -599,8 +683,13 @@ def plan_dm(people_map, budgets, user_id, prediction, moment) -> str:
     **No confident prediction means no DM at all** (P6). The alternative — "I
     don't know your days yet" — is a push notification whose entire content is
     that the bot has nothing to say, and the first month is nothing but those.
+
+    The kind is known before anything else here — there is only one message this
+    function can produce — so 📅 and the quiet window are checked in the first
+    call rather than after the prediction, and somebody who has switched the
+    check-in off costs the loop no history scan at all.
     """
-    verdict = eligible(people_map, user_id, moment)
+    verdict = eligible(people_map, user_id, moment, kind=people.KIND_CHECKIN)
     if verdict != REASON_OK:
         return verdict
     if not isinstance(prediction, dict) or not plan.normalise_cell(

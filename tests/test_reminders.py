@@ -61,6 +61,7 @@ REASON_ALREADY = _nudge.REASON_ALREADY
 REASON_BUDGET_DAY = _nudge.REASON_BUDGET_DAY
 REASON_BUDGET_WEEK = _nudge.REASON_BUDGET_WEEK
 REASON_DM_CLOSED = _nudge.REASON_DM_CLOSED
+REASON_KIND_OFF = _nudge.REASON_KIND_OFF
 REASON_MOMENT = _nudge.REASON_MOMENT
 REASON_MONITOR_OFF = _nudge.REASON_MONITOR_OFF
 REASON_NOTHING_TODAY = _nudge.REASON_NOTHING_TODAY
@@ -71,6 +72,7 @@ REASON_OK = _nudge.REASON_OK
 REASON_OUTSIDE_SLOT = _nudge.REASON_OUTSIDE_SLOT
 REASON_PAUSED = _nudge.REASON_PAUSED
 REASON_PREDICT_OFF = _nudge.REASON_PREDICT_OFF
+REASON_QUIET = _nudge.REASON_QUIET
 REASON_REMINDERS_OFF = _nudge.REASON_REMINDERS_OFF
 REASON_WASHER_BUSY = _nudge.REASON_WASHER_BUSY
 BUDGET_REASONS = _nudge.BUDGET_REASONS
@@ -83,6 +85,7 @@ claim_select = _nudge.claim_select
 eligible = _nudge.eligible
 heads_up_clock = _nudge.heads_up_clock
 heads_up_text = _nudge.heads_up_text
+in_quiet_hours = _nudge.in_quiet_hours
 is_booked = _nudge.is_booked
 is_paused = _nudge.is_paused
 opportunity_cell = _nudge.opportunity_cell
@@ -94,6 +97,11 @@ select = _nudge.select
 slot_ended = _nudge.slot_ended
 slot_soon = _nudge.slot_soon
 slot_start_ts = _nudge.slot_start_ts
+
+KIND_CHECKIN = _people.KIND_CHECKIN
+KIND_OPPORTUNITY = _people.KIND_OPPORTUNITY
+KIND_SLOT = _people.KIND_SLOT
+KIND_TRADES = _people.KIND_TRADES
 
 THU_EVE = "3-eve"
 
@@ -206,6 +214,141 @@ def test_a_pause_expires_on_its_own() -> None:
     assert is_paused(person, THU) is True
     assert is_paused(person, at(2026, 8, 7, 20, 30)) is False
     assert is_paused(_people.get_person(_person(), "1"), THU) is False
+
+
+# --- 🔔 which kinds, and when (per-person DM settings) -----------------------
+
+
+def test_naming_no_kind_asks_the_older_broader_question() -> None:
+    # Every caller written before these settings — including the reminder
+    # loop's own cheap pre-filter, which runs before it knows what it would
+    # even say — passes no kind, and must get the answer it always got. If a
+    # kind switch or a quiet window could bite here, an upgrade would silence
+    # people through a call that never mentioned either.
+    quiet = _person(dm_checkin=False, dm_headsup=False, dm_opportunity=False,
+                    dm_trades=False, quiet_start=0, quiet_end=23)
+    assert eligible(quiet, "1", THU) == REASON_OK
+    # ...and the gates it *does* apply still bite, so this is not a way past
+    # the preferences that were already there.
+    assert eligible(_people.set_person(quiet, "1", monitor=False), "1", THU) == (
+        REASON_MONITOR_OFF
+    )
+
+
+def test_each_message_kind_is_switched_off_on_its_own() -> None:
+    # The point of four switches rather than one: the unit somebody opts out of
+    # is the message that annoyed them. A gate that silenced its neighbours
+    # would be the single 📬 switch again, which is the thing this replaces.
+    guess = _guess()
+    checkin_off = _person(dm_checkin=False)
+    # The kind names belong to :mod:`people` (they name stored fields, and this
+    # module already imports that one), and the two messages this module can
+    # send *are* those names — so select() hands eligible() the kind it just
+    # worked out with no lookup table in between to fall out of step.
+    assert (MSG_SLOT, MSG_OPPORTUNITY) == (KIND_SLOT, KIND_OPPORTUNITY)
+    assert eligible(checkin_off, "1", THU, kind=KIND_CHECKIN) == REASON_KIND_OFF
+    assert eligible(checkin_off, "1", THU, kind=KIND_TRADES) == REASON_OK
+    assert plan_dm(checkin_off, {}, "1", guess, THU) == REASON_KIND_OFF
+    # ...and it is only the Sunday DM: the heads-up they left on still goes.
+    assert select(checkin_off, {}, "1", HEADS_UP, booked=[THU_EVE]) == (
+        MSG_SLOT, THU_EVE, REASON_OK
+    )
+    headsup_off = _person(dm_headsup=False)
+    assert plan_dm(headsup_off, {}, "1", guess, THU) == REASON_OK
+    assert select(headsup_off, {}, "1", HEADS_UP, booked=[THU_EVE]) == (
+        MSG_NONE, None, REASON_KIND_OFF
+    )
+    # THE case the gate's placement exists for: ⏰ off and 💡 on still gets the
+    # opportunity. Gating on the kind before select() has chosen one would have
+    # had to ask about both switches at once, and this is what that would break.
+    assert select(
+        headsup_off, {}, "1", HEADS_UP, prediction=guess, due=True
+    ) == (MSG_OPPORTUNITY, THU_EVE, REASON_OK)
+    opportunity_off = _person(dm_opportunity=False)
+    assert select(
+        opportunity_off, {}, "1", HEADS_UP, prediction=guess, due=True
+    ) == (MSG_NONE, None, REASON_KIND_OFF)
+    assert select(opportunity_off, {}, "1", HEADS_UP, booked=[THU_EVE]) == (
+        MSG_SLOT, THU_EVE, REASON_OK
+    )
+    # 🔁 is the broker's switch, not this module's: turning swaps off must not
+    # cost somebody the reminders they opted into.
+    trades_off = _person(dm_trades=False)
+    assert plan_dm(trades_off, {}, "1", guess, THU) == REASON_OK
+    assert select(trades_off, {}, "1", HEADS_UP, booked=[THU_EVE])[2] == REASON_OK
+
+
+def test_a_switched_off_heads_up_is_not_swapped_for_an_opportunity() -> None:
+    # These settings may only ever *subtract*. Falling through to the other
+    # message when the chosen one is refused would hand somebody a
+    # differently-worded DM about the very evening they just switched off —
+    # routing around the tap they made, which is worse than ignoring it.
+    prefs, guess = _person(dm_headsup=False), _guess()
+    assert select(
+        prefs, {}, "1", HEADS_UP, booked=[THU_EVE], prediction=guess, due=True
+    ) == (MSG_NONE, None, REASON_KIND_OFF)
+
+
+def test_a_silenced_message_costs_nobody_their_allowance() -> None:
+    # Suppressions are checked before the budget for the same reason every
+    # other one is: a message that was never sent must not spend the single
+    # daily nudge that the message they *do* want would have used.
+    reason, budgets = _claim(_person(dm_headsup=False), {}, "1", THU_EVE, HEADS_UP)
+    assert reason == REASON_KIND_OFF
+    assert check_nudge(budget_for(budgets, "1"), THU) == BUDGET_OK
+    quiet = _person(quiet_start=19, quiet_end=8)
+    reason, budgets = _claim(quiet, {}, "1", THU_EVE, HEADS_UP)
+    assert reason == REASON_QUIET
+    assert check_nudge(budget_for(budgets, "1"), THU) == BUDGET_OK
+
+
+def test_the_quiet_window_wraps_midnight() -> None:
+    # The one bit of arithmetic in this feature, and the one worth its own
+    # test: 22 -> 8 is not an interval on the number line, it is two arcs of a
+    # clock face. Getting the comparison backwards would silence somebody all
+    # day and message them all night — the exact inverse of what they asked
+    # for, which reads as the bot being malicious rather than broken.
+    person = _people.get_person(_person(quiet_start=22, quiet_end=8), "1")
+    quiet = [h for h in range(24) if in_quiet_hours(person, at(2026, 8, 6, h))]
+    assert quiet == [0, 1, 2, 3, 4, 5, 6, 7, 22, 23]
+    # A window that does not wrap is the plain reading, start inclusive and end
+    # exclusive, so the two ends never both belong to it.
+    daytime = _people.get_person(_person(quiet_start=10, quiet_end=14), "1")
+    assert [h for h in range(24) if in_quiet_hours(daytime, at(2026, 8, 6, h))] == (
+        [10, 11, 12, 13]
+    )
+    # No window, and the degenerate one, are both "never quiet" — no single tap
+    # may collapse into total silence.
+    assert in_quiet_hours(_people.get_person(_person(), "1"), THU) is False
+    same = _people.get_person(_person(quiet_start=22, quiet_end=22), "1")
+    assert [h for h in range(24) if in_quiet_hours(same, at(2026, 8, 6, h))] == []
+    # An unreadable clock keeps quiet, like every "we cannot tell" here — but
+    # only for somebody who set a window, so one bad datetime cannot mute the
+    # house.
+    assert in_quiet_hours(person, None) is True
+    assert in_quiet_hours(_people.get_person(_person(), "1"), None) is False
+    assert in_quiet_hours({}, THU) is False
+
+
+def test_quiet_hours_hold_the_dawn_heads_up_and_not_the_evening_one() -> None:
+    # The 05:00 trigger is the only message in the system that can wake
+    # somebody up, and "quiet before 8am" is aimed precisely at it. The same
+    # person's evening heads-up is untouched, which is the whole reason this is
+    # a window rather than another way of saying "stop messaging me".
+    prefs = _person(quiet_start=22, quiet_end=8)
+    dawn = at(2026, 8, 6, 5, 30)  # the AM slot opens at 06:00
+    assert slot_soon(["3-am"], dawn) == "3-am"
+    assert select(prefs, {}, "1", dawn, booked=["3-am"]) == (
+        MSG_NONE, None, REASON_QUIET
+    )
+    assert select(prefs, {}, "1", HEADS_UP, booked=[THU_EVE]) == (
+        MSG_SLOT, THU_EVE, REASON_OK
+    )
+    # It holds the Sunday DM the same way, and by the same gate.
+    assert plan_dm(prefs, {}, "1", _guess(), dawn) == REASON_QUIET
+    assert plan_dm(prefs, {}, "1", _guess(), HEADS_UP) == REASON_OK
+    # Somebody with no window keeps the dawn heads-up they always had.
+    assert select(_person(), {}, "1", dawn, booked=["3-am"])[2] == REASON_OK
 
 
 # --- the Sunday plan DM (§10.2) ---------------------------------------------
