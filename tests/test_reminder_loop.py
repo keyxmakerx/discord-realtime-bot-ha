@@ -177,7 +177,10 @@ plan = sys.modules["ld.plan"]
 people = sys.modules["ld.people"]
 
 THU_EVE = "3-eve"
-THU = datetime.datetime(2026, 8, 6, 20, 30, tzinfo=TZ)  # a Thursday, Eve slot
+# A Thursday, half an hour before the Eve slot opens at 20:00 — which is when a
+# message about that slot is now sent. The retired day-of nudge fired *inside*
+# the window, which was too late to put a load on.
+THU = datetime.datetime(2026, 8, 6, 19, 30, tzinfo=TZ)
 
 
 # --- the household, faked ----------------------------------------------------
@@ -222,7 +225,12 @@ class FakeAssistant:
         self.sent: list = []
         self.booked_calls: list = []
         self.pushes: list = []
+        self.freed: list = []
         self.dm_delay = 0.0
+        self.due: dict = {}
+        self.gap: dict = {}
+        self.nudge_cells: dict = {}
+        self.week: dict = {}
 
     def now(self):
         return self.moment
@@ -240,6 +248,21 @@ class FakeAssistant:
     def booked_cells(self, user_id, week=None):
         return list(self.booked.get(str(user_id), []))
 
+    def occupancy(self):
+        return dict(self.week)
+
+    def is_due(self, user_id):
+        return bool(self.due.get(str(user_id), False))
+
+    def typical_gap(self, user_id):
+        return self.gap.get(str(user_id))
+
+    def note_nudge_cell(self, user_id, cell):
+        self.nudge_cells[str(user_id)] = cell
+
+    def nudge_cell(self, user_id):
+        return self.nudge_cells.get(str(user_id))
+
     async def async_store_budgets(self, budgets):
         self.budgets = budgets
 
@@ -255,6 +278,10 @@ class FakeAssistant:
 
     async def async_record_push(self, user_id, cell):
         self.pushes.append((str(user_id), cell))
+
+    async def async_free_cell(self, user_id, cell, week=None):
+        self.freed.append((str(user_id), cell, week))
+        return True
 
 
 class FakeCoordinator:
@@ -443,17 +470,26 @@ def _button(cls, assistant):
 
 
 def test_a_reply_acts_on_the_slot_the_dm_was_about() -> None:
-    # A DM sits in an inbox indefinitely and the Eve backstop lands at 23:00, so
-    # "whatever slot is running when they finally look" is routinely a different
-    # slot. Reading the clock at tap time books a cell nobody chose — taken on
-    # the whole household's grid — while the slot they were actually nudged
-    # about stays free.
+    # A DM sits in an inbox indefinitely, so "whatever slot is running when they
+    # finally look" is routinely a different slot. Acting on that books a cell
+    # nobody chose — taken on the whole household's grid — while the slot they
+    # were actually messaged about stays free.
+    #
+    # The heads-up makes the old timestamp reading ambiguous as well as stale:
+    # sent at 19:30, PM (16:00-20:00) is running *and* Eve opens within the
+    # hour, and a timestamp cannot say which. So the cell is recorded when the
+    # DM is sent, and that is what the reply reads.
     assistant = FakeAssistant(moment=THU)
+    assistant.note_nudge_cell("1", THU_EVE)
     on_it = _button(reminders._NudgeOnItButton, assistant)
-    tapped_in_time = FakeInteraction("1", created_at=THU.astimezone(datetime.timezone.utc))
+    sent_at = THU.astimezone(datetime.timezone.utc)
+    tapped_in_time = FakeInteraction("1", created_at=sent_at)
     note = _run(on_it.act(tapped_in_time))
     assert assistant.booked_calls == [("1", THU_EVE, None)]
     assert "marked the slot taken" in note
+    # Read from the timestamp instead, 19:30 is the PM slot — the wrong cell,
+    # and the reason the note exists at all.
+    assert plan.slot_for_hour(19) == "pm"
 
     # The same DM, opened the next morning. Nothing is written, and the reply
     # does not claim anything was.
@@ -464,10 +500,62 @@ def test_a_reply_acts_on_the_slot_the_dm_was_about() -> None:
     assert "left the week grid alone" in note
 
     # ⏭ Push is the dangerous one: acting on the wrong cell manufactures a
-    # booking for a slot nobody chose, which then produces its own nudge.
+    # booking for a slot nobody chose, which then produces its own message.
     push = _button(reminders._NudgePushButton, assistant)
     note = _run(push.act(tapped_in_time))
     assert assistant.booked_calls == [] and assistant.pushes == []
+
+
+def test_a_reply_still_works_when_the_note_was_lost_to_a_restart() -> None:
+    # The recorded cell is memory only, so a restart drops it. The fallback is
+    # the old timestamp reading rather than a refused tap — exact when we know,
+    # the previous best guess when we don't.
+    assistant = FakeAssistant(moment=datetime.datetime(2026, 8, 6, 21, tzinfo=TZ))
+    assert assistant.nudge_cell("1") is None
+    on_it = _button(reminders._NudgeOnItButton, assistant)
+    sent = datetime.datetime(2026, 8, 6, 20, 45, tzinfo=TZ)
+    _run(on_it.act(FakeInteraction("1", created_at=sent.astimezone(datetime.timezone.utc))))
+    assert assistant.booked_calls == [("1", THU_EVE, None)]
+
+
+def test_free_it_up_gives_the_slot_back_and_only_that_slot() -> None:
+    # The reply that serves the house rather than the person: a reservation
+    # about to lapse unused is exactly the capacity the grid exists to reclaim.
+    assistant = FakeAssistant(moment=THU)
+    assistant.note_nudge_cell("1", THU_EVE)
+    free = _button(reminders._NudgeFreeButton, assistant)
+    sent_at = THU.astimezone(datetime.timezone.utc)
+    note = _run(free.act(FakeInteraction("1", created_at=sent_at)))
+    assert assistant.freed == [("1", THU_EVE, None)]
+    assert "Released" in note and "back next week" in note
+    # Once its slot has gone there is nothing useful left to write.
+    assistant.freed.clear()
+    assistant.moment = datetime.datetime(2026, 8, 7, 8, 15, tzinfo=TZ)
+    note = _run(free.act(FakeInteraction("1", created_at=sent_at)))
+    assert assistant.freed == []
+    assert "left the week grid alone" in note
+
+
+def test_the_two_message_kinds_offer_different_replies() -> None:
+    # Nothing to free and nothing to push about a slot nobody booked, so the
+    # opportunity carries just "yes" and "leave me alone this week". One view
+    # class, subsets of one button set — two classes sharing 👍 On it would mean
+    # the second add_view registration quietly won for both.
+    assistant = FakeAssistant(moment=THU)
+
+    def ids(view):
+        return {item.custom_id for item in view.children}
+
+    template = ids(reminders.NudgeView(assistant))
+    slot = ids(reminders.NudgeView(assistant, kind=nudge.MSG_SLOT))
+    chance = ids(reminders.NudgeView(assistant, kind=nudge.MSG_OPPORTUNITY))
+    assert const.NUDGE_FREE_CUSTOM_ID in slot
+    assert const.NUDGE_FREE_CUSTOM_ID not in chance
+    assert const.NUDGE_PUSH_CUSTOM_ID in slot
+    assert const.NUDGE_SKIP_CUSTOM_ID in chance
+    assert const.NUDGE_ON_IT_CUSTOM_ID in slot & chance
+    # The template must carry every id, or a button goes dead after a restart.
+    assert slot | chance == template
 
 
 def test_a_sunday_push_books_the_week_it_actually_lands_in() -> None:

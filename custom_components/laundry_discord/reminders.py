@@ -7,7 +7,7 @@ message on somebody's phone. That single difference is why it lives in its own
 file, behind its own option, defaulting **off**, and why every send in it is
 routed through the same three chokepoints:
 
-* :func:`nudge.claim_plan_dm` / :func:`nudge.claim_day_nudge` — the decision
+* :func:`nudge.claim_plan_dm` / :func:`nudge.claim_select` — the decision
   *and* the budget claim, in one call (P2). Nothing sends without one.
 * :meth:`assistant.LaundryAssistant.async_store_budgets` — the claim is
   persisted **before** the send, so a DM that bounces still costs a nudge.
@@ -17,11 +17,17 @@ routed through the same three chokepoints:
 Two things shape the scheduling:
 
 * **Event-driven, not clock-driven (§10.4).** A fixed 18:00 reminder is a guess;
-  the washer actually being free is a fact. So the day-of nudge fires on
-  whichever comes first — the coordinator handing the machine over, or a
-  backstop near the end of the slot. The first of those reuses the *existing*
+  the washer actually being free is a fact. So a message fires on whichever
+  comes first — the coordinator handing the machine over, or the heads-up an
+  hour before a booked slot opens. The first of those reuses the *existing*
   handoff moments via :data:`const.SIGNAL_WASHER_FREE`; there is deliberately no
   second definition of "free" anywhere in this file.
+
+  The heads-up replaced a day-of nudge that fired near the slot's *end*, which
+  was too late to act on and made a booking the weakest signal in the system
+  rather than the strongest. :func:`nudge.select` then decides which single
+  message, if any, is worth sending — so the two triggers cannot produce two
+  DMs about one evening.
 * **Triggers, not polling.** Everything here is either
   ``async_track_time_change`` (fires once, at a wall-clock time) or a dispatcher
   callback. Nothing runs on a tick, so nothing is evaluated — and nothing is
@@ -64,6 +70,7 @@ from .const import (
     DEFAULT_PLAN_DM_TIME,
     DEFAULT_PLAN_DM_WEEKDAY,
     DEFAULT_REMIND_DMS,
+    NUDGE_FREE_CUSTOM_ID,
     NUDGE_ON_IT_CUSTOM_ID,
     NUDGE_PUSH_CUSTOM_ID,
     NUDGE_SKIP_CUSTOM_ID,
@@ -179,7 +186,7 @@ class _PlanStopButton(_ReminderButton):
     """🔕 Stop asking — permanent, and never re-prompted.
 
     Sets the person's ``predict`` preference off, which :func:`nudge.eligible`
-    refuses outright: no Sunday DM, no day-of nudge, and no ░ on their grid
+    refuses outright: no Sunday DM, no day-of nudge, and no ? on their grid
     either. The 🔮 panel's own button is the way back, so this is an opt-out
     rather than a one-way door (P7).
     """
@@ -280,6 +287,36 @@ class _NudgeSkipButton(_ReminderButton):
         return "🚫 Right you are — nothing more from me until next week."
 
 
+class _NudgeFreeButton(_ReminderButton):
+    """🆓 Free it up — hand a booked slot back to the house.
+
+    The one button here that serves somebody *other* than the person tapping
+    it, and the reason the heads-up is worded as a question rather than a
+    reminder. A reservation about to lapse unused is exactly the capacity the
+    grid exists to reclaim, so the reply somebody gives when the answer is "no,
+    not tonight" still does something useful — instead of the message being
+    ignored and the slot sitting there blocking a housemate all evening.
+
+    Only ever offered on the slot heads-up, because it is the only message
+    about a cell they actually booked. There is nothing to free about a guess.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(assistant, "Free it up", "🆓", NUDGE_FREE_CUSTOM_ID)
+
+    async def act(self, interaction: discord.Interaction) -> str:
+        cell = _dm_cell(self.assistant, interaction)
+        if cell is None:
+            return _STALE_TAP
+        if not await self.assistant.async_free_cell(interaction.user.id, cell):
+            return "🆓 Nothing to free up there — that slot wasn't yours."
+        return (
+            "🆓 Released — the slot's back on the grid for anyone. Thanks, "
+            "that's genuinely useful to whoever was eyeing it. If it's a "
+            "standing slot it'll be back next week as usual."
+        )
+
+
 class PlanDMView(discord.ui.View):
     """The Sunday DM's three answers (§10.2)."""
 
@@ -291,13 +328,30 @@ class PlanDMView(discord.ui.View):
 
 
 class NudgeView(discord.ui.View):
-    """The day-of DM's three answers (§10.3)."""
+    """The replies to a reminder DM, which differ by what it was about.
 
-    def __init__(self, assistant: "LaundryAssistant") -> None:
+    One view class rather than two, for the reason :class:`GridView` is one
+    class: ``add_view`` keys the persistent registry by ``custom_id``, so two
+    view classes sharing 👍 On it would mean the second registration quietly
+    wins for both. Built with no ``kind`` this is the registration template and
+    carries **every** button; a real DM carries the subset that makes sense.
+
+    * **The slot heads-up** — you booked this and it starts within the hour, so
+      all three answers are live: do it, give it back, or move it.
+    * **The opportunity** — nothing was booked, so there is nothing to free and
+      nothing to push. Just "yes" and "leave me alone this week".
+    """
+
+    def __init__(
+        self, assistant: "LaundryAssistant", *, kind: str | None = None
+    ) -> None:
         super().__init__(timeout=None)
         self.add_item(_NudgeOnItButton(assistant))
-        self.add_item(_NudgePushButton(assistant))
-        self.add_item(_NudgeSkipButton(assistant))
+        if kind in (None, nudge_mod.MSG_SLOT):
+            self.add_item(_NudgeFreeButton(assistant))
+            self.add_item(_NudgePushButton(assistant))
+        if kind in (None, nudge_mod.MSG_OPPORTUNITY):
+            self.add_item(_NudgeSkipButton(assistant))
 
 
 # What a day-of reply says when the slot the DM was about is over. Nothing is
@@ -327,8 +381,19 @@ def _dm_cell(assistant: "LaundryAssistant", interaction: discord.Interaction):
     Booking a window that has closed tells the house nothing and blocks a slot
     nobody can use, so there is nothing useful left to write — only something
     honest left to say (:data:`_STALE_TAP`).
+
+    **The recorded cell is preferred over the timestamp reading**, because the
+    heads-up arrives *before* its slot opens and the reading cannot tell those
+    apart: at 19:00, PM (16:00-20:00) is running and Eve starts within the hour,
+    and there is no way to know from a timestamp which of the two a DM sent then
+    was about. Guessing wrong books a slot nobody chose on everybody's grid. The
+    note is memory only, so a restart falls through to the reading — the old
+    behaviour, kept as the fallback rather than as the rule.
     """
     now = assistant.now()
+    remembered = assistant.nudge_cell(interaction.user.id)
+    if remembered is not None and not nudge_mod.slot_ended(remembered, now):
+        return remembered
     sent = getattr(getattr(interaction, "message", None), "created_at", None)
     moment = now
     if sent is not None:
@@ -442,7 +507,15 @@ class LaundryReminders:
 
     @property
     def nudge_lead(self) -> int:
-        """Minutes before a slot ends that the day-of backstop fires."""
+        """Minutes before a slot **starts** that its heads-up fires.
+
+        The same option as before, with its meaning corrected rather than
+        replaced: it used to be a lead before the slot *ended*, which is the one
+        line that made a reservation worthless — booking Thursday Eve bought
+        nothing until you were already standing inside it. The default was, and
+        still is, 60, so nobody's configuration changes meaning under them by
+        more than the fix they wanted.
+        """
         try:
             return int(self._option(CONF_NUDGE_LEAD, DEFAULT_NUDGE_LEAD))
         except (TypeError, ValueError):
@@ -479,9 +552,12 @@ class LaundryReminders:
                 self.hass, self._on_plan_time, hour=hour, minute=minute, second=0
             )
         )
-        # One backstop per slot, near that slot's own end (§10.4 trigger b).
+        # One heads-up per slot, an hour before that slot's own **start**. This
+        # replaces the retired day-of nudge, whose lead was measured from the
+        # slot's *end* — which is why booking Thursday Eve used to do nothing
+        # until you were already inside it.
         for slot in plan_mod.SLOTS:
-            clock = nudge_mod.fallback_clock(slot, self.nudge_lead)
+            clock = nudge_mod.heads_up_clock(slot, self.nudge_lead)
             if clock is None:  # unreachable for a real slot; belt and braces
                 continue
             self._unsubs.append(
@@ -578,6 +654,14 @@ class LaundryReminders:
                 # does no work at all: reading a prediction means scanning that
                 # person's history, and there is no point doing it for somebody
                 # who cannot be messaged whatever it says.
+                #
+                # Deliberately **no kind**, even though this loop sends exactly
+                # one and knows which. A pre-filter is allowed to be broader
+                # than the decision it precedes and never narrower: 📅 and the
+                # quiet window are re-asked inside :func:`nudge.claim_plan_dm`,
+                # which is where the budget and the reason string come from, so
+                # asking here as well would only mean two places to keep in step
+                # for a check that costs a dict read.
                 if nudge_mod.eligible(people_map, user_id, now) != (
                     nudge_mod.REASON_OK
                 ):
@@ -610,12 +694,17 @@ class LaundryReminders:
     async def _async_send_nudges(
         self, *, released: bool, just_washed_id=None
     ) -> None:
-        """The day-of nudge (§10.3), from whichever trigger got here first.
+        """At most **one** message per person, chosen for them right now.
 
-        Both triggers run this same method with the same arguments, because
-        they are the same decision asked at two different moments. Which one
-        won is not recorded and does not matter: the budget claim inside
-        :func:`nudge.claim_day_nudge` is what makes the second one a no-op.
+        Both triggers run this same method, because they are the same question
+        asked at two different moments — an hour before a slot opens, and when
+        the washer changes hands. Which one got here first is not recorded and
+        does not matter: the budget claim inside :func:`nudge.claim_select` is
+        what makes the second a no-op.
+
+        The choice itself lives in :func:`nudge.select`, so the rule that there
+        is only ever one message is enforced in a pure function with tests
+        rather than by four triggers agreeing to take turns.
         """
         now = self._assistant.now()
         free = self._washer_free(released=released)
@@ -623,25 +712,40 @@ class LaundryReminders:
         # the planner store as strings, and a mismatch here is silent — it just
         # sends the one DM this whole guard exists to stop.
         just_washed = None if just_washed_id is None else str(just_washed_id)
+        occupancy = self._assistant.occupancy()
         for user_id in self._assistant.people_map:
             try:
                 people_map = self._assistant.people_map
                 # Same reasoning as the plan DM: the preference check is a dict
                 # read, and everything after it is not.
+                #
+                # Kind-agnostic, and here it is load-bearing rather than merely
+                # tidy. This pass does not yet know which message it would send
+                # — :func:`nudge.select` decides that from a booking, a
+                # prediction and the occupancy, none of which have been read
+                # yet — so there is no kind to pass. Naming one anyway would
+                # mean picking ⏰ or 💡 before the branch that chooses between
+                # them, and somebody who switched off only the one we guessed
+                # would be dropped here, never reaching the branch that would
+                # have sent them the other.
                 if nudge_mod.eligible(people_map, user_id, now) != (
                     nudge_mod.REASON_OK
                 ):
                     continue
-                booked = self._assistant.booked_cells(user_id)
                 prediction = self._assistant.prediction_for(user_id)
-                cell = nudge_mod.current_cell(booked, prediction, now)
-                reason, budgets = nudge_mod.claim_day_nudge(
+                kind, cell, reason, budgets = nudge_mod.claim_select(
                     people_map,
                     self._assistant.budgets,
                     user_id,
-                    cell,
                     now,
+                    booked=self._assistant.booked_cells(user_id),
+                    prediction=prediction,
+                    occupancy=occupancy,
                     washer_free=free,
+                    # Their own learned cadence, not a fixed number of days:
+                    # the twice-a-week washer and the fortnightly one are both
+                    # left alone until *they* are overdue.
+                    due=self._assistant.is_due(user_id),
                     # The washer coming free is very often this person's own
                     # load finishing, and being told to do the laundry you have
                     # just done is the fastest way to get a bot muted.
@@ -652,21 +756,31 @@ class LaundryReminders:
                     # rather than inferred.
                     just_washed=just_washed is not None
                     and str(user_id) == just_washed,
+                    lead_minutes=self.nudge_lead,
                 )
+                # Persisted first, always: the claim is spent whether or not
+                # the send lands (see the module docstring).
                 await self._assistant.async_store_budgets(budgets)
                 if reason != nudge_mod.REASON_OK:
                     self._log_drop(user_id, reason)
                     continue
-                text = nudge_mod.day_nudge_text(
-                    cell, None if nudge_mod.is_booked(booked, cell) else prediction
-                )
+                if kind == nudge_mod.MSG_SLOT:
+                    text = nudge_mod.heads_up_text(cell, self.nudge_lead)
+                else:
+                    text = nudge_mod.opportunity_text(
+                        cell, prediction, self._assistant.typical_gap(user_id)
+                    )
                 if text is None:
                     continue
+                # Before the send, not after: the reply buttons read this to
+                # know which cell they are about, and a DM that lands before
+                # the note is written is a tap that books the wrong slot.
+                self._assistant.note_nudge_cell(user_id, cell)
                 if not await self._async_deliver(
-                    user_id, text, NudgeView(self._assistant)
+                    user_id, text, NudgeView(self._assistant, kind=kind)
                 ):
                     continue
-                _LOGGER.debug("Sent the day-of nudge to %s", user_id)
+                _LOGGER.debug("Sent the %s DM to %s", kind, user_id)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to send a nudge to %s", user_id)
 

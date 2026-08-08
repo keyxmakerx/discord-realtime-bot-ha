@@ -30,15 +30,21 @@ QUEUE_CAP = _queue.QUEUE_CAP
 TOGGLE_ADDED = _queue.TOGGLE_ADDED
 TOGGLE_REMOVED = _queue.TOGGLE_REMOVED
 TOGGLE_FULL = _queue.TOGGLE_FULL
+TOGGLE_STALE = _queue.TOGGLE_STALE
+attributes = _queue.attributes
 carry_forward = _queue.carry_forward
 find = _queue.find
 format_queue = _queue.format_queue
+handoff_line = _queue.handoff_line
+names = _queue.names
 next_in_line = _queue.next_in_line
+ordinal = _queue.ordinal
 position = _queue.position
 prune = _queue.prune
 remove_user = _queue.remove_user
 same_user = _queue.same_user
 select_handoff = _queue.select_handoff
+tap_notice = _queue.tap_notice
 toggle_member = _queue.toggle_member
 
 HOUR = 3600.0
@@ -274,6 +280,190 @@ def test_format_queue() -> None:
 
 def test_format_queue_survives_a_nameless_entry() -> None:
     assert format_queue([{"id": 1, "ts": 0.0}]) == "someone"
+
+
+# --- the HA attribute -------------------------------------------------------
+
+
+def test_names_is_order_preserving() -> None:
+    q = [{"id": i, "name": n, "ts": 0.0} for i, n in enumerate(["Sam", "Ty", "Jo"])]
+    assert names(q) == ["Sam", "Ty", "Jo"]
+    assert names([]) == []
+    assert names([{"id": 1, "ts": 0.0}]) == ["someone"]
+
+
+def test_names_carries_nothing_derived_from_the_clock() -> None:
+    """The recorder-churn guard: the same line must render identically later.
+
+    An attribute that changed on the 5-minute health tick would write ~288
+    history rows a day forever — the bug the connection-health sensor was
+    already fixed for. Names cannot drift; timestamps and anything computed
+    from them can, so none of them are here.
+    """
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 1.0}]
+    assert names(q) == names(q)
+    aged = [dict(e) for e in q]  # same people, read a very long time later
+    assert names(aged) == names(q)
+    assert all(isinstance(n, str) for n in names(q))
+
+
+# --- what the tapper is told ------------------------------------------------
+
+
+def test_ordinal() -> None:
+    assert [ordinal(n) for n in (1, 2, 3, 4, 5)] == ["1st", "2nd", "3rd", "4th", "5th"]
+    # The 11/12/13 exception, in case the cap is ever raised.
+    assert [ordinal(n) for n in (11, 12, 13)] == ["11th", "12th", "13th"]
+    assert [ordinal(n) for n in (21, 22, 23, 101)] == ["21st", "22nd", "23rd", "101st"]
+
+
+def test_tap_notice_joining_names_the_place() -> None:
+    assert "**2nd**" in tap_notice(TOGGLE_ADDED, 2)
+    assert "**3rd**" in tap_notice(TOGGLE_ADDED, 3)
+    # First in line is told "next", not "1st" — and warned that a finished
+    # washer is not an empty one, which is the whole reason for the ✅ tap.
+    first = tap_notice(TOGGLE_ADDED, 1)
+    assert "**next**" in first
+    assert "1st" not in first
+
+
+def test_tap_notice_tells_joining_and_leaving_apart() -> None:
+    """The actual bug: the shared card looks the same either way."""
+    joined = tap_notice(TOGGLE_ADDED, 2)
+    left = tap_notice(TOGGLE_REMOVED, None)
+    assert joined and left
+    assert joined != left
+    assert "out of the line" in left
+
+
+def test_tap_notice_is_silent_where_the_response_already_spoke() -> None:
+    # TOGGLE_FULL / TOGGLE_STALE answer the interaction with their own
+    # ephemeral; a followup here would say it twice.
+    assert tap_notice(TOGGLE_FULL, None) is None
+    assert tap_notice(TOGGLE_STALE, None) is None
+    assert tap_notice("something else entirely", 1) is None
+
+
+def test_tap_notice_still_confirms_without_a_place() -> None:
+    notice = tap_notice(TOGGLE_ADDED, None)
+    assert notice and "line" in notice
+
+
+def test_position_feeds_tap_notice() -> None:
+    """The two halves of the fix, joined up as the button joins them."""
+    q, _ = toggle_member([], 1, "Sam", 0.0)
+    q, res = toggle_member(q, 2, "Ty", 10.0)
+    assert "**2nd**" in tap_notice(res, position(q, 2))
+    # ...and leaving really does leave.
+    q, res = toggle_member(q, 2, "Ty", 20.0)
+    assert res == TOGGLE_REMOVED
+    assert position(q, 2) is None
+
+
+# --- the done card's record of the handoff ----------------------------------
+
+
+def test_handoff_line_keeps_the_hedge_distinct() -> None:
+    confirmed = handoff_line("Sam", hedged=False)
+    backstop = handoff_line("Sam", hedged=True)
+    assert "Sam" in confirmed and "Sam" in backstop
+    assert confirmed != backstop
+    # The backstop must never claim somebody confirmed the drum was clear.
+    assert "nobody confirmed" in backstop
+    assert "told the washer's free" in confirmed
+
+
+def test_handoff_line_survives_a_nameless_entry() -> None:
+    assert "someone" in handoff_line(None, hedged=False)
+    assert "someone" in handoff_line("", hedged=True)
+
+
+def test_handoff_line_names_whoever_select_handoff_popped() -> None:
+    """The vanishing act: the head is gone from the line by design."""
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 1.0}]
+    head, rest = select_handoff(q, 100.0, EXPIRY, claimant_id=None)
+    assert position(rest, 1) is None  # Sam is off the line entirely...
+    assert "Sam" in handoff_line(_queue.entry_name(head), hedged=False)  # ...but named
+
+
+def test_attributes_publish_the_line_that_would_actually_act() -> None:
+    """The plain case: everyone fresh, nobody claiming."""
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
+    assert attributes(q, 100.0, EXPIRY, None) == {
+        "queue_count": 2,
+        "queue": ["Sam", "Ty"],
+        "next_up": "Sam",
+    }
+    assert attributes([], 100.0, EXPIRY, None) == {
+        "queue_count": 0,
+        "queue": [],
+        "next_up": None,
+    }
+
+
+def test_attributes_never_name_somebody_the_handoff_would_skip() -> None:
+    """The stored line is pruned on tap/start/handoff — never on read.
+
+    Sam taps 🔜 in the evening and goes away. Nothing touches the line
+    overnight, so by morning ``coordinator.queue`` still holds an entry that
+    :func:`select_handoff` would drop. Reading it raw had the dashboard
+    announcing a person who is provably not getting the machine.
+    """
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 11 * HOUR}]
+    aged = attributes(q, 13 * HOUR, EXPIRY, None)  # EXPIRY is 12h
+    assert aged == {"queue_count": 1, "queue": ["Ty"], "next_up": "Ty"}
+    # Everybody aged out: an empty line, not a stale head.
+    assert attributes(q, 40 * HOUR, EXPIRY, None)["next_up"] is None
+    # ...and expiry disabled keeps them, exactly as the handoff would.
+    assert attributes(q, 40 * HOUR, 0.0, None)["next_up"] == "Sam"
+
+
+def test_attributes_never_name_the_claimant_as_next_up() -> None:
+    """Claiming takes you out of the line; tapping 🔜 after can put you back.
+
+    ``select_handoff`` refuses to hand the machine to whoever is using it, so
+    the attribute must not promise it either — otherwise the card says the
+    claimant is up next and the ping goes to the person behind them.
+    """
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
+    attrs = attributes(q, 100.0, EXPIRY, claimant_id=1)
+    assert attrs["next_up"] == "Ty"
+    # The line itself still shows them, matching the Discord card's rendering.
+    assert attrs["queue"] == ["Sam", "Ty"]
+    # A claimant alone in the line means nobody is up next, not "Sam".
+    assert attributes(q[:1], 100.0, EXPIRY, claimant_id=1)["next_up"] is None
+    # String/int ids round-trip through the Store; both must match.
+    assert attributes(q, 100.0, EXPIRY, claimant_id="1")["next_up"] == "Ty"
+
+
+def test_attributes_agree_with_select_handoff_on_who_is_up() -> None:
+    """Guards the two from drifting apart — the whole point of the fix."""
+    q = [
+        {"id": 1, "name": "Sam", "ts": 0.0},  # stale
+        {"id": 2, "name": "Ty", "ts": 11 * HOUR},  # the claimant
+        {"id": 3, "name": "Jo", "ts": 11 * HOUR},
+    ]
+    now = 13 * HOUR
+    head, _rest = select_handoff(q, now, EXPIRY, claimant_id=2)
+    assert attributes(q, now, EXPIRY, claimant_id=2)["next_up"] == _queue.entry_name(
+        head
+    )
+
+
+def test_attributes_carry_nothing_derived_from_the_clock() -> None:
+    """The recorder-churn guard, now that ``now`` is an input.
+
+    Pruning needs the wall clock, which is exactly the shape of thing that
+    wrote ~288 rows a day on the connection-health sensor. It is safe here
+    because the clock only decides *membership*: between two ticks with nobody
+    expiring, the attribute dict must be identical, so HA suppresses the
+    state_changed event and no row is written.
+    """
+    q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
+    ticks = [attributes(q, 100.0 + 300.0 * i, EXPIRY, None) for i in range(12)]
+    assert all(t == ticks[0] for t in ticks)  # a full hour of health ticks
+    assert set(ticks[0]) == {"queue_count", "queue", "next_up"}
+    assert not any(isinstance(v, float) for v in ticks[0].values())
 
 
 def _run() -> None:

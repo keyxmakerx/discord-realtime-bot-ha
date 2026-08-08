@@ -81,6 +81,7 @@ from .const import (
     STORAGE_VERSION,
     UNCLAIMED,
 )
+from . import cancel as cancel_mod
 from . import queue
 from .assistant import LaundryAssistant
 from .detect import (
@@ -96,11 +97,15 @@ from .discord_bot import ClaimView, DiscordBot, view_for
 
 _LOGGER = logging.getLogger(__name__)
 
-# Colors per stage.
+# Colors per stage. One colour, one meaning: grey used to serve **both**
+# "somebody has claimed this load" and "nothing is happening", which are the two
+# states a glance at the channel most needs to tell apart — a claimed load is
+# waiting on a person, an idle card is waiting on nobody. They are split here.
 _COLOR_WASHING = 0x3498DB
 _COLOR_DRYING = 0xE67E22
 _COLOR_DONE = 0x2ECC71
-_COLOR_CLAIMED = 0x95A5A6
+_COLOR_CLAIMED = 0xF1C40F  # amber — this load has an owner and they're not done
+_COLOR_IDLE = 0x95A5A6  # grey — nothing running, nobody waited on
 _COLOR_TEST = 0x9B59B6
 _COLOR_SELFCLEAN = 0x1ABC9C
 
@@ -141,12 +146,25 @@ class LaundryCoordinator:
         # washer is not an *empty* one — their clothes are still in it — so the
         # handoff to whoever is next waits for this, not for completion.
         self.emptied: bool = False
+        # Who this load's handoff ping went to, and whether it was the hedged
+        # backstop rather than a confirmed one. Recorded because the handoff
+        # *pops* the head off the line: without it the "Next up" field simply
+        # disappears at the moment that person was told, and to everybody else
+        # the card reads as though they were never waiting at all.
+        self.handoff_name: str | None = None
+        self.handoff_hedged: bool = False
         self.message_id: int | None = None
         # True when the session was picked up mid-cycle (washer already running
         # at startup) rather than caught at its off->on start.
         self.catch_up: bool = False
         # True while machine_state reports the load is paused mid-cycle.
         self.paused: bool = False
+        # True when the load in ``done_waiting`` was ended by somebody stopping
+        # the washer rather than by the cycle finishing. It is what stops the
+        # card and the ping claiming a cycle completed when we know it didn't,
+        # and it is the flag ``handle_claim`` checks before logging anything to
+        # the habit model — a stopped load is not a wash.
+        self.cancelled: bool = False
         # Last confirmed real job phase, ignoring unavailable/unknown blips —
         # used purely for enrichment now (the wash->dry transition display).
         self._last_real_phase: str | None = None
@@ -183,6 +201,12 @@ class LaundryCoordinator:
         self._eta_cache: tuple[datetime, float] | None = None
         # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
         self._job_confirm_unsub = None
+        # Pending stop-confirm timer — the same `for: 30s` shape, for "somebody
+        # stopped the wash on the machine". Its own handle rather than a second
+        # debounce mechanism: a stop and a job_state change can be in flight at
+        # the same moment (they are at the end of every normal load) and one
+        # must not disarm the other.
+        self._stop_confirm_unsub = None
         # Pending self-clean detect/end timer (running + job_state stuck none).
         self._selfclean_unsub = None
         # Pending handoff-fallback timer (nobody tapped "Emptied it").
@@ -380,6 +404,7 @@ class LaundryCoordinator:
         if self._job_confirm_unsub is not None:
             self._job_confirm_unsub()
             self._job_confirm_unsub = None
+        self._cancel_stop_confirm()
         if self._selfclean_unsub is not None:
             self._selfclean_unsub()
             self._selfclean_unsub = None
@@ -424,9 +449,12 @@ class LaundryCoordinator:
         # neither key, and an upgrade must not KeyError on the first load.
         self.queue = list(data.get("queue") or [])
         self.emptied = data.get("emptied", False)
+        self.handoff_name = data.get("handoff_name")
+        self.handoff_hedged = data.get("handoff_hedged", False)
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
         self.paused = data.get("paused", False)
+        self.cancelled = data.get("cancelled", False)
         self._last_real_phase = data.get("last_real_phase")
         self._energy_start = data.get("energy_start")
         self._water_start = data.get("water_start")
@@ -459,9 +487,12 @@ class LaundryCoordinator:
                 "quiet": self.quiet,
                 "queue": self.queue,
                 "emptied": self.emptied,
+                "handoff_name": self.handoff_name,
+                "handoff_hedged": self.handoff_hedged,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
                 "paused": self.paused,
+                "cancelled": self.cancelled,
                 "last_real_phase": self._last_real_phase,
                 "energy_start": self._energy_start,
                 "water_start": self._water_start,
@@ -481,6 +512,13 @@ class LaundryCoordinator:
 
     @callback
     def _notify_entities(self) -> None:
+        # The planner's ``*`` rides along here rather than on the session edges
+        # themselves. There are five places that start or end a session — wash,
+        # dry, self-clean, the completion path and the reset service — and a
+        # push added to four of them is a grid that keeps claiming the washer is
+        # busy after the fifth. This is the one call every one of them already
+        # makes, so it cannot be the one somebody forgets.
+        self._publish_running()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     # ---------------------------------------------------------- state handlers
@@ -492,6 +530,19 @@ class LaundryCoordinator:
         if st is None or st.state in UNAVAILABLE_STATES:
             return None
         return st.state
+
+    def _running_state(self) -> bool | None:
+        """Whether the running sensor says on/off, or None when unreadable.
+
+        Deliberately three-valued, unlike the self-clean check's
+        ``running is not None and state == "on"``: for the cancel path
+        "unavailable" and "off" have to be different answers, because the cloud
+        drops hourly and reading that silence as *off* would end a live wash.
+        """
+        st = self.hass.states.get(self.running_entity) if self.running_entity else None
+        if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
+            return None
+        return st.state == "on"
 
     def _job_phase(self) -> str | None:
         """Current job_state value, or None when unavailable/unknown."""
@@ -573,6 +624,26 @@ class LaundryCoordinator:
         return (True, dt_util.utcnow() >= target)
 
     @callback
+    def _publish_running(self) -> None:
+        """Tell the planner the live load's window, so its grid can draw ``*``.
+
+        Pushed, never pulled: the assistant must not reach back into the
+        coordinator (§14 rule 5), so that a planner panel still opens when the
+        detection side is wedged. Two floats and no store write, which is what
+        makes it safe to call from a hot path.
+
+        Called from :meth:`_notify_entities`, which every state transition
+        already goes through, *and* from the 5-minute tick. The first makes it
+        prompt; the second makes it self-correcting, so the worst case is one
+        stale grid rather than a ``*`` that never goes away.
+        """
+        running = self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN)
+        self.assistant.note_running(
+            self._session_started_ts if running else None,
+            self._last_eta_ts if running else None,
+        )
+
+    @callback
     def _check_time_completion(self, _now=None) -> None:
         """Time-based completions on the periodic ticks (job 'finish' / the ETA
         gate normally complete far earlier).
@@ -581,6 +652,9 @@ class LaundryCoordinator:
           its last-known ETA has passed (+grace) — finish, flagged *unverified*.
         - **Max-session:** absolute safety net so a stuck session can't live on.
         """
+        # Before the stage guard: an idle machine is exactly when the planner
+        # most needs telling there is nothing running.
+        self._publish_running()
         if self.stage not in (STAGE_WASHING, STAGE_DRYING):
             return
         now = dt_util.utcnow().timestamp()
@@ -673,13 +747,30 @@ class LaundryCoordinator:
 
     @callback
     def _on_running(self, event: Event) -> None:
-        if event.data.get("new_state") is None:
+        new = event.data.get("new_state")
+        if new is None:
             return
         # Self-clean ends quickly when the washer stops (faster than the energy
         # idle-timeout, which is the backstop).
-        if self.stage == STAGE_SELF_CLEAN and event.data["new_state"].state == "off":
+        if self.stage == STAGE_SELF_CLEAN and new.state == "off":
             self._schedule_selfclean_end()
             return
+        old = event.data.get("old_state")
+        if self.stage in (STAGE_WASHING, STAGE_DRYING) and (
+            cancel_mod.running_off_signalled(
+                old.state if old is not None else None,
+                new.state,
+                # This sensor cannot tell a pause from a stop; machine_state can,
+                # both live and via ``self.paused``. Without that entity there is
+                # nothing to veto it, so it does not arm a stop alone — see
+                # cancel.running_off_signalled.
+                machine_state_configured=bool(self.machine_state_entity),
+            )
+        ):
+            # The second way "somebody stopped it" reaches us: a corroborating
+            # trigger for the machine_state signal, faster on units where the
+            # running sensor moves first.
+            self._schedule_stop_confirm()
         self._feed_detector()
 
     @callback
@@ -696,6 +787,23 @@ class LaundryCoordinator:
             elif new_s == MACHINE_RUN and self.paused:
                 self.paused = False
                 self.hass.async_create_task(self._async_render_active("resumed"))
+            elif new_s == MACHINE_STOP and self.paused:
+                # Cancelling is Start/Pause then Stop on most combo units, so
+                # `pause -> stop` is the *ordinary* cancel. Clear the flag at
+                # the source: the load is no longer on hold, and a stale
+                # "paused" would otherwise outlive the session in the card, in
+                # the persisted state and in the stop verdict. No "resumed"
+                # render — the stop confirm below decides what this card says.
+                self.paused = False
+            old = event.data.get("old_state")
+            if cancel_mod.machine_stop_signalled(
+                old.state if old is not None else None, new_s
+            ):
+                # A stop while a load is being tracked. Debounced, then judged —
+                # this is the only route by which "the human ended the cycle"
+                # can ever finish a load (see cancel.py for why it isn't in
+                # detect.py).
+                self._schedule_stop_confirm()
         elif self.stage == STAGE_SELF_CLEAN:
             if new_s == MACHINE_STOP:
                 self._schedule_selfclean_end()
@@ -774,6 +882,90 @@ class LaundryCoordinator:
             self._last_real_phase = job
         elif job == JOB_STATE_NONE:
             self._last_real_phase = None
+
+    # ------------------------------------------------- stopped on the machine
+    @callback
+    def _schedule_stop_confirm(self) -> None:
+        """(Re)arm the stop-confirm debounce; collapses rapid changes.
+
+        The same shape as :meth:`_schedule_job_confirm` and on the same
+        ``confirm_delay``, which is the point: this washer's cloud drops to
+        ``unavailable`` on a ~51-minute timer, and an undebounced stop signal
+        would end live washes. ``confirm_delay`` is sufficient on its own here
+        and gets no second setting — the flap values never arm this at all
+        (:func:`cancel.is_flap`), and :meth:`_async_stop_confirmed` re-reads the
+        live sensors rather than trusting the event that armed it, so a stop
+        that has gone away by the time this fires decides nothing.
+        """
+        self._cancel_stop_confirm()
+        delay = self.confirm_delay
+        if delay <= 0:
+            self._async_stop_confirmed()
+            return
+        self._stop_confirm_unsub = async_call_later(
+            self.hass, delay, self._async_stop_confirmed
+        )
+
+    @callback
+    def _cancel_stop_confirm(self) -> None:
+        if self._stop_confirm_unsub is not None:
+            self._stop_confirm_unsub()
+            self._stop_confirm_unsub = None
+
+    @callback
+    def _async_stop_confirmed(self, _now=None) -> None:
+        """Act on a stop that is *still* a stop ``confirm_delay`` later.
+
+        Everything decided here is decided in :mod:`cancel`, from the live
+        readings — including the difference between "stopped early" and "it
+        finished", which is the washer's own estimate. Nothing in
+        :mod:`detect` is consulted or changed: the ETA gate keeps a frozen
+        meter from firing a false done, and this path is keyed off a different
+        signal entirely.
+        """
+        self._stop_confirm_unsub = None
+        has_eta, eta_passed = self._eta_status()
+        machine_state = self._machine_state()
+        verdict = cancel_mod.stop_verdict(
+            tracked=self.stage in (STAGE_WASHING, STAGE_DRYING),
+            machine_state=machine_state,
+            running_on=self._running_state(),
+            paused=self.paused,
+            has_eta=has_eta,
+            eta_passed=eta_passed,
+            # The last *confirmed* phase counts as well as the live one: at the
+            # natural end of a cycle the machine stops and job_state reports
+            # 'finish', and if that value has since flapped to unavailable we
+            # would otherwise call a real completion "stopped early" on the
+            # strength of an estimate that ran long. A cancel can't be mistaken
+            # for it — job_state goes to 'none' there, which clears this.
+            job_finished=JOB_STATE_FINISH
+            in (self._job_phase(), self._last_real_phase),
+        )
+        if verdict == cancel_mod.VERDICT_IGNORE:
+            return
+        # ``_eta_status`` has just refreshed ``_last_eta_ts`` if there is a real
+        # estimate for this cycle; without one there is no margin to measure and
+        # the retraction test refuses on its own.
+        remaining = (
+            self._last_eta_ts - dt_util.utcnow().timestamp()
+            if has_eta and self._last_eta_ts is not None
+            else None
+        )
+        _LOGGER.debug("Washer reports stopped mid-load (verdict=%s)", verdict)
+        self.hass.async_create_task(
+            self._async_handle_finished(
+                cancelled=verdict == cancel_mod.VERDICT_STOPPED,
+                # Deliberately *not* the same boolean as the wording. Deleting
+                # somebody's history row is irreversible; calling a completion
+                # "stopped early" is not.
+                retract=cancel_mod.retracts_history(
+                    verdict=verdict,
+                    machine_state=machine_state,
+                    eta_remaining_s=remaining,
+                ),
+            )
+        )
 
     # ---------------------------------------------------------- self-clean
     def _looks_like_selfclean(self) -> bool:
@@ -876,8 +1068,17 @@ class LaundryCoordinator:
                 float(self.queue_expiry),
             )
             self.emptied = False
+            # ...and so did its handoff record. Reset wherever `emptied` is:
+            # the two describe the same finished load, and a stale name here
+            # would have the new card announcing the last load's handoff.
+            self.handoff_name = None
+            self.handoff_hedged = False
+            self.cancelled = False  # belonged to the load this one supersedes
             # Any pending handoff belonged to the load this one supersedes.
             self._cancel_handoff_timer()
+            # ...as did any stop signal still waiting to be confirmed: this load
+            # is the proof that whatever stopped, stopped before it.
+            self._cancel_stop_confirm()
             self.paused = self._machine_state() == MACHINE_PAUSE
             # Seed the last confirmed phase from the current job state so a
             # caught-up (already-drying) load still detects its finish.
@@ -940,16 +1141,37 @@ class LaundryCoordinator:
             await self._async_save()
             self._notify_entities()
 
-    async def _async_handle_finished(self) -> None:
+    async def _async_handle_finished(
+        self, *, cancelled: bool = False, retract: bool = False
+    ) -> None:
+        """End the tracked load. ``cancelled`` means the cycle didn't finish.
+
+        One completion path for every way a load can end (job 'finish', the ETA
+        gate, the offline path, the max-session net and now a stop on the
+        machine) so the handoff, the queue carry and the persistence can't drift
+        apart.
+
+        ``cancelled`` decides what is *said* — the card, the ping — and whether
+        a claim tapped from here on is logged. ``retract`` decides the one
+        irreversible thing: deleting the claimant's existing history row for
+        this load. They are separate arguments because they answer to different
+        standards of proof (see :func:`cancel.retracts_history`); a hedged
+        wording costs one card, a wrong deletion is permanent.
+        """
         async with self._lock:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
                 return
             self._stop_eta_timer()
+            self._cancel_stop_confirm()
             self.stage = STAGE_DONE_WAITING
             self.paused = False
+            self.cancelled = cancelled
             # Keep the detector in lockstep with the session, regardless of which
             # path completed the load (dry timer, job 'finish', energy backstop).
             self._detector.reset()
+            # Captured before the reset below: it bounds the history retraction
+            # to this load's own session.
+            started_ts = self._session_started_ts
             self._session_started_ts = None
             self._offline_since = None
             self._last_eta_ts = None
@@ -958,8 +1180,28 @@ class LaundryCoordinator:
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
             # Done is not empty: this load's clothes are still in the drum until
-            # somebody says otherwise, so every completion starts un-emptied.
+            # somebody says otherwise, so every completion starts un-emptied,
+            # and with nobody yet told the machine is theirs.
             self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
+            # A cancel is not a wash (design doc §2). A claim made *during* the
+            # wash has already written its history row, so the row is retracted
+            # here — inside the transition that decided this load never
+            # happened — rather than being left for a reader to filter out.
+            # Bounded to this session's window, so an earlier real load of
+            # theirs can't be caught by it. A claim tapped *after* this point is
+            # stopped at the other end, by the `cancelled` check in
+            # handle_claim: between them a stopped cycle has no route into the
+            # model that predicts everybody's wash times.
+            # ...and only when the stop is unambiguous enough to stand behind
+            # deleting data (``retract``, not ``cancelled``): a real completion
+            # that merely beat its own drifting estimate reaches this transition
+            # worded as a stop, and must not take somebody's history with it.
+            if retract and claimed and started_ts is not None:
+                await self.assistant.async_forget_load(
+                    self.claimed_by_id, started_ts, dt_util.utcnow().timestamp()
+                )
             embed = self.build_embed()
             view = view_for(self)
             # Unverified (offline) completions hedge the wording.
@@ -969,38 +1211,54 @@ class LaundryCoordinator:
                 if unverified
                 else ""
             )
+            if cancelled:
+                # Never "done". The bot knows this cycle didn't finish, and a
+                # completion ping that turns out to be wrong is how the pings
+                # stop being read at all.
+                ping_body = (
+                    "🛑 Looks like your load was **stopped early** — the washer's "
+                    "free, but your things are probably still in it."
+                )
+                quiet_body = (
+                    f"🌙 {self.claimed_by}, it looks like your load was **stopped "
+                    "early** — your things are probably still in the washer."
+                )
+                grabs = (
+                    "🛑 **Looks like that load was stopped early** — it didn't "
+                    "finish, and the washer's free again."
+                )
+            else:
+                ping_body = f"🧺 Your laundry's {done} — don't forget the lint tray!{unv}"
+                quiet_body = (
+                    f"🌙 {self.claimed_by}, your laundry's {done} — "
+                    f"don't forget the lint tray!{unv}"
+                )
+                grabs = (
+                    f"🧺 **Laundry's {done} and up for grabs** — come move it, "
+                    f"and don't forget the **lint tray**!{unv}"
+                )
             try:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed, view=view)
                 if claimed and self.quiet:
                     # Quiet mode: name them, but no @mention and no push — a
                     # visible "done" that won't wake them.
-                    await self.bot.async_announce_done(
-                        f"🌙 {self.claimed_by}, your laundry's {done} — "
-                        f"don't forget the lint tray!{unv}"
-                    )
+                    await self.bot.async_announce_done(quiet_body)
                 elif claimed and self.ping_claimant_on_complete:
                     # The one push per load, routed by whatever the claimant
                     # chose in 🤖 — an @mention in the channel unless they've
                     # opted into a DM. Unset means channel, i.e. unchanged.
-                    body = (
-                        f"🧺 Your laundry's {done} — "
-                        f"don't forget the lint tray!{unv}"
-                    )
                     await self.assistant.async_route_ping(
                         self.claimed_by_id,
-                        dm_text=body,
-                        channel_text=f"<@{self.claimed_by_id}> {body}",
+                        dm_text=ping_body,
+                        channel_text=f"<@{self.claimed_by_id}> {ping_body}",
                     )
                 elif not claimed:
                     # Nobody claimed it: no @ping, but drop a short, push-silent
                     # text nudge at the bottom of the channel so the finished load
                     # is visible (the original card above keeps the Claim button).
                     # Plain text, not a second embed, so it isn't a duplicate card.
-                    await self.bot.async_announce_done(
-                        f"🧺 **Laundry's {done} and up for grabs** — come move it, "
-                        f"and don't forget the **lint tray**!{unv}"
-                    )
+                    await self.bot.async_announce_done(grabs)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
             # The handoff. A claimed load is released by the claimant's ✅ tap,
@@ -1024,6 +1282,7 @@ class LaundryCoordinator:
                 return
             self.stage = STAGE_SELF_CLEAN
             self.paused = False
+            self.cancelled = False
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
@@ -1098,7 +1357,15 @@ class LaundryCoordinator:
         # and reporting it is the whole of the coordinator's involvement:
         # consent, de-duplication, retention and whether any of it is ever
         # rendered are the assistant's business. Never raises.
-        await self.assistant.async_note_claim(user_id)
+        #
+        # ...except on a load that was stopped on the machine, which is not a
+        # wash and must never move somebody's predicted times. Claiming one is
+        # still allowed and still useful — it is how you say "those are mine,
+        # I'll deal with it" — it just isn't evidence. The card says "stopped
+        # early", so the state that decides the wording is also the state that
+        # decides this: one flag, no second notion of a cancelled load.
+        if not self.cancelled:
+            await self.assistant.async_note_claim(user_id)
         return True
 
     async def handle_unclaim(self) -> bool:
@@ -1217,6 +1484,12 @@ class LaundryCoordinator:
         )
         if head is None:
             return  # nobody waiting — the line being empty is the normal case
+        # Recorded *here*, next to the pop that causes the problem, and before
+        # the ping rather than after it: the line has already lost them either
+        # way, so a ping that fails and gets logged must still leave the card
+        # saying who it was for. The card render below picks this up.
+        self.handoff_name = queue.entry_name(head)
+        self.handoff_hedged = hedged
         if hedged:
             body = (
                 "🔜 The washer's been done a while and nobody's checked in — "
@@ -1301,6 +1574,78 @@ class LaundryCoordinator:
             self._async_ping_next(hedged=True, expect_emptied=False)
         )
 
+    async def async_reset_session(self) -> None:
+        """Service: force-close whatever session is being tracked.
+
+        The backstop for the failures we haven't thought of. Detection ends a
+        load on its own in every case it knows about — job 'finish', the ETA
+        gate, the flat-energy backstop, an offline completion, and now a stop on
+        the machine — but the absolute net is ``MAX_SESSION_MINUTES``, and
+        waiting 12 hours for a card to unstick itself is not a recovery plan.
+
+        Deliberately a *reset*, not a completion: it announces nothing, pings
+        nobody and hands the machine to no one, because a human calling this is
+        saying "you are wrong about the state of the washer", which is no basis
+        for telling six other people their laundry is ready. The card is closed
+        so it can't be tapped, and the next real load posts a fresh one.
+
+        The 🔜 line is deliberately left alone — the people in it are still
+        waiting for the machine, whatever the bot got wrong about the load —
+        and so is history: an unwedging is not a statement about whether the
+        wash happened, and the cancel path is what retracts a load that didn't.
+        """
+        async with self._lock:
+            self._stop_eta_timer()
+            self._cancel_stop_confirm()
+            self._cancel_handoff_timer()
+            if self._job_confirm_unsub is not None:
+                self._job_confirm_unsub()
+                self._job_confirm_unsub = None
+            if self._selfclean_unsub is not None:
+                self._selfclean_unsub()
+                self._selfclean_unsub = None
+            message_id = self.message_id
+            self.stage = STAGE_IDLE
+            self.waiting = False
+            self.claimed_by = UNCLAIMED
+            self.claimed_by_id = None
+            self.quiet = False
+            self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
+            self.paused = False
+            self.cancelled = False
+            self.catch_up = False
+            self.message_id = None
+            self._last_real_phase = None
+            self._energy_start = self._water_start = None
+            self._session_started_ts = None
+            self._offline_since = None
+            self._last_eta_ts = None
+            self._offline_unverified = False
+            # In lockstep with the session, as at every other completion — a
+            # detector left ACTIVE would refuse to start the next real load.
+            self._detector.reset()
+            if message_id:
+                try:
+                    await self.bot.async_edit(
+                        message_id,
+                        discord.Embed(
+                            title="🧺 Card closed",
+                            description=(
+                                "This card was closed by hand — I'm not tracking "
+                                "a load right now. The next one posts a new card."
+                            ),
+                            color=_COLOR_IDLE,
+                        ),
+                        view=None,
+                    )
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Failed to close the card on reset_session")
+            _LOGGER.debug("Session force-closed via reset_session")
+            await self._async_save()
+            self._notify_entities()
+
     async def async_test_post(self) -> None:
         """Debug service: post a sample embed with a working Claim button."""
         async with self._lock:
@@ -1308,12 +1653,15 @@ class LaundryCoordinator:
             self.waiting = True
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
+            self.cancelled = False
             # A real load's handoff must not fire against this synthetic state:
             # the debug post forces done_waiting and repoints message_id, so a
             # timer armed by an actual finished load would sail past its guard,
             # ping the head of the line for a load that no longer exists and
             # overwrite the sample message with the live embed.
             self.emptied = False
+            self.handoff_name = None
+            self.handoff_hedged = False
             self._cancel_handoff_timer()
             embed = self.build_embed(test=True)
             try:
@@ -1499,7 +1847,28 @@ class LaundryCoordinator:
             self._add_queue(embed)
             self._add_offline_notice(embed)
         elif self.stage == STAGE_DONE_WAITING:
-            if self.claimed_by and self.claimed_by != UNCLAIMED:
+            if self.cancelled:
+                # "Stopped", never "done": the cycle didn't finish and the card
+                # says so. Claiming still works — it is how somebody says the
+                # clothes in the drum are theirs — so the buttons are unchanged.
+                who = (
+                    f"**{self.claimed_by}**'s load"
+                    if self.claimed_by and self.claimed_by != UNCLAIMED
+                    else "This load"
+                )
+                embed = discord.Embed(
+                    title="🛑 Stopped early",
+                    description=(
+                        f"{who} looks like it was **stopped on the machine** "
+                        "rather than finishing.\nThe washer's free — whatever's "
+                        "in the drum still needs moving."
+                    ),
+                    # Grey rather than amber: the machine is idle and the bot is
+                    # not waiting on anybody. It deliberately does not borrow the
+                    # green of a finished load — this cycle did not finish.
+                    color=_COLOR_IDLE,
+                )
+            elif self.claimed_by and self.claimed_by != UNCLAIMED:
                 embed = discord.Embed(
                     title="🧺 Claimed",
                     description=(
@@ -1521,6 +1890,7 @@ class LaundryCoordinator:
             if usage:
                 embed.add_field(name="This load used", value=usage, inline=False)
             self._add_queue(embed)
+            self._add_handoff(embed)
             if self._offline_unverified:
                 embed.add_field(
                     name="⚠️ Unverified",
@@ -1532,7 +1902,7 @@ class LaundryCoordinator:
                 )
         else:
             embed = discord.Embed(
-                title="Laundry", description="Idle.", color=_COLOR_CLAIMED
+                title="Laundry", description="Idle.", color=_COLOR_IDLE
             )
 
         embed.set_footer(text=_FOOTER)
@@ -1570,6 +1940,27 @@ class LaundryCoordinator:
             # Set the expectation: the washer being done doesn't make it free.
             value += f" — you're up once {self.claimed_by} clears it"
         embed.add_field(name="Next up", value=value, inline=False)
+
+    def _add_handoff(self, embed: discord.Embed) -> None:
+        """Show that the line moved, once the head has been taken off it.
+
+        Without this the handoff is a disappearance: the ping pops whoever was
+        first, so "Next up" loses them at the exact moment they were told, and
+        to everyone else the card reads as though they never tapped 🔜 at all.
+        Done-waiting only — it is the one stage in which a handoff can have
+        happened for the load the card is describing.
+
+        Named, like "Claimed by" and "Next up" above it. This is the live card,
+        where the house can already see who is doing what; §11's anonymity rule
+        governs the forward plan, not this.
+        """
+        if not self.handoff_name:
+            return
+        embed.add_field(
+            name="Handed over",
+            value=queue.handoff_line(self.handoff_name, hedged=self.handoff_hedged),
+            inline=False,
+        )
 
     def _add_offline_notice(self, embed: discord.Embed) -> None:
         """Warn on the live card when the washer has been offline a while."""

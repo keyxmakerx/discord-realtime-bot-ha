@@ -354,6 +354,45 @@ def record_load(history, user_id, moment, *, monitor: bool) -> list[dict]:
     return _cap([*rows, record])
 
 
+def forget_load(history, user_id, since, until) -> list[dict]:
+    """Drop one person's rows inside one window — a load that wasn't a wash.
+
+    The counterpart to :func:`record_load`, and the reason the cancel path can
+    be *structurally* incapable of feeding the model rather than merely
+    documented as not doing so. A Claim tap is logged the moment it happens, so
+    by the time the washer reports that somebody stopped the cycle on the
+    machine, the row already exists — and a cancel is not a wash. Leaving it in
+    would move this person's predicted times toward a load they never ran, and
+    those predictions drive every nudge in the system.
+
+    The window is what keeps this from being destructive. ``since`` is the start
+    of the load being retracted and ``until`` its end, so the only rows that can
+    match are ones written *during* it: an earlier, real load of theirs that
+    same evening is outside the window and survives. Inclusive at both ends —
+    the claim can land on the same second as the session start on a load claimed
+    the instant the card appears.
+
+    Anything unreadable — no id, an unparseable bound, a window that runs
+    backwards — removes **nothing**. The dangerous direction here is deleting
+    somebody's real history because of a bad argument, so an unusable call is a
+    no-op rather than a guess, exactly as :func:`prune_history` refuses to age
+    rows off an unreadable clock.
+    """
+    rows = normalise_history(history)
+    if user_id is None or isinstance(user_id, bool):
+        return rows
+    key = str(user_id)
+    start = _timestamp(since)
+    end = _timestamp(until)
+    if not key or start is None or end is None or end < start:
+        return rows
+    return [
+        row
+        for row in rows
+        if not (row["user_id"] == key and start <= row["ts"] <= end)
+    ]
+
+
 def forget_person(records, user_id) -> list:
     """Every row that is **not** this person's, for history or corrections.
 
@@ -435,6 +474,88 @@ def history_days(history, user_id, moment) -> float:
 def history_weeks(history, user_id, moment) -> float:
     """The same span in weeks — the third gate's input."""
     return history_days(history, user_id, moment) / 7
+
+
+# --- how often somebody washes ----------------------------------------------
+# Gaps below this are not a cadence, they are one trip to the utility room
+# counted twice: a wash and then a dry claimed separately, which at 4-5 hours a
+# cycle is the ordinary shape of one evening's laundry. Counting those would
+# drag the median toward a few hours and leave everybody permanently "due".
+#
+# Half a day rather than something tighter because the pair can be far apart —
+# a wash claimed at 17:00 and its dry at 22:00 is five hours. A genuine second
+# load the next morning is over the line and counts, which is right: that is a
+# real interval, whatever prompted it.
+MIN_GAP_DAYS = 0.5
+
+# Two gaps means three loads, which is the same evidence bar the day prediction
+# uses. Below that, "how often do you wash" has no answer worth acting on.
+MIN_GAPS = 2
+
+
+def gaps_for(history, user_id, moment=None) -> list[float]:
+    """The intervals between this person's loads, in days, oldest first.
+
+    Reads through :func:`history_for`, so it inherits the §11 guarantee and the
+    retention window like everything else here.
+    """
+    rows = history_for(history, user_id, moment)
+    gaps: list[float] = []
+    for older, newer in zip(rows, rows[1:]):
+        days = (newer["ts"] - older["ts"]) / SECONDS_PER_DAY
+        if days >= MIN_GAP_DAYS:
+            gaps.append(days)
+    return gaps
+
+
+def typical_gap(history, user_id, moment=None) -> float | None:
+    """How many days this person usually leaves between loads, or **None**.
+
+    The **median**, not the mean, and that is the whole design. One holiday, one
+    fortnight visiting family, one stretch of illness — a single 21-day gap in
+    an otherwise weekly pattern drags a mean past ten days and would silence the
+    opportunity nudge for a week and a half. The median ignores it, which is the
+    behaviour somebody would describe as "it knows I wash about weekly".
+
+    None whenever there is not enough to say (:data:`MIN_GAPS`), and None is the
+    answer that sends nothing: a cadence guessed from one interval is not a
+    cadence, and P6 says the bot stays quiet rather than guessing out loud.
+    """
+    gaps = sorted(gaps_for(history, user_id, moment))
+    if len(gaps) < MIN_GAPS:
+        return None
+    middle = len(gaps) // 2
+    if len(gaps) % 2:
+        return gaps[middle]
+    return (gaps[middle - 1] + gaps[middle]) / 2
+
+
+def days_since_load(history, user_id, moment) -> float | None:
+    """Days since this person's last load, or None if they have none."""
+    rows = history_for(history, user_id, moment)
+    now = moment_ts(moment)
+    if not rows or now is None:
+        return None
+    return max(0.0, (now - rows[-1]["ts"]) / SECONDS_PER_DAY)
+
+
+def is_due(history, user_id, moment) -> bool:
+    """Whether this person is past **their own** usual gap between washes.
+
+    The gate on the opportunity nudge, and the reason it can claim to be useful
+    rather than nagging: the threshold is learned per person, so a housemate who
+    washes twice a week and one who washes fortnightly are both left alone until
+    *they* are overdue by their own standard. A fixed number of days would be
+    wrong for at least one of them and probably both.
+
+    False whenever the cadence is unknown — the common early answer, and the
+    quiet one.
+    """
+    gap = typical_gap(history, user_id, moment)
+    if gap is None:
+        return False
+    since = days_since_load(history, user_id, moment)
+    return since is not None and since >= gap
 
 
 # --- corrections (design doc §7.3) ------------------------------------------
@@ -682,7 +803,7 @@ def predict(history, user_id, moment, corrections=None) -> dict | None:
     """This person's one predicted slot, or **None** — the common answer.
 
     None is not a failure and must not be rendered as a hedge: no prediction
-    means no ``░``, no Sunday sentence and no nudge (P6). The person's
+    means no ``?``, no Sunday sentence and no nudge (P6). The person's
     ``predict`` preference is deliberately not consulted here — this is
     arithmetic about their own history, and whether to *act* on it is the
     panel's call (unlike ``monitor``, which has to be enforced at the write or
@@ -693,7 +814,7 @@ def predict(history, user_id, moment, corrections=None) -> dict | None:
 
 
 def predicted_cells(history, user_id, moment, corrections=None) -> list[str]:
-    """Just the cell keys — what a grid would draw as ``░`` for this viewer.
+    """Just the cell keys — what a grid would draw as ``?`` for this viewer.
 
     Only ever this person's own, so a rendered grid still shows nothing about
     anybody else (P5).

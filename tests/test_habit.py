@@ -68,6 +68,7 @@ describe_bucket = _habit.describe_bucket
 describe_prediction = _habit.describe_prediction
 explain = _habit.explain
 first_load_ts = _habit.first_load_ts
+forget_load = _habit.forget_load
 forget_person = _habit.forget_person
 history_days = _habit.history_days
 history_for = _habit.history_for
@@ -268,6 +269,96 @@ def test_a_junk_history_normalises_to_nothing() -> None:
         {"ts": 10, "user_id": "1", "cell": THU_EVE},
     ]
     assert [row["ts"] for row in normalise_history(out_of_order)] == [10.0, 20.0]
+
+
+# --- retracting a load that turned out not to be one -------------------------
+
+
+def test_a_stopped_load_is_removed_from_history() -> None:
+    # A Claim tap is logged the moment it happens, so a load stopped on the
+    # machine an hour later already has its row. A cancel is not a wash, and
+    # leaving it in would drag this person's predicted times toward a load
+    # they never ran.
+    claimed = at(2026, 8, 6, 21)
+    history = _loads(at(2026, 7, 30), claimed)
+    assert load_count(history, "1") == 2
+    kept = forget_load(history, "1", claimed.timestamp() - 60, claimed.timestamp() + 7200)
+    assert load_count(kept, "1") == 1
+    assert [row["ts"] for row in kept] == [at(2026, 7, 30).timestamp()]
+
+
+def test_retracting_a_load_cannot_reach_an_earlier_real_one() -> None:
+    # The window is the whole safety of this: it is the stopped load's own
+    # session, so last Thursday's real wash — and one from earlier the same
+    # evening — are outside it and survive.
+    earlier = at(2026, 8, 6, 19)
+    claimed = at(2026, 8, 6, 21)
+    history = _loads(at(2026, 7, 30), earlier, claimed)
+    kept = forget_load(history, "1", claimed.timestamp(), claimed.timestamp() + 3600)
+    assert [row["ts"] for row in kept] == [
+        at(2026, 7, 30).timestamp(),
+        earlier.timestamp(),
+    ]
+
+
+def test_retracting_a_load_touches_nobody_else() -> None:
+    moment = at(2026, 8, 6, 21)
+    history = _loads(moment)
+    history = record_load(history, "2", moment, monitor=True)
+    kept = forget_load(history, "1", moment.timestamp(), moment.timestamp() + 3600)
+    assert [row["user_id"] for row in kept] == ["2"]
+    # The int/str id hazard again: the coordinator hands over the int.
+    assert forget_load(history, 2, moment.timestamp(), moment.timestamp() + 1) == [
+        row for row in normalise_history(history) if row["user_id"] == "1"
+    ]
+
+
+def test_the_window_is_inclusive_at_both_ends() -> None:
+    # A load claimed the instant the card appears lands on the same second as
+    # the session start.
+    moment = at(2026, 8, 6, 21)
+    history = _loads(moment)
+    assert forget_load(history, "1", moment.timestamp(), moment.timestamp()) == []
+    assert forget_load(
+        history, "1", moment.timestamp() + 1, moment.timestamp() + 60
+    ) == normalise_history(history)
+
+
+def test_an_unusable_retraction_removes_nothing() -> None:
+    # The dangerous direction is deleting real history because of a bad
+    # argument, so anything unreadable is a no-op — not a guess.
+    history = _regular()
+    normalised = normalise_history(history)
+    now = NOW.timestamp()
+    assert forget_load(history, None, 0, now) == normalised
+    assert forget_load(history, "", 0, now) == normalised
+    assert forget_load(history, True, 0, now) == normalised
+    assert forget_load(history, "1", None, now) == normalised
+    assert forget_load(history, "1", 0, None) == normalised
+    assert forget_load(history, "1", "junk", now) == normalised
+    assert forget_load(history, "1", now, 0) == normalised  # backwards window
+    assert forget_load(None, "1", 0, now) == []
+
+
+def test_a_retraction_that_matches_nothing_changes_nothing() -> None:
+    # The caller compares before saving, so "no row was in that window" has to
+    # come back equal — otherwise every cancel would cost a Store write.
+    history = _regular()
+    assert forget_load(history, "9", 0, NOW.timestamp()) == history
+    assert forget_load(history, "1", NOW.timestamp(), NOW.timestamp() + 3600) == history
+
+
+def test_a_retracted_load_stops_voting_on_the_prediction() -> None:
+    # The point of all of this: the model that drives every nudge must not
+    # learn a time from a cycle somebody cancelled.
+    history = _regular()
+    stopped = at(2026, 8, 13, 9)  # a Thursday morning that never actually ran
+    history = record_load(history, "1", stopped, monitor=True)
+    later = at(2026, 8, 14, 12)
+    assert load_count(history, "1", later) == 9
+    kept = forget_load(history, "1", stopped.timestamp() - 300, stopped.timestamp() + 300)
+    assert load_count(kept, "1", later) == 8
+    assert bucket_counts(kept, "1", moment=later).get("3-am", 0) == 0
 
 
 # --- the JSON string/int id hazard ------------------------------------------
@@ -990,11 +1081,11 @@ def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> Non
 
 
 def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
-    """P4: a ░ nobody can argue with is not a correctable guess.
+    """P4: a ? nobody can argue with is not a correctable guess.
 
     ``predictions`` can return up to three cells — at 30% a piece there is room
     for exactly that — but the 🔮 panel renders ``predict`` (the top one) and
-    ❌ Wrong retires ``predict``. Drawing all three would put ░ on cells the
+    ❌ Wrong retires ``predict``. Drawing all three would put ? on cells the
     panel cannot mention, and tapping Wrong about one of them would silently
     discard a different guess. This is ``assistant._predicted_cells``.
     """
@@ -1023,7 +1114,7 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
         return guess["cell"] if guess else None
 
     # Every cell drawn is one the panel names, so ❌ Wrong always acts on the
-    # ░ the person is actually looking at.
+    # the ? the person is actually looking at.
     assert rendered([]) == [panel([])] == [THU_EVE]
     # ...and it keeps holding as guesses are retired one at a time: the next
     # one down becomes both the drawn cell and the named one, together.
@@ -1033,6 +1124,91 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
     assert rendered(corrections) == [panel(corrections)] == [sat_pm]
     corrections = mark_prediction_wrong(corrections, "1", panel(corrections), now)
     assert (rendered(corrections), panel(corrections)) == ([], None)
+
+
+# --- how often somebody washes (live-use design §3) --------------------------
+def _at(days: float) -> datetime.datetime:
+    """A moment ``days`` after a fixed Saturday, for cadence arithmetic."""
+    return at(2026, 8, 1, 10) + datetime.timedelta(days=days)
+
+
+
+def test_the_usual_gap_is_a_median_so_one_holiday_cannot_silence_a_month():
+    # A mean is the obvious choice and the wrong one. One fortnight away drags
+    # it past ten days, and the opportunity nudge then goes quiet for a week
+    # and a half for somebody who washes every Sunday.
+    history = []
+    for day in (0, 7, 14, 35, 42, 49):  # weekly, with one 21-day holiday
+        history = _habit.record_load(history, "1", _at(day), monitor=True)
+    now = _at(56)
+    gaps = _habit.gaps_for(history, "1", now)
+    assert gaps == [7.0, 7.0, 21.0, 7.0, 7.0]
+    assert sum(gaps) / len(gaps) > 9  # what a mean would have said
+    assert _habit.typical_gap(history, "1", now) == 7.0
+    # An even number of gaps averages the middle two rather than picking one.
+    trimmed = _habit.record_load([], "1", _at(0), monitor=True)
+    for day in (2, 8):
+        trimmed = _habit.record_load(trimmed, "1", _at(day), monitor=True)
+    assert _habit.typical_gap(trimmed, "1", now) == 4.0  # (2 + 6) / 2
+
+
+def test_a_cadence_guessed_from_too_little_is_no_cadence_at_all() -> None:
+    # Two gaps means three loads, the same evidence bar the day prediction
+    # uses. Below it the honest answer is None, and None sends nothing (P6).
+    now = _at(30)
+    assert _habit.typical_gap([], "1", now) is None
+    one = _habit.record_load([], "1", _at(0), monitor=True)
+    assert _habit.typical_gap(one, "1", now) is None
+    two = _habit.record_load(one, "1", _at(7), monitor=True)
+    assert _habit.typical_gap(two, "1", now) is None  # one gap is not a habit
+    three = _habit.record_load(two, "1", _at(14), monitor=True)
+    assert _habit.typical_gap(three, "1", now) == 7.0
+    assert _habit.MIN_GAPS == 2
+
+
+def test_a_wash_and_its_dry_are_one_trip_not_two() -> None:
+    # At 4-5 hours a cycle, a wash claimed at 17:00 and its dry at 22:00 is one
+    # evening's laundry. Counting that five-hour gap as an interval would drag
+    # the median toward a few hours and leave everybody permanently "due".
+    history = []
+    for hours in (0, 5, 24 * 7, 24 * 7 + 5, 24 * 14):
+        history = _habit.record_load(
+            history, "1", _at(hours / 24), monitor=True
+        )
+    assert len(history) == 5  # all five rows are kept; only the *gaps* filter
+    gaps = _habit.gaps_for(history, "1", _at(20))
+    # Only the two genuine week-long intervals survive; the two five-hour ones
+    # are gone, so the answer is "about a week" rather than "about five hours".
+    assert len(gaps) == 2
+    assert all(gap >= _habit.MIN_GAP_DAYS for gap in gaps), gaps
+    assert 6.5 < _habit.typical_gap(history, "1", _at(20)) < 7.0
+    # The one-hour dedupe is a different rule about a different thing: it drops
+    # a *duplicate row* from unclaim-then-reclaim, before any of this is asked.
+    twice = _habit.record_load(
+        _habit.record_load([], "1", _at(0), monitor=True),
+        "1", _at(0.02), monitor=True,
+    )
+    assert len(twice) == 1
+
+
+def test_being_due_is_measured_against_your_own_gap_and_nobody_elses() -> None:
+    # The whole point: the twice-a-week washer and the fortnightly one are both
+    # left alone until *they* are overdue, and a fixed threshold would be wrong
+    # for at least one of them.
+    weekly, fortnightly = [], []
+    for day in (0, 7, 14, 21):
+        weekly = _habit.record_load(weekly, "1", _at(day), monitor=True)
+    for day in (0, 14, 28, 42):
+        fortnightly = _habit.record_load(fortnightly, "2", _at(day), monitor=True)
+    both = weekly + fortnightly
+    # Day 28: the weekly washer is a week overdue, the other is bang on time.
+    assert _habit.days_since_load(both, "1", _at(28)) == 7.0
+    assert _habit.is_due(both, "1", _at(28)) is True
+    assert _habit.is_due(both, "2", _at(49)) is False  # 7 days into a 14 gap
+    assert _habit.is_due(both, "2", _at(56)) is True
+    # No cadence, no claim — the common early answer, and the quiet one.
+    assert _habit.is_due([], "9", _at(28)) is False
+    assert _habit.days_since_load([], "9", _at(28)) is None
 
 
 def _run() -> None:

@@ -209,6 +209,13 @@ collisions — you see it without deciding to look.
 
 ### 6.3 Rendering
 
+> **The glyphs below are superseded.** The density ramp shipped, met a real
+> household, and could not be read: it encodes *magnitude* for what are actually
+> *categories*. It was replaced in v0.24.0 — see
+> [live-use-fixes-design.md §5](live-use-fixes-design.md) for the replacement and
+> the argument. Everything else in this section (the layout, the width cap, the
+> emoji rule) still holds; only the alphabet changed.
+
 ```
       Mo Tu We Th Fr Sa Su
 AM     ·  ·  ▓  ·  ·  ▓  ·
@@ -340,8 +347,9 @@ Nothing can enforce a reservation. If Alex books Thu Eve and Kim throws a load
 in at 18:45, the bot cannot stop her and must not try. Build a lock that can't be
 enforced and the first time it's ignored, trust in the whole board dies.
 
-Both tiers are therefore **information, not permission**: `▓` *planned* (someone
-said so) vs `░` *expected* (the model guessed). No implied authority. The value
+Both tiers are therefore **information, not permission**: *planned* (someone said
+so) vs *expected* (the model guessed) — `▒`/`║` vs `?` since v0.24.0, `▓`/`░`
+when this was written. No implied authority. The value
 is "huh, three people are aiming for Thursday night" — enough to make one of
 them move on their own, which is the mechanism that actually works in a shared
 house.

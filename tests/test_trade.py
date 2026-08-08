@@ -83,10 +83,12 @@ REASON_NO_REPLY_PATH = _trade.REASON_NO_REPLY_PATH
 REASON_UNDELIVERED = _trade.REASON_UNDELIVERED
 REASON_OK = _trade.REASON_OK
 REASON_PAUSED = _trade.REASON_PAUSED
+REASON_QUIET = _trade.REASON_QUIET
 REASON_REMINDERS_OFF = _trade.REASON_REMINDERS_OFF
 REASON_SELF = _trade.REASON_SELF
 REASON_SILENT = _trade.REASON_SILENT
 REASON_SLOT_REFUSED = _trade.REASON_SLOT_REFUSED
+REASON_SWAPS_OFF = _trade.REASON_SWAPS_OFF
 REASON_TOO_MANY_OPEN = _trade.REASON_TOO_MANY_OPEN
 REASON_TRADES_OFF = _trade.REASON_TRADES_OFF
 REASONS = _trade.REASONS
@@ -490,6 +492,89 @@ def test_guessing_and_monitoring_do_not_gate_a_trade() -> None:
     assert _ask(prefs=prefs) == REASON_OK
 
 
+def test_swaps_switched_off_is_a_holder_side_refusal_like_any_other() -> None:
+    # 🔁 is its own switch precisely because a swap ask is a *housemate*
+    # talking, not the habit model: turning the guessing off must not silence
+    # it (the test above), and turning it off must not cost somebody their
+    # reminders. What matters here is that it refuses from behind the same flat
+    # wall as every other holder-side reason — a requester who cannot even name
+    # the holder must not learn from a refusal that this particular housemate
+    # switched swaps off.
+    prefs = _people.set_person(_prefs(), HOLDER, dm_trades=False)
+    assert reachable(prefs, HOLDER, NOW) == REASON_SWAPS_OFF
+    assert _ask(prefs=prefs) == REASON_SWAPS_OFF
+    assert REASON_SWAPS_OFF in HOLDER_REASONS
+    assert refusal_text(REASON_SWAPS_OFF) == refusal_text(REASON_BLOCKED)
+    # The rest of the bot is untouched by it: this is the swap switch, not a
+    # second way of saying 🚫.
+    assert _ask(prefs=prefs, holder=THIRD) == REASON_OK
+    assert _nudge.eligible(prefs, HOLDER, NOW) == REASON_OK
+
+
+def test_quiet_hours_hold_a_swap_ask_and_share_one_definition_of_quiet() -> None:
+    # An anonymous "someone wants your Thursday" at 3am is the message quiet
+    # hours exist for. The window is read through nudge.in_quiet_hours rather
+    # than restated here, the way is_paused already is: two definitions of
+    # "quiet" is how the panel starts showing a window the broker ignores.
+    prefs = _people.set_person(_prefs(), HOLDER, quiet_start=22, quiet_end=8)
+    night = at(2026, 8, 7, 3, 0)
+    assert _nudge.in_quiet_hours(_people.get_person(prefs, HOLDER), night) is True
+    assert reachable(prefs, HOLDER, night) == REASON_QUIET
+    assert _ask(prefs=prefs, moment=night, week=_plan.iso_week_key(night)) == (
+        REASON_QUIET
+    )
+    assert REASON_QUIET in HOLDER_REASONS
+    assert refusal_text(REASON_QUIET) == refusal_text(REASON_BLOCKED)
+    # It is a window, not an off switch: the same ask an hour after it closes
+    # goes through.
+    morning = at(2026, 8, 7, 9, 0)
+    assert reachable(prefs, HOLDER, morning) == REASON_OK
+    assert _ask(prefs=prefs, moment=morning, week=_plan.iso_week_key(morning)) == (
+        REASON_OK
+    )
+
+
+def test_a_swaps_off_refusal_costs_exactly_what_a_real_ask_costs() -> None:
+    # The §11 leak is in the *outcome*, not only in the wording: 🔁 off is a
+    # standing choice, so a cell that refused for free on every probe while its
+    # neighbours went through would identify its holder as one of a fixed set,
+    # and one requester could watch a housemate's week move around the grid.
+    # Both new gates must therefore land in the silent path with the rest.
+    for changes in ({"dm_trades": False}, {"quiet_start": 20, "quiet_end": 8}):
+        prefs = _prefs(holder_changes=changes)
+        reason, request, rows, budgets = claim_request(
+            prefs, [], {}, ASKER, [HOLDER], WANT, OFFER, WEEK, NOW, mine=(OFFER,)
+        )
+        assert reason == REASON_SILENT and request is not None
+        # Inert, exactly like every other silent refusal: never open, so it
+        # blocks nobody's inbox, and never refused, so it does not shut the
+        # cell to the rest of the house on an answer nobody gave.
+        assert is_open(rows[0], NOW) is False
+        assert slot_refused(rows, WANT, WEEK) is False
+        assert _habit.budget_for(budgets, HOLDER)["nudges_today"] == 0
+        # ...and the probe is spent, which is the whole point.
+        assert asked_this_week(rows, ASKER, WANT, WEEK) is True
+
+
+def test_the_askers_own_settings_never_block_the_answer_to_their_own_ask() -> None:
+    # The design's line: 🔁 and quiet hours govern messages the bot or a
+    # housemate *starts*, never a reply to something you did. Somebody who
+    # switched swap requests off so nobody can ask *them* is still owed the
+    # answer to the one they sent, and somebody asking at 23:00 chose to be
+    # awake at 23:00. Gating either here would refuse them with
+    # REASON_NO_REPLY_PATH — a sentence telling them to check a setting that is
+    # already correct.
+    prefs = _people.set_person(_prefs(), ASKER, dm_trades=False)
+    assert _ask(prefs=prefs) == REASON_OK
+    night = at(2026, 8, 6, 23, 0)
+    prefs = _people.set_person(_prefs(), ASKER, quiet_start=22, quiet_end=8)
+    assert _ask(prefs=prefs, moment=night) == REASON_OK
+    # The gates that are about the *route* still bite, because a DM that cannot
+    # land is a question asked into a void.
+    prefs = _people.set_reminders(prefs, ASKER, _people.REMIND_CHANNEL)
+    assert _ask(prefs=prefs, moment=night) == REASON_NO_REPLY_PATH
+
+
 def test_only_one_ask_can_be_waiting_on_one_person() -> None:
     waiting = [_request(requester=THIRD)]
     assert len(open_to(waiting, HOLDER, NOW)) == MAX_OPEN_PER_HOLDER
@@ -772,7 +857,8 @@ def test_the_swap_leaves_everybody_else_where_they_were() -> None:
     overrides = {WEEK: {WANT: [HOLDER, THIRD], OFFER: [ASKER], OTHER: [THIRD]}}
     swapped = apply_swap(prefs, overrides, _request(STATE_ACCEPTED))
     week = _plan.effective_week(prefs, swapped, WEEK)
-    assert week[WANT] == [THIRD, ASKER]
+    # Order matters as much as membership: the third party keeps their place.
+    assert _plan.holders(week, WANT) == [THIRD, ASKER]
     assert _plan.holders(week, OFFER) == [HOLDER]
     assert _plan.holders(week, OTHER) == [THIRD]
 

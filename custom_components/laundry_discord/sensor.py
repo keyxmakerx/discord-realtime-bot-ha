@@ -7,7 +7,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
+from . import queue as queue_mod
 from .const import DOMAIN, STAGE_DONE_WAITING, STAGE_LABELS, UNCLAIMED
 from .entity import LaundryEntity
 
@@ -48,6 +50,13 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
 
     _attr_name = "Laundry Stage"
     _attr_icon = "mdi:washing-machine"
+    # The names ride on the live state (that is the point — a dashboard card),
+    # but they are kept out of recorder history. Persisted, every 🔜 tap would
+    # leave a timestamped row naming who joined and who left, and the retention
+    # window would then answer "who queues most" — the tally design doc §11
+    # bans. `queue_count` stays recorded: it is the same shape of fact the card
+    # shows and names nobody.
+    _unrecorded_attributes = frozenset({"queue", "next_up"})
 
     def __init__(self, coordinator, entry) -> None:
         super().__init__(coordinator, entry)
@@ -62,6 +71,36 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
         ):
             return "Done — claimed"
         return STAGE_LABELS.get(coordinator.stage, coordinator.stage)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """The 🔜 line, so it can reach a dashboard without opening Discord.
+
+        It rides on this entity rather than a new one because it is the same
+        fact — what the machine is doing and who is waiting on it — and a
+        second entity would need its own restore, its own availability and its
+        own row in every dashboard that already shows this one.
+
+        **Count and names only.** The recorder writes a history row whenever a
+        state *or an attribute* changes, and this entity is refreshed by the
+        5-minute health tick, so anything derived from the clock — how long
+        somebody has waited, when they tapped — would differ on every single
+        tick and write ~288 rows a day forever. That is exactly the bug the
+        connection-health sensor had to be fixed for, and it is not worth
+        reintroducing for a number nobody reads. These three change when
+        somebody taps 🔜 (or an entry ages out), and at no other time.
+
+        The selection rules live in :func:`queue.attributes` so the pure tests
+        cover them: the stored line is only pruned when something happens to
+        it, so read cold it can still name somebody the handoff would skip.
+        """
+        coordinator = self.coordinator
+        return queue_mod.attributes(
+            coordinator.queue,
+            dt_util.utcnow().timestamp(),
+            float(coordinator.queue_expiry),
+            coordinator.claimed_by_id,
+        )
 
 
 class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):

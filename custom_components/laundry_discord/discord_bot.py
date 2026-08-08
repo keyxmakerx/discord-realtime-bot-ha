@@ -18,6 +18,7 @@ from .assistant import (
     AssistantView,
     GridView,
     GuessView,
+    NotifyView,
     TradeAskView,
     TradeRequestView,
 )
@@ -33,7 +34,13 @@ from .const import (
     UNCLAIM_CUSTOM_ID,
     UNCLAIMED,
 )
-from .queue import QUEUE_CAP, TOGGLE_FULL, TOGGLE_STALE
+from .queue import (
+    QUEUE_CAP,
+    TOGGLE_FULL,
+    TOGGLE_STALE,
+    position as queue_position,
+    tap_notice,
+)
 from .reminders import NudgeView, PlanDMView
 
 if TYPE_CHECKING:
@@ -73,6 +80,27 @@ async def _dm_notice_followup(
         await coordinator.assistant.async_followup_dm_notice(interaction)
     except Exception:  # noqa: BLE001 - a notice must never break a real tap
         _LOGGER.debug("Could not follow up with the DM-failure notice", exc_info=True)
+
+
+async def _ephemeral_followup(
+    interaction: discord.Interaction, text: str | None
+) -> None:
+    """Say something privately to the tapper *after* the card's own edit.
+
+    Discord allows exactly **one response** per interaction, and a card button
+    spends it on ``edit_message`` — correctly, because the shared card is what
+    the whole house reads. A ``followup`` is a legal second message on that
+    same token, so the person who tapped gets a word addressed to them without
+    the card losing its update. Same shape as :func:`_dm_notice_followup`,
+    errors included: a confirmation must never be the reason a real tap fails,
+    and ``None`` means nothing is owed and no Discord call is made at all.
+    """
+    if not text:
+        return
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+    except Exception:  # noqa: BLE001 - a confirmation must never break a tap
+        _LOGGER.debug("Could not send the tap confirmation", exc_info=True)
 
 
 class _ClaimButton(discord.ui.Button):
@@ -193,6 +221,10 @@ class _NextUpButton(discord.ui.Button):
         user_id = interaction.user.id
         try:
             result = await self.coordinator.handle_next_toggle(who, user_id)
+            # Read the place now, not after the edit: `edit_message` is a round
+            # trip, and anybody else's tap inside that window would move the
+            # line under us and misreport where this person actually stands.
+            place = queue_position(self.coordinator.queue, user_id)
             # Exactly one response per path — Discord rejects a second one, and
             # a swallowed tap shows the user "interaction failed".
             if result == TOGGLE_FULL:
@@ -212,6 +244,13 @@ class _NextUpButton(discord.ui.Button):
                     embed=self.coordinator.build_embed(),
                     view=view_for(self.coordinator),
                 )
+                # ...and then, privately, what it did *for them*. The shared
+                # card alone leaves joining and leaving indistinguishable to
+                # the one person who needs to know which just happened — and
+                # invisible entirely on a phone scrolled past the card. A
+                # followup, not a response: the edit above already spent the
+                # single response this interaction gets.
+                await _ephemeral_followup(interaction, tap_notice(result, place))
             await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to handle I'm next interaction")
@@ -394,6 +433,13 @@ class LaundryDiscordClient(discord.Client):
                 # including the ones a given render leaves out.
                 self.add_view(GridView(self.coordinator.assistant))
                 self.add_view(GuessView(self.coordinator.assistant))
+                # And the 🔔 sub-panel's four toggles, quiet-hours select and
+                # back. Built with no person, which is the template form. It
+                # matters most of all here: a toggle that never registered
+                # still *looks* like it saved — the label only changes on the
+                # re-render a dispatched tap would have caused, so the panel
+                # goes on saying "on" about a message somebody switched off.
+                self.add_view(NotifyView(self.coordinator.assistant))
                 # The reminder DMs' replies. Registered whatever the reminder
                 # option currently says: a DM already sitting in somebody's
                 # inbox has to keep working, and "🔕 Stop asking" is the last

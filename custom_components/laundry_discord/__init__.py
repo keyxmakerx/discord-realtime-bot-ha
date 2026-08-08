@@ -7,7 +7,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
-from .const import DOMAIN, PLATFORMS, SERVICE_TEST_POST
+from .const import DOMAIN, PLATFORMS, SERVICE_RESET_SESSION, SERVICE_TEST_POST
 from .coordinator import LaundryCoordinator
 from .reminders import LaundryReminders
 
@@ -58,8 +58,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             hass.data.pop(DOMAIN, None)
-            if hass.services.has_service(DOMAIN, SERVICE_TEST_POST):
-                hass.services.async_remove(DOMAIN, SERVICE_TEST_POST)
+            for service in (SERVICE_TEST_POST, SERVICE_RESET_SESSION):
+                if hass.services.has_service(DOMAIN, service):
+                    hass.services.async_remove(DOMAIN, service)
 
     return unload_ok
 
@@ -70,9 +71,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
-    """Register the debug test_post service (once)."""
-    if hass.services.has_service(DOMAIN, SERVICE_TEST_POST):
-        return
+    """Register the debug + escape-hatch services (once each)."""
 
     async def _handle_test_post(call: ServiceCall) -> None:
         coordinators = list(hass.data.get(DOMAIN, {}).values())
@@ -82,4 +81,20 @@ def _async_register_services(hass: HomeAssistant) -> None:
         for coordinator in coordinators:
             await coordinator.async_test_post()
 
-    hass.services.async_register(DOMAIN, SERVICE_TEST_POST, _handle_test_post)
+    async def _handle_reset_session(call: ServiceCall) -> None:
+        # No complaint when nothing is loaded: this is the button somebody
+        # reaches for when they already believe something is wrong, and it is
+        # idempotent — calling it against an idle session is a no-op by
+        # construction rather than an error to explain.
+        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
+            await coordinator.async_reset_session()
+
+    # Checked per service rather than once: an upgrade that adds a service
+    # registers it into a running HA where the old one already exists, and an
+    # early return on the first would leave the new one missing until a restart.
+    if not hass.services.has_service(DOMAIN, SERVICE_TEST_POST):
+        hass.services.async_register(DOMAIN, SERVICE_TEST_POST, _handle_test_post)
+    if not hass.services.has_service(DOMAIN, SERVICE_RESET_SESSION):
+        hass.services.async_register(
+            DOMAIN, SERVICE_RESET_SESSION, _handle_reset_session
+        )

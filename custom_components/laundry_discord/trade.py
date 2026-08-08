@@ -161,6 +161,8 @@ REASON_REMINDERS_OFF = "reminders_off"  # 🚫 in the panel
 REASON_NOT_DM = "not_dm"  # they chose the channel; a trade can't go there
 REASON_DM_CLOSED = "dm_closed"  # a previous DM bounced (50007)
 REASON_PAUSED = "paused"  # ⏸, or ⏭ Skip this week
+REASON_SWAPS_OFF = "swaps_off"  # 🔁 off on *their* record — not the house switch
+REASON_QUIET = "quiet"  # inside their overnight quiet window
 REASON_HOLDER_BUSY = "holder_busy"  # they already have an ask waiting
 REASON_BUDGET_DAY = "budget_day"  # their 1-DM-a-day cap
 REASON_UNDELIVERED = "undelivered"  # the DM did not leave the building
@@ -185,6 +187,8 @@ REASONS = (
     REASON_NOT_DM,
     REASON_DM_CLOSED,
     REASON_PAUSED,
+    REASON_SWAPS_OFF,
+    REASON_QUIET,
     REASON_HOLDER_BUSY,
     REASON_BUDGET_DAY,
     REASON_UNDELIVERED,
@@ -200,6 +204,8 @@ HOLDER_REASONS = (
     REASON_NOT_DM,
     REASON_DM_CLOSED,
     REASON_PAUSED,
+    REASON_SWAPS_OFF,
+    REASON_QUIET,
     REASON_HOLDER_BUSY,
     REASON_BUDGET_DAY,
     REASON_UNDELIVERED,
@@ -614,8 +620,15 @@ def with_block(people_map, requester, holder) -> list[str]:
 
 
 # --- can this person be reached at all? --------------------------------------
-def reachable(people_map, user_id, moment) -> str:
-    """Whether a trade DM may be delivered to this person at all.
+def _delivery_gate(people_map, user_id, moment) -> str:
+    """Whether a DM can land on this person at all: the **route**, not the message.
+
+    Split out from :func:`reachable` because the two questions have different
+    answers for the same person: everything here is about whether a DM reaches
+    them, and the two gates :func:`reachable` adds on top are about whether this
+    particular message should be sent. An ask and the *answer* to your own ask
+    need different halves, and conflating them is how somebody's quiet hours
+    would stop them being told what a housemate said.
 
     Returns :data:`REASON_OK` or the first gate that said no. The gates are the
     ones that mean *this person can be sent an unprompted DM*, which is a
@@ -652,6 +665,39 @@ def reachable(people_map, user_id, moment) -> str:
         return REASON_DM_CLOSED
     if nudge.is_paused(person, moment):
         return REASON_PAUSED
+    return REASON_OK
+
+
+def reachable(people_map, user_id, moment) -> str:
+    """Whether an **unprompted** trade ask may be delivered to this person.
+
+    :func:`_delivery_gate` plus the two settings that are about the message
+    rather than the route:
+
+    * **🔁 Swap requests off.** Its own switch, and deliberately not folded into
+      🔮 *Stop guessing*: a swap ask is a **housemate** talking, not the model,
+      so somebody who doesn't want to be predicted at is still a person who can
+      be asked whether they'd swap. The reverse holds too, which is why this
+      exists — somebody can now refuse the asks without refusing the bot.
+    * **Quiet hours**, via :func:`nudge.in_quiet_hours` so there is exactly one
+      definition of the wrapping window, the way :func:`nudge.is_paused` is
+      already the one definition of paused for both modules.
+
+    Both reasons are in :data:`HOLDER_REASONS`, so they render as the same flat
+    sentence every other holder-side refusal does (:func:`refusal_text`) *and*
+    cost the requester the same lapsed row (:func:`claim_request`). That is not
+    tidiness: "swaps off" and "asleep" are facts about a housemate the requester
+    cannot even name, and a refusal that looked or cost different would be a
+    free oracle for exactly the thing anonymity is for.
+    """
+    verdict = _delivery_gate(people_map, user_id, moment)
+    if verdict != REASON_OK:
+        return verdict
+    person = people.get_person(people_map, user_id)
+    if not people.wants_kind(person, people.KIND_TRADES):
+        return REASON_SWAPS_OFF
+    if nudge.in_quiet_hours(person, moment):
+        return REASON_QUIET
     return REASON_OK
 
 
@@ -704,7 +750,16 @@ def check_request(
     held = [plan.normalise_cell(cell) for cell in mine or ()]
     if offered not in held:
         return REASON_NOT_YOURS
-    if reachable(people_map, requester, moment) != REASON_OK:
+    # :func:`_delivery_gate` and deliberately **not** :func:`reachable`: what is
+    # being checked here is whether the *answer to your own ask* can reach you,
+    # and the design's line is that 🔁 and quiet hours govern messages the bot or
+    # a housemate starts, never a reply to something you did. Somebody who
+    # switched swap requests off so nobody can ask *them* is still owed the
+    # answer to the one they sent, and somebody who asks at 23:00 has chosen to
+    # be awake at 23:00. Gating either here would also refuse them with
+    # :data:`REASON_NO_REPLY_PATH`, which tells them to go and check a setting
+    # that is already correct.
+    if _delivery_gate(people_map, requester, moment) != REASON_OK:
         return REASON_NO_REPLY_PATH
     if asked_this_week(requests, requester, wanted, stamp):
         return REASON_ALREADY_ASKED
@@ -725,7 +780,9 @@ def check_holder(people_map, requests, budgets, requester, holder, moment) -> st
 
     * **You are not asking yourself.**
     * **🚫 Don't ask me again**, permanently, for this pair.
-    * **They are reachable at all** (:func:`reachable`).
+    * **They are reachable at all** (:func:`reachable`), which includes their
+      own 🔁 switch and their quiet hours — both of them in
+      :data:`HOLDER_REASONS`, so neither can be told apart from the rest.
     * **They have nothing else waiting** — one ask at a time, per person.
     * **Their daily DM budget has room.** :func:`habit.check_daily_cap`, not
       :func:`habit.check_nudge`: see :func:`claim_request` for the argument
