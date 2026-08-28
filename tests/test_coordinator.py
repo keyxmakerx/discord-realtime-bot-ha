@@ -550,6 +550,89 @@ def test_a_gateway_outage_does_not_log_a_stack_trace_every_hour() -> None:
     assert ok not in coord._tasks
 
 
+class _Ev:
+    """A minimal state-change event: only new_state/old_state are read."""
+
+    class _S:
+        def __init__(self, state):
+            self.state = state
+
+    def __init__(self, old, new):
+        self.data = {
+            "old_state": None if old is None else self._S(old),
+            "new_state": None if new is None else self._S(new),
+        }
+
+
+def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
+    # REGRESSION (v0.28.0, from a live incident). This washer's cloud drops on
+    # a metronome — 19 drops in 15.5 hours, 3087s apart — and on reconnect it
+    # republishes the phase it last saw. `_on_job_state` filtered values that
+    # were themselves `unavailable` but not values arriving *from* it, while
+    # its own comment claimed the opposite. So a stale `wash` replayed on
+    # reconnect took the fast-start accelerant and minted a load out of
+    # nothing: the session began exactly confirm_delay after the drop, the
+    # energy meter never moved, no ETA was ever published, and an hour later
+    # it closed itself by announcing a wash that never happened.
+    #
+    # The rule already existed and was already trusted — cancel.is_flap guards
+    # both stop routes, and its docstring cites _on_job_state as the prior art.
+    # This was the one place not applying it.
+    c = _coordinator()
+    c._job_confirm_unsub = None
+    c._job_from_flap = False
+    # The debounce itself is not under test — only which value it settles on,
+    # and whether that value is allowed to drive the fast paths.
+    c._schedule_job_confirm = lambda: None
+    c._flap_times = []
+    c._notify_entities = lambda: None
+    # _record_flap schedules a save; close it rather than leaving an
+    # un-awaited coroutine warning in the output.
+    c._create_task = lambda coro: coro.close()
+    fed = []
+    c._feed_detector = lambda *a, **kw: fed.append(kw.get("job_accel"))
+    c._job_phase = lambda: "wash"
+
+    # The incident: unavailable -> wash, i.e. the cloud coming back.
+    c._on_job_state(_Ev("unavailable", "wash"))
+    assert c._job_from_flap is True
+    c._async_job_confirmed()
+    assert fed == [False], "a replayed phase must not arm the fast start"
+
+    # A real start, cloud up throughout, is untouched — the accelerant is the
+    # whole reason the card appears before the meter has moved.
+    fed.clear()
+    c._on_job_state(_Ev("none", "wash"))
+    assert c._job_from_flap is False
+    c._async_job_confirmed()
+    assert fed == [True]
+
+    # First-ever reading (no prior state) counts as a flap, matching is_flap.
+    fed.clear()
+    c._on_job_state(_Ev(None, "wash"))
+    c._async_job_confirmed()
+    assert fed == [False]
+
+    # The flag is per settled value, not sticky: a flap-armed debounce that a
+    # genuine change then re-arms must not stay suppressed.
+    fed.clear()
+    c._on_job_state(_Ev("unavailable", "wash"))
+    c._on_job_state(_Ev("wash", "rinse"))
+    c._async_job_confirmed()
+    assert fed == [True]
+
+    # ...and it is consumed, so a later tick cannot inherit it.
+    fed.clear()
+    c._async_job_confirmed()
+    assert fed == [True]
+
+    # A value that IS a flap still returns early and arms nothing.
+    fed.clear()
+    c._job_from_flap = False
+    c._on_job_state(_Ev("wash", "unavailable"))
+    assert fed == [] and c._job_from_flap is False
+
+
 def _run_all() -> None:
     for name, test in sorted(globals().items()):
         if name.startswith("test_") and callable(test):

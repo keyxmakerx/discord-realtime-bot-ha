@@ -201,6 +201,11 @@ class LaundryCoordinator:
         self._eta_cache: tuple[datetime, float] | None = None
         # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
         self._job_confirm_unsub = None
+        # Whether the job_state change that armed that debounce arrived *from*
+        # `unavailable` — i.e. the cloud reconnecting rather than the machine
+        # doing something. It suppresses the job fast-paths for that one
+        # settled value; see `_on_job_state` for what it costs not to.
+        self._job_from_flap = False
         # Pending stop-confirm timer — the same `for: 30s` shape, for "somebody
         # stopped the wash on the machine". Its own handle rather than a second
         # debounce mechanism: a stop and a job_state change can be in flight at
@@ -962,10 +967,27 @@ class LaundryCoordinator:
         if new_s == "unavailable" and old_s not in (None, "unavailable"):
             self._record_flap()
 
-        # Ignore flap values outright (the `not_from: unavailable/unknown`).
+        # Ignore values that are themselves a flap (the `not_to:` half).
         if new_s in UNAVAILABLE_STATES:
             return
 
+        # ...and remember when the value arrived *from* one (the `not_from:`
+        # half, which this comment has always claimed and the code never did).
+        #
+        # This washer's cloud drops on a metronome — 19 drops in 15.5 hours,
+        # 3087 seconds apart — and on reconnect it republishes the phase it
+        # last saw. A stale `wash` replayed that way is indistinguishable here
+        # from a real one, so the fast-start accelerant minted a load out of a
+        # reconnect: session start exactly `confirm_delay` after the drop, an
+        # energy meter that never moved (energy_start == idle_energy ==
+        # last_energy), and no ETA ever published because there was nothing to
+        # estimate. It then closed itself an hour later by announcing a load
+        # that never happened.
+        #
+        # The rule already existed and was already trusted — `cancel.is_flap`
+        # guards both stop routes, and its docstring cites *this function* as
+        # the prior art. It was the one place not applying it.
+        self._job_from_flap = cancel_mod.is_flap(old_s)
         self._schedule_job_confirm()
 
     @callback
@@ -990,13 +1012,26 @@ class LaundryCoordinator:
         'Drying' when the wash->dry transition is confirmed mid-load.
         """
         self._job_confirm_unsub = None
+        from_flap = self._job_from_flap
+        self._job_from_flap = False
         job = self._job_phase()
         if job is None:
             return  # not settled to a real value yet
 
-        # Let the detector see the settled phase, with the job fast-paths enabled
-        # (this is the debounced path, so it's safe from transient flaps).
-        self._feed_detector(job_accel=True)
+        # Let the detector see the settled phase. The job fast-paths — the
+        # early-phase start and the `finish` completion — are enabled only when
+        # this value did not arrive from a reconnect: debouncing proves a value
+        # is *settled*, which is not the same as proving it is *new*, and a
+        # republished phase is perfectly settled.
+        #
+        # Suppressed rather than dropped, and only for this one value. The
+        # detector still sees the phase, the meter still drives start and
+        # finish, and the offline energy-jump catch-up still finds a load that
+        # really did run during the outage — it just has to be corroborated by
+        # the meter instead of taken on the cloud's word. That is what this
+        # module already says it wants: job_state is enrichment, the energy
+        # meter is the authority.
+        self._feed_detector(job_accel=not from_flap)
 
         if job == JOB_STATE_FINISH:
             self._last_real_phase = JOB_STATE_FINISH
