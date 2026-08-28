@@ -5,9 +5,17 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, PLATFORMS, SERVICE_RESET_SESSION, SERVICE_TEST_POST
+from . import diagnose as diagnose_mod
+from .const import (
+    DOMAIN,
+    PLATFORMS,
+    SERVICE_DIAGNOSTICS,
+    SERVICE_RESET_SESSION,
+    SERVICE_TEST_POST,
+)
 from .coordinator import LaundryCoordinator
 from .reminders import LaundryReminders
 
@@ -89,6 +97,61 @@ def _async_register_services(hass: HomeAssistant) -> None:
         for coordinator in list(hass.data.get(DOMAIN, {}).values()):
             await coordinator.async_reset_session()
 
+    async def _handle_diagnostics(call: ServiceCall) -> dict:
+        """Answer "is it stuck, is it lying" without reading a storage file.
+
+        Returns **response data** rather than logging, because the log is
+        exactly where this was unreachable: every line in this integration is
+        debug, so a household at the default level sees nothing from it even
+        while it misbehaves six times in a morning. Response data shows up in
+        Developer Tools the moment the action is run, needs no logger config
+        and no restart, and can be read by an automation that wants to alert on
+        a wedge.
+
+        Never raises. Somebody runs this *because* something is already wrong,
+        and an action that fails with a traceback at that moment is worse than
+        useless — so a coordinator that cannot answer is reported as an entry
+        in the result rather than aborting the whole call.
+        """
+        now = dt_util.utcnow().timestamp()
+        entries = []
+        for entry_id, coordinator in list(hass.data.get(DOMAIN, {}).items()):
+            try:
+                snap = coordinator.diagnostic_snapshot()
+                findings = diagnose_mod.check(
+                    snap["session"],
+                    now,
+                    watched=snap["watched"],
+                    max_session_minutes=snap["config"]["max_session_minutes"],
+                )
+                entries.append({
+                    "entry_id": entry_id,
+                    "summary": diagnose_mod.summarise(findings),
+                    "findings": findings,
+                    "state": snap,
+                })
+            except Exception as err:  # noqa: BLE001 - see the docstring
+                _LOGGER.exception("Diagnostics failed for entry %s", entry_id)
+                entries.append({
+                    "entry_id": entry_id,
+                    "summary": f"could not be read: {type(err).__name__}",
+                    "findings": [],
+                    "state": {},
+                })
+        if not entries:
+            return {"summary": "no Laundry Discord entry is loaded", "entries": []}
+        worst = max(
+            (len([f for f in e["findings"] if f["severity"] == diagnose_mod.PROBLEM])
+             for e in entries),
+            default=0,
+        )
+        return {
+            "summary": entries[0]["summary"] if len(entries) == 1 else (
+                f"{len(entries)} entries, {worst} with problems"
+            ),
+            "entries": entries,
+        }
+
     # Checked per service rather than once: an upgrade that adds a service
     # registers it into a running HA where the old one already exists, and an
     # early return on the first would leave the new one missing until a restart.
@@ -97,4 +160,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
     if not hass.services.has_service(DOMAIN, SERVICE_RESET_SESSION):
         hass.services.async_register(
             DOMAIN, SERVICE_RESET_SESSION, _handle_reset_session
+        )
+    if not hass.services.has_service(DOMAIN, SERVICE_DIAGNOSTICS):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DIAGNOSTICS,
+            _handle_diagnostics,
+            # ONLY, not OPTIONAL: this action exists solely to hand back an
+            # answer, and it changes nothing. Declaring it that way is what
+            # makes Developer Tools show the result instead of just "success".
+            supports_response=SupportsResponse.ONLY,
         )

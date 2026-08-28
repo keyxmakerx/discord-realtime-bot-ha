@@ -633,6 +633,42 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     assert fed == [] and c._job_from_flap is False
 
 
+def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
+    # REGRESSION. v0.28.1 stopped a cloud reconnect minting a phantom load, and
+    # left the identical hole standing on the other entry point: the restore
+    # fed the detector with the job fast-paths ON, asserting "the restored
+    # state is settled". Settled was never the question. `_job_phase()` reads
+    # whatever the washer integration is publishing at that instant, and for a
+    # cloud integration that is routinely the last phase it saw before HA went
+    # down — so a stale `wash` started a whole session, card and completion
+    # ping included, for a load that never ran.
+    #
+    # Every reload counts, not only restarts: an options change calls
+    # async_reload, which builds a fresh coordinator with _restored = False.
+    # Changing a setting must not be able to invent a wash.
+    for stage in (const.STAGE_IDLE, const.STAGE_DONE_WAITING):
+        c = _coordinator(stage=stage)
+        c._restored = False
+        fed = []
+        c._feed_detector = lambda *a, **kw: fed.append(kw.get("job_accel"))
+        c._arm_handoff_timer = lambda: None
+        _run(c.async_on_bot_ready())
+        assert fed == [False], f"{stage}: a restore must not arm the fast start"
+
+    # The guard is not a blanket ban on feeding the detector — a restore still
+    # feeds it, so a load that really is running is picked up by the meter.
+    assert fed, "the restore must still feed the detector"
+
+    # And an active session restores its ETA timer rather than feeding at all.
+    live = _coordinator(stage=const.STAGE_WASHING, message_id=555)
+    live._restored = False
+    live._feed_detector = lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("an active restore must not re-feed the detector")
+    )
+    live._start_eta_timer = lambda: None
+    _run(live.async_on_bot_ready())
+
+
 def _run_all() -> None:
     for name, test in sorted(globals().items()):
         if name.startswith("test_") and callable(test):

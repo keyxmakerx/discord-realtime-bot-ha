@@ -514,11 +514,31 @@ class LaundryCoordinator:
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage in (STAGE_IDLE, STAGE_DONE_WAITING):
-            # Not tracking an active wash, but the washer may already be mid-cycle
-            # (installed/restarted during a load) or a load may have run entirely
-            # while HA was down. One feed covers both; the restored state is
-            # settled, so the job fast-paths are safe to use here.
-            self._feed_detector(job_accel=True)
+            # Not tracking an active wash, but the washer may already be
+            # mid-cycle (installed/restarted during a load) or a load may have
+            # run entirely while HA was down. One feed covers both.
+            #
+            # The job fast-paths are deliberately OFF here, for the same reason
+            # they are off after a reconnect. "The restored state is settled"
+            # is what this used to assert, and settled was never the question:
+            # `_job_phase()` reads whatever the washer integration is
+            # publishing at this instant, and for a cloud integration that is
+            # routinely the last phase it saw before HA went down. A stale
+            # `wash` read here is `job_is_early` against a detector the restore
+            # has just put in RUN_IDLE, which mints a whole session — card,
+            # Claim button, ETA timer, and an hour later a completion ping —
+            # for a load that never ran.
+            #
+            # Every reload counts, not only restarts: an options change calls
+            # `async_reload`, which builds a fresh coordinator with
+            # `_restored = False`. Changing a setting should not be able to
+            # invent a wash.
+            #
+            # Nothing is lost by waiting. A load that really is running moves
+            # the meter, and the energy paths start it on the next reading with
+            # corroboration; a load that ran entirely while HA was down still
+            # arrives as the offline energy jump.
+            self._feed_detector(job_accel=False)
             # ...and a *claimed* load still sitting in done_waiting is owed its
             # handoff backstop. It is armed in exactly one place — the
             # completion that put it here — so a restart in the window between
@@ -730,6 +750,73 @@ class LaundryCoordinator:
             return (False, False)  # stale estimate frozen from a previous load
         self._last_eta_ts = target.timestamp()  # remember for offline completion
         return (True, dt_util.utcnow() >= target)
+
+    def diagnostic_snapshot(self) -> dict:
+        """Everything the health check needs, gathered in one place.
+
+        Deliberately the *live* objects rather than a re-read of the Store: the
+        store is written after a change, so reading it back would show a
+        diagnostic run mid-transition a state that is one save behind. It also
+        means this works before the first save of a fresh install.
+
+        ``watched`` is the washer's own account of itself, and it is the only
+        external truth available — every other field here is the integration
+        reporting on the integration, which cannot catch the case where the bot
+        and the machine disagree.
+        """
+        return {
+            "session": {
+                "stage": self.stage,
+                "waiting": self.waiting,
+                "claimed_by": self.claimed_by,
+                "claimed_by_id": self.claimed_by_id,
+                "quiet": self.quiet,
+                "queue": list(self.queue),
+                "emptied": self.emptied,
+                "message_id": self.message_id,
+                "catch_up": self.catch_up,
+                "paused": self.paused,
+                "cancelled": self.cancelled,
+                "last_real_phase": self._last_real_phase,
+                "energy_start": self._energy_start,
+                "session_started_ts": self._session_started_ts,
+                "offline_since": self._offline_since,
+                "last_eta_ts": self._last_eta_ts,
+                "offline_unverified": self._offline_unverified,
+                "detector": {
+                    "phase": self._detector.phase,
+                    "last_energy": self._detector.last_energy,
+                    "last_rise_ts": self._detector.last_rise_ts,
+                    "idle_energy": self._detector.idle_energy,
+                },
+                "flap_times": list(self._flap_times),
+            },
+            "watched": {
+                "running": self._entity_state(self.running_entity),
+                "machine_state": self._entity_state(self.machine_state_entity),
+                "job_state": self._entity_state(self.job_state_entity),
+                "eta": self._entity_state(self.eta_entity),
+                "energy": self._entity_state(self.energy_entity),
+            },
+            "config": {
+                "confirm_delay": self.confirm_delay,
+                "energy_idle": self.energy_idle,
+                "max_session_minutes": MAX_SESSION_MINUTES,
+            },
+        }
+
+    def _entity_state(self, entity_id):
+        """One watched entity's raw state, or None when unset/missing.
+
+        None covers both "not configured" and "configured but absent", and the
+        check treats them the same: neither can contradict the bot, which is
+        the only thing this field is for. A typo in an entity id therefore
+        shows up as a silently disabled guard rather than as an error.
+        """
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        return None if st is None else st.state
 
     @callback
     def _publish_running(self) -> None:
