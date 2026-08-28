@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 from custom_components.laundry_discord import coordinator as coord_mod  # noqa: E402
 from custom_components.laundry_discord import const  # noqa: E402
 from custom_components.laundry_discord import discord_bot as bot_mod  # noqa: E402
+from custom_components.laundry_discord import diagnose  # noqa: E402
 from custom_components.laundry_discord.detect import EnergyDetector  # noqa: E402
 
 
@@ -581,6 +582,8 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     c = _coordinator()
     c._job_confirm_unsub = None
     c._job_from_flap = False
+    c._flap_recovery_ts = None
+    c._cfg = {}  # confirm_delay falls back to its default for the time memory
     # The debounce itself is not under test — only which value it settles on,
     # and whether that value is allowed to drive the fast paths.
     c._schedule_job_confirm = lambda: None
@@ -590,8 +593,15 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     # un-awaited coroutine warning in the output.
     c._create_task = lambda coro: coro.close()
     fed = []
-    c._feed_detector = lambda *a, **kw: fed.append(kw.get("job_accel"))
+    c._feed_detector = lambda *a, **kw: fed.append(kw.get("allow_early"))
     c._job_phase = lambda: "wash"
+
+    def _age_past_window():
+        # The recovery time-memory deliberately outlives one event (see the
+        # attribute-churn test). These sub-cases are about the per-value flag
+        # alone, so the stamp is aged past the window between them.
+        if c._flap_recovery_ts is not None:
+            c._flap_recovery_ts -= 10_000
 
     # The incident: unavailable -> wash, i.e. the cloud coming back.
     c._on_job_state(_Ev("unavailable", "wash"))
@@ -602,6 +612,7 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     # A real start, cloud up throughout, is untouched — the accelerant is the
     # whole reason the card appears before the meter has moved.
     fed.clear()
+    _age_past_window()
     c._on_job_state(_Ev("none", "wash"))
     assert c._job_from_flap is False
     c._async_job_confirmed()
@@ -618,6 +629,7 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     fed.clear()
     c._on_job_state(_Ev("unavailable", "wash"))
     c._on_job_state(_Ev("wash", "rinse"))
+    _age_past_window()
     c._async_job_confirmed()
     assert fed == [True]
 
@@ -650,7 +662,7 @@ def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
         c = _coordinator(stage=stage)
         c._restored = False
         fed = []
-        c._feed_detector = lambda *a, **kw: fed.append(kw.get("job_accel"))
+        c._feed_detector = lambda *a, **kw: fed.append(bool(kw.get("allow_early")))
         c._arm_handoff_timer = lambda: None
         _run(c.async_on_bot_ready())
         assert fed == [False], f"{stage}: a restore must not arm the fast start"
@@ -667,6 +679,148 @@ def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
     )
     live._start_eta_timer = lambda: None
     _run(live.async_on_bot_ready())
+
+
+def test_the_diagnostic_snapshot_is_reachable_and_serialisable() -> None:
+    # REGRESSION (v0.29.0, critical). The first snapshot read `self.energy_idle`
+    # — an attribute that does not exist; the property is `energy_idle_timeout`
+    # — so the diagnostics action raised AttributeError on every call, and the
+    # handler's never-raise wrapper converted the flagship feature into
+    # "could not be read" for every entry, every time. 399 tests stayed green
+    # because nothing ever called the REAL method: the pure suite fed check()
+    # hand-built dicts, and the one seam between them was the one that broke.
+    # This test exists to make that seam a tested path: real method, real
+    # properties, and the exact JSON trip the websocket response takes.
+    import json as _json
+
+    c = _coordinator(stage=const.STAGE_WASHING, message_id=1542881883527057553)
+    c._cfg = {const.CONF_RUNNING_ENTITY: "binary_sensor.washer_running",
+              const.CONF_JOB_STATE_ENTITY: "sensor.job",
+              const.CONF_ETA_ENTITY: "sensor.eta"}
+    c._flap_times = [1.0, 2.0]
+    c.queue = [{"id": 4242, "name": "Alex", "ts": 3.0}]  # snowflake int rides
+    snap = c.diagnostic_snapshot()
+    _json.dumps(snap)  # the response path must survive it verbatim
+    assert snap["config"]["energy_idle_s"] == const.DEFAULT_ENERGY_IDLE * 60
+    assert snap["session"]["stage"] == const.STAGE_WASHING
+    assert snap["session"]["detector"]["phase"] is not None
+    assert snap["watched"]["running"] is None  # unset entity = None, honestly
+    # ...and the pure checks accept the real shape end to end.
+    findings = diagnose.check(snap["session"], 10_000.0, watched=snap["watched"])
+    assert isinstance(findings, list)
+
+
+def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
+    # REGRESSION (v0.29.1). HA fires state_changed for attribute-only updates,
+    # and _on_job_state used to overwrite _job_from_flap on every one of them:
+    # `unavailable -> wash` set the flag, a `wash -> wash` RSSI update seconds
+    # later stomped it back to False and re-armed the debounce — so the
+    # replayed phase got the accelerant after all, and the incident's phantom
+    # returned through a two-event reconnect.
+    c = _coordinator()
+    c._job_confirm_unsub = None
+    c._job_from_flap = False
+    c._flap_recovery_ts = None
+    c._cfg = {}  # confirm_delay falls back to its default for the time memory
+    c._schedule_job_confirm = lambda: None
+    c._flap_times = []
+    c._notify_entities = lambda: None
+    c._create_task = lambda coro: coro.close()
+    fed = []
+    c._feed_detector = lambda *a, **kw: fed.append(kw.get("allow_early"))
+    c._job_phase = lambda: "wash"
+
+    c._on_job_state(_Ev("unavailable", "wash"))
+    assert c._job_from_flap is True
+    c._on_job_state(_Ev("wash", "wash"))  # attribute-only churn
+    assert c._job_from_flap is True, "same-state events must not touch the flag"
+    c._async_job_confirmed()
+    assert fed == [False]
+
+    # The launder chain: unavailable -> none, then none -> wash. The second
+    # hop's old_state is clean, so the per-value flag alone would wave the
+    # replayed phase through; the recovery time-memory is what catches it.
+    fed.clear()
+    c._on_job_state(_Ev("unavailable", "none"))
+    c._on_job_state(_Ev("none", "wash"))
+    assert c._job_from_flap is False  # the flag really is blind here
+    c._async_job_confirmed()
+    assert fed == [False], "the time memory must cover what the flag cannot"
+
+    # ...and it expires: a genuine start long after the reconnect keeps its
+    # fast card. (The stamp is aged past the window by hand — the window is
+    # confirm_delay + 90, and nothing else in this test advances the clock.)
+    fed.clear()
+    c._flap_recovery_ts -= 10_000
+    c._on_job_state(_Ev("none", "wash"))
+    c._async_job_confirmed()
+    assert fed == [True]
+
+
+def test_restore_trusts_the_meter_not_the_replayed_phase() -> None:
+    # REGRESSION (v0.29.1). The restore fed the detector with the fast paths
+    # fully off, which stopped the restart-phantom but silently regressed the
+    # honest cases with it: a genuinely mid-cycle load at restart waited
+    # 15-60+ minutes for the next job transition. The split restores exactly
+    # the corroborated half: a mid-cycle phase may start a load if and only
+    # if the meter has moved since idle.
+    for stage in (const.STAGE_IDLE, const.STAGE_DONE_WAITING):
+        c = _coordinator(stage=stage)
+        c._restored = False
+        c._arm_handoff_timer = lambda: None
+        seen = []
+        c._feed_detector = lambda *a, **kw: seen.append(
+            (kw.get("allow_early"), kw.get("allow_catchup"))
+        )
+        _run(c.async_on_bot_ready())
+        assert seen == [(None, True)], f"{stage}: catch-up only at restore"
+
+
+def test_the_accel_split_separates_the_two_bets() -> None:
+    # The semantic the split must hold: an early phase is trusted only with
+    # allow_early (it starts on the cloud's word alone — the phantom risk);
+    # a mid-cycle phase is trusted only through allow_catchup (detect demands
+    # the meter moved since idle — corroborated by construction). `finish`
+    # rides with allow_early because a replayed finish is the mirror phantom.
+    c = _coordinator(stage=const.STAGE_IDLE)
+    c._cfg = {}  # the entity properties read config even when their reads are stubbed
+    c._flap_times = []
+    seen = {}
+
+    class _Det:
+        phase = "idle"
+        last_energy = 11.6
+        last_rise_ts = None
+        idle_energy = 11.6
+
+        def observe(self, *a, **kw):
+            seen.update(kw)
+            return None
+
+    c._detector = _Det()
+    c._track_offline = lambda: None
+    c._eta_status = lambda: (False, False)
+    c._wrinkle_active = lambda: False
+    c._machine_state = lambda: None
+    c._entity_float = lambda _x: 11.6
+
+    c._job_phase = lambda: "wash"  # early phase
+    c._feed_detector(allow_early=False, allow_catchup=True)
+    assert seen["job_is_real"] is False and seen["job_is_early"] is False
+    c._feed_detector(allow_early=True, allow_catchup=False)
+    assert seen["job_is_real"] is True and seen["job_is_early"] is True
+
+    c._job_phase = lambda: "rinse"  # mid-cycle phase
+    c._feed_detector(allow_early=True, allow_catchup=False)
+    assert seen["job_is_real"] is False
+    c._feed_detector(allow_early=False, allow_catchup=True)
+    assert seen["job_is_real"] is True and seen["job_is_early"] is False
+
+    c._job_phase = lambda: "finish"
+    c._feed_detector(allow_early=False, allow_catchup=True)
+    assert seen["job_is_finish"] is False
+    c._feed_detector(allow_early=True, allow_catchup=False)
+    assert seen["job_is_finish"] is True
 
 
 def _run_all() -> None:

@@ -77,8 +77,17 @@ def test_the_real_incident_is_diagnosed_without_a_human_doing_arithmetic():
     assert "started_on_a_reconnect" in codes  # 34s after a drop
     assert "no_completion_estimate" in codes  # the washer never estimated one
     assert "connection_cadence" in codes      # drops on a timer, not at random
-    assert found[0]["severity"] == PROBLEM    # worst first
-    assert "problem" in summarise(found)
+    # All warnings, none problems — by the module's own severity contract. A
+    # phantom is "wrong now, and a safety net will eventually clear it" (the
+    # flat-energy backstop ends it within the hour); PROBLEM is reserved for
+    # states nothing will clear. The wording carries the action instead: the
+    # meter finding names reset_session, and the machine finding asks for a
+    # second run, which a wedge survives and an end-of-cycle window does not.
+    assert all(f["severity"] == WARNING or f["code"] == "connection_cadence"
+               for f in found)
+    assert "warning" in summarise(found)
+    assert "reset_session" in next(
+        f for f in found if f["code"] == "meter_never_moved")["detail"]
 
 
 def test_a_healthy_running_load_is_reported_healthy():
@@ -197,6 +206,88 @@ def test_the_impossible_pair_is_reported_as_proof_of_a_race():
     assert "claimed_and_waiting" not in _codes(
         check(_incident(claimed_by="Unclaimed", claimed_by_id=None, waiting=True), STARTED, watched={})
     )
+
+
+def test_an_outage_is_an_outage_not_a_phantom():
+    # The worst false positive the first release had: a real load whose cloud
+    # drops a few minutes in freezes the meter at its start value, and at 75
+    # minutes the check called it "almost certainly a load that never existed"
+    # and advised reset_session — killing a legitimate wash mid-outage. The
+    # offline fact was sitting unread in the same dict the whole time.
+    away = _incident(offline_since=STARTED + 180)
+    found = check(
+        away, STARTED + 7200,
+        watched={"running": "unavailable", "machine_state": "unavailable"},
+    )
+    codes = _codes(found)
+    assert "meter_never_moved" not in codes
+    assert "no_completion_estimate" not in codes
+    assert "started_on_a_reconnect" not in codes
+    assert "washer_offline" in codes          # said out loud, not just skipped
+    # Back online, the same state is accused again.
+    assert "meter_never_moved" in _codes(check(_incident(), STARTED + 7200, watched={}))
+
+
+def test_reconnect_proximity_corroborates_and_never_accuses_alone():
+    # Drops arrive every ~51 min around the clock, so bare proximity would
+    # flag ~8% of perfectly healthy loads. It may only ever second the silent
+    # meter's accusation, so early in a load — meter legitimately unmoved
+    # under its 15-45 min lag, but under the 75-min bar — it stays quiet.
+    early = check(_incident(), STARTED + 40 * 60, watched={})
+    assert "started_on_a_reconnect" not in _codes(early)
+    late = check(_incident(), STARTED + 80 * 60, watched={})
+    assert "started_on_a_reconnect" in _codes(late)
+    # A moved meter clears both accusations at once.
+    moved = _incident(detector={"phase": "active", "last_energy": 12.9,
+                                "last_rise_ts": STARTED + 900, "idle_energy": 11.6})
+    assert "started_on_a_reconnect" not in _codes(check(moved, STARTED + 80 * 60, watched={}))
+
+
+def test_a_self_clean_is_never_accused_of_missing_an_estimate():
+    # Drum cleans never publish a completion estimate, so its absence carries
+    # no information. (The check's other suppressions still apply to it.)
+    sc = _incident(stage="self_clean")
+    assert "no_completion_estimate" not in _codes(check(sc, STARTED + 3600, watched={}))
+
+
+def test_junk_numerics_are_refused_rather_than_carried():
+    # A literal NaN cannot round-trip HA's store, but the STRING "nan" can —
+    # json and float() both accept it — and one such value in flap_times
+    # walked to int(median // 60) and raised, in the module whose contract is
+    # that it never raises. Infinity is the same trap for the meter check.
+    poisoned = _incident(flap_times=["nan", 1.0, 2.0])
+    assert isinstance(check(poisoned, STARTED, watched={}), list)  # not raises
+    rich = _incident(energy_start=float("inf"))
+    assert "meter_never_moved" not in _codes(check(rich, STARTED + 7200, watched={}))
+    count, median, regular = flap_cadence(["nan", "inf", 1.0, 2.0])
+    assert count == 2 and regular is False
+
+
+def test_regularity_is_a_fraction_not_a_unanimity_vote():
+    # One drop the recorder missed merges two 3087s gaps into ~6174s. Under
+    # the all-gaps rule that single outlier flipped the incident's own
+    # metronome to "ordinary unreliable link" — pointing the owner at the
+    # wifi while the evidence said timer.
+    missing_one = FLAPS[:7] + FLAPS[8:]
+    count, median, regular = flap_cadence(missing_one)
+    assert regular is True, (count, median)
+    # ...while two drops — one gap, conforming to itself — is not a cadence.
+    assert flap_cadence(FLAPS[:2])[2] is False
+    assert flap_cadence([0.0, 500.0, 1040.0])[2] is False  # nor two gaps
+
+
+def test_the_multi_entry_summary_counts_entries_not_findings():
+    # The first inline version rendered max-problems-within-one-entry as the
+    # number of entries WITH problems — "2 entries, 4 with problems" from a
+    # two-entry install. Units matter in the one line everybody reads first.
+    two = [
+        {"findings": [{"severity": "problem"}, {"severity": "problem"},
+                      {"severity": "problem"}]},
+        {"findings": [{"severity": "warning"}]},
+    ]
+    assert _d.summarise_entries(two) == "2 entries, 1 with problems"
+    assert _d.summarise_entries([]) == "0 entries, 0 with problems"
+    assert _d.summarise_entries("junk") == "0 entries, 0 with problems"
 
 
 def _run() -> None:

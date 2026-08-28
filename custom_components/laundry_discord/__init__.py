@@ -66,7 +66,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             hass.data.pop(DOMAIN, None)
-            for service in (SERVICE_TEST_POST, SERVICE_RESET_SESSION):
+            for service in (
+                SERVICE_TEST_POST,
+                SERVICE_RESET_SESSION,
+                SERVICE_DIAGNOSTICS,
+            ):
                 if hass.services.has_service(DOMAIN, service):
                     hass.services.async_remove(DOMAIN, service)
 
@@ -140,14 +144,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 })
         if not entries:
             return {"summary": "no Laundry Discord entry is loaded", "entries": []}
-        worst = max(
-            (len([f for f in e["findings"] if f["severity"] == diagnose_mod.PROBLEM])
-             for e in entries),
-            default=0,
-        )
         return {
             "summary": entries[0]["summary"] if len(entries) == 1 else (
-                f"{len(entries)} entries, {worst} with problems"
+                diagnose_mod.summarise_entries(entries)
             ),
             "entries": entries,
         }
@@ -166,8 +165,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
             DOMAIN,
             SERVICE_DIAGNOSTICS,
             _handle_diagnostics,
-            # ONLY, not OPTIONAL: this action exists solely to hand back an
-            # answer, and it changes nothing. Declaring it that way is what
-            # makes Developer Tools show the result instead of just "success".
-            supports_response=SupportsResponse.ONLY,
+            # OPTIONAL, not ONLY. ONLY reads as the natural choice for an
+            # action whose entire product is its answer — and it makes a bare
+            # `hass.services.async_call` from a script or automation hard-fail
+            # with a ValueError on the running HA. Somebody wiring "run
+            # diagnostics nightly" without capturing the response should get a
+            # no-op, not an error in the log of the very tool meant to keep
+            # the log clean. Developer Tools shows the response either way.
+            supports_response=SupportsResponse.OPTIONAL,
         )
