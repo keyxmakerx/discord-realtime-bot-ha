@@ -57,6 +57,14 @@
     "test_post": {
       "name": "Test post",
       "description": "Post a sample embed with a working Claim button to test the Discord path without a real wash."
+    },
+    "reset_session": {
+      "name": "Reset session",
+      "description": "Force-close the load the bot thinks is running and go back to idle. Announces nothing and pings nobody."
+    },
+    "diagnostics": {
+      "name": "Diagnostics",
+      "description": "Check the bot's health and return the findings as response data. Changes nothing; safe to run mid-wash."
     }
   }
 }

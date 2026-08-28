@@ -201,6 +201,16 @@ class LaundryCoordinator:
         self._eta_cache: tuple[datetime, float] | None = None
         # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
         self._job_confirm_unsub = None
+        # Whether the job_state change that armed that debounce arrived *from*
+        # `unavailable` — i.e. the cloud reconnecting rather than the machine
+        # doing something. It suppresses the job fast-paths for that one
+        # settled value; see `_on_job_state` for what it costs not to.
+        self._job_from_flap = False
+        # ...and WHEN the last recovery from unavailable happened. The flag
+        # alone can be laundered (unavailable -> none -> wash hands the last
+        # hop a clean old_state) or stomped by attribute-only churn; the
+        # timestamp survives both. Consumed by _async_job_confirmed.
+        self._flap_recovery_ts = None
         # Pending stop-confirm timer — the same `for: 30s` shape, for "somebody
         # stopped the wash on the machine". Its own handle rather than a second
         # debounce mechanism: a stop and a job_state change can be in flight at
@@ -509,11 +519,37 @@ class LaundryCoordinator:
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage in (STAGE_IDLE, STAGE_DONE_WAITING):
-            # Not tracking an active wash, but the washer may already be mid-cycle
-            # (installed/restarted during a load) or a load may have run entirely
-            # while HA was down. One feed covers both; the restored state is
-            # settled, so the job fast-paths are safe to use here.
-            self._feed_detector(job_accel=True)
+            # Not tracking an active wash, but the washer may already be
+            # mid-cycle (installed/restarted during a load) or a load may have
+            # run entirely while HA was down. One feed covers both.
+            #
+            # The EARLY half of the accelerant is off here, for the same reason
+            # it is off after a reconnect. "The restored state is settled"
+            # is what this used to assert, and settled was never the question:
+            # `_job_phase()` reads whatever the washer integration is
+            # publishing at this instant, and for a cloud integration that is
+            # routinely the last phase it saw before HA went down. A stale
+            # `wash` read here is `job_is_early` against a detector the restore
+            # has just put in RUN_IDLE, which mints a whole session — card,
+            # Claim button, ETA timer, and an hour later a completion ping —
+            # for a load that never ran.
+            #
+            # Every reload counts, not only restarts: an options change calls
+            # `async_reload`, which builds a fresh coordinator with
+            # `_restored = False`. Changing a setting should not be able to
+            # invent a wash.
+            #
+            # The CATCH-UP half stays on, and this is not a soft option — the
+            # first fix here turned the accelerant off wholesale, and that
+            # quietly regressed the two honest cases: a genuinely mid-cycle
+            # load at restart waited on the next job transition (15-60+
+            # minutes, or forever on a frozen job_state), and a load that ran
+            # entirely while HA was down could be missed outright once the
+            # reconnect's machine_state read `stop` and vetoed the energy
+            # jump. Catch-up requires the meter to have moved since idle, so
+            # it provably cannot fire on the stale-phase/flat-meter shape that
+            # minted the phantom — the corroboration IS the guard.
+            self._feed_detector(allow_catchup=True)
             # ...and a *claimed* load still sitting in done_waiting is owed its
             # handoff backstop. It is armed in exactly one place — the
             # completion that put it here — so a restart in the window between
@@ -726,6 +762,81 @@ class LaundryCoordinator:
         self._last_eta_ts = target.timestamp()  # remember for offline completion
         return (True, dt_util.utcnow() >= target)
 
+    def diagnostic_snapshot(self) -> dict:
+        """Everything the health check needs, gathered in one place.
+
+        Deliberately the *live* objects rather than a re-read of the Store: the
+        store is written after a change, so reading it back would show a
+        diagnostic run mid-transition a state that is one save behind. It also
+        means this works before the first save of a fresh install.
+
+        ``watched`` is the washer's own account of itself, and it is the only
+        external truth available — every other field here is the integration
+        reporting on the integration, which cannot catch the case where the bot
+        and the machine disagree.
+        """
+        return {
+            "session": {
+                "stage": self.stage,
+                "waiting": self.waiting,
+                "claimed_by": self.claimed_by,
+                "claimed_by_id": self.claimed_by_id,
+                "quiet": self.quiet,
+                "queue": list(self.queue),
+                "emptied": self.emptied,
+                "message_id": self.message_id,
+                "catch_up": self.catch_up,
+                "paused": self.paused,
+                "cancelled": self.cancelled,
+                "last_real_phase": self._last_real_phase,
+                "energy_start": self._energy_start,
+                "session_started_ts": self._session_started_ts,
+                "offline_since": self._offline_since,
+                "last_eta_ts": self._last_eta_ts,
+                "offline_unverified": self._offline_unverified,
+                "detector": {
+                    "phase": self._detector.phase,
+                    "last_energy": self._detector.last_energy,
+                    "last_rise_ts": self._detector.last_rise_ts,
+                    "idle_energy": self._detector.idle_energy,
+                },
+                "flap_times": list(self._flap_times),
+            },
+            "watched": {
+                "running": self._entity_state(self.running_entity),
+                "machine_state": self._entity_state(self.machine_state_entity),
+                "job_state": self._entity_state(self.job_state_entity),
+                "eta": self._entity_state(self.eta_entity),
+                "energy": self._entity_state(self.energy_entity),
+            },
+            "config": {
+                "confirm_delay": self.confirm_delay,
+                # Named by unit, and read through the real property. The first
+                # release of this method read `self.energy_idle`, which does
+                # not exist — and the handler's never-raise wrapper politely
+                # converted that AttributeError into "could not be read" for
+                # every entry, every time. The action shipped dead, and 399
+                # green tests never noticed because nothing called the real
+                # snapshot: the pure suite drove check() with hand-built
+                # dicts. tests/test_coordinator.py now calls this method.
+                "energy_idle_s": self.energy_idle_timeout,
+                "max_session_minutes": MAX_SESSION_MINUTES,
+            },
+        }
+
+    def _entity_state(self, entity_id):
+        """One watched entity's raw state, or None when unset/missing.
+
+        None covers both "not configured" and "configured but absent", and the
+        check treats them the same: neither can contradict the bot, which is
+        the only thing this field is for. A typo in an entity id therefore
+        shows up as a silently disabled guard rather than as an error.
+        """
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        return None if st is None else st.state
+
     @callback
     def _publish_running(self) -> None:
         """Tell the planner the live load's window, so its grid can draw ``*``.
@@ -806,23 +917,47 @@ class LaundryCoordinator:
             )
 
     @callback
-    def _feed_detector(self, _now=None, *, job_accel: bool = False) -> None:
+    def _feed_detector(
+        self, _now=None, *, allow_early: bool = False, allow_catchup: bool = False
+    ) -> None:
         """Drive the energy-primary liveness core from current sensor readings.
 
         Called from every signal (energy/job/machine/running changes, the health
         tick, the ETA tick, bot-ready). The detector dedupes — it only emits an
         event on a real transition — so calling this often is safe and cheap.
 
-        ``job_accel`` enables the job_state fast-paths (early-phase start, finish
-        completion). It is only set on the *debounced* confirm path (and the
-        one-shot restore), so a transient phase flap can never start a load — the
-        energy meter remains the authority for everything else.
+        The job fast-paths are two different bets and are gated separately,
+        because they fail differently:
+
+        * ``allow_early`` — trust an early phase (and ``finish``) on the
+          cloud's word alone, before the meter has moved. The whole value is
+          starting the card before this meter's 15-45 minute lag; the whole
+          risk is that a *replayed* phase mints a load out of nothing, which
+          is exactly what a reconnect and a restore both delivered. Only the
+          debounced confirm path may set it, and only for a value that did
+          not arrive from a flap. The ``finish`` accelerant rides on this half
+          for the same reason: a replayed ``finish`` is the mirror phantom —
+          it would complete a live load early.
+        * ``allow_catchup`` — trust a mid-cycle phase only when the meter has
+          moved since idle (detect.py enforces the corroboration). Safe by
+          construction against a flat meter, so the restore and even a
+          flap-arrived confirm may set it freely.
         """
         self._track_offline()
         phase = self._job_phase()
-        is_real = job_accel and phase in REAL_PHASES and phase != JOB_STATE_FINISH
-        is_early = is_real and phase not in MIDCYCLE_PHASES
-        is_finish = job_accel and phase == JOB_STATE_FINISH
+        is_early = (
+            allow_early
+            and phase in REAL_PHASES
+            and phase != JOB_STATE_FINISH
+            and phase not in MIDCYCLE_PHASES
+        )
+        is_catchup = (
+            allow_catchup
+            and phase in MIDCYCLE_PHASES
+            and phase != JOB_STATE_FINISH
+        )
+        is_real = is_early or is_catchup
+        is_finish = allow_early and phase == JOB_STATE_FINISH
         has_eta, eta_passed = self._eta_status()
         before = (self._detector.last_energy, self._detector.last_rise_ts)
         ev = self._detector.observe(
@@ -958,14 +1093,53 @@ class LaundryCoordinator:
         old = event.data.get("old_state")
         old_s = old.state if old is not None else None
 
+        # An attribute-only republish — HA fires state_changed for those too —
+        # is not a transition. Returning here is load-bearing, not tidiness:
+        # this handler used to overwrite `_job_from_flap` on every event, so a
+        # reconnect's `unavailable -> wash` (flag set True) followed seconds
+        # later by a `wash -> wash` attribute update (flag stomped back to
+        # False, debounce re-armed) handed the replayed phase the fast start
+        # after all — the exact phantom v0.28.1 was written to stop, minted
+        # through a two-event reconnect instead of one.
+        if old_s == new_s:
+            return
+
         # Connection health: record each transition INTO unavailable.
         if new_s == "unavailable" and old_s not in (None, "unavailable"):
             self._record_flap()
 
-        # Ignore flap values outright (the `not_from: unavailable/unknown`).
+        # Ignore values that are themselves a flap (the `not_to:` half).
         if new_s in UNAVAILABLE_STATES:
             return
 
+        # ...and remember when the value arrived *from* one (the `not_from:`
+        # half, which this comment has always claimed and the code never did).
+        #
+        # This washer's cloud drops on a metronome — 19 drops in 15.5 hours,
+        # 3087 seconds apart — and on reconnect it republishes the phase it
+        # last saw. A stale `wash` replayed that way is indistinguishable here
+        # from a real one, so the fast-start accelerant minted a load out of a
+        # reconnect: session start exactly `confirm_delay` after the drop, an
+        # energy meter that never moved (energy_start == idle_energy ==
+        # last_energy), and no ETA ever published because there was nothing to
+        # estimate. It then closed itself an hour later by announcing a load
+        # that never happened.
+        #
+        # The rule already existed and was already trusted — `cancel.is_flap`
+        # guards both stop routes, and its docstring cites *this function* as
+        # the prior art. It was the one place not applying it.
+        self._job_from_flap = cancel_mod.is_flap(old_s)
+        # ...and remember WHEN, not only whether. The per-value flag alone can
+        # be laundered: a reconnect that passes through an intermediate real
+        # value (`unavailable -> none`, then `none -> wash`) hands the second
+        # transition a clean old_state, and the replayed phase regains the
+        # fast start. Reconnect chains complete within seconds, so a short
+        # window after any recovery covers every shape of replay, while a
+        # genuine start that merely lands near a reconnect loses nothing but
+        # the accelerant — the meter or the next settled transition still
+        # starts it.
+        if self._job_from_flap:
+            self._flap_recovery_ts = dt_util.utcnow().timestamp()
         self._schedule_job_confirm()
 
     @callback
@@ -990,13 +1164,32 @@ class LaundryCoordinator:
         'Drying' when the wash->dry transition is confirmed mid-load.
         """
         self._job_confirm_unsub = None
+        from_flap = self._job_from_flap
+        self._job_from_flap = False
+        # The time memory backs up the flag — see _on_job_state. The window
+        # must outlast the debounce, or a launder chain whose last hop re-armed
+        # the timer would settle just past its own recovery stamp.
+        if not from_flap and self._flap_recovery_ts is not None:
+            since = dt_util.utcnow().timestamp() - self._flap_recovery_ts
+            from_flap = since < (self.confirm_delay + 90)
         job = self._job_phase()
         if job is None:
             return  # not settled to a real value yet
 
-        # Let the detector see the settled phase, with the job fast-paths enabled
-        # (this is the debounced path, so it's safe from transient flaps).
-        self._feed_detector(job_accel=True)
+        # Let the detector see the settled phase. The job fast-paths — the
+        # early-phase start and the `finish` completion — are enabled only when
+        # this value did not arrive from a reconnect: debouncing proves a value
+        # is *settled*, which is not the same as proving it is *new*, and a
+        # republished phase is perfectly settled.
+        #
+        # Suppressed rather than dropped, and only the half that needs it.
+        # The catch-up half stays on even for a flap-arrived value, because it
+        # is corroborated by construction — it requires the meter to have
+        # moved since idle, and the incident's meter provably had not
+        # (11.6 == 11.6 == 11.6). A replayed mid-cycle phase whose meter HAS
+        # moved is a load that is genuinely running, and refusing to pick it
+        # up would trade a phantom for a miss.
+        self._feed_detector(allow_early=not from_flap, allow_catchup=True)
 
         if job == JOB_STATE_FINISH:
             self._last_real_phase = JOB_STATE_FINISH

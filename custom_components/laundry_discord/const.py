@@ -340,6 +340,11 @@ SERVICE_TEST_POST = "test_post"
 # about, and the absolute net is MAX_SESSION_MINUTES above — 12 hours, which is
 # not a recovery plan for the failure nobody predicted.
 SERVICE_RESET_SESSION = "reset_session"
+# The health check. Returns its answer as response data rather than writing to
+# the log, because the log is exactly where this information was unreachable:
+# every line here is debug, so a household running at the default level sees
+# nothing from this integration even while it misbehaves.
+SERVICE_DIAGNOSTICS = "diagnostics"
 
 # --- Session stages ---
 STAGE_IDLE = "idle"

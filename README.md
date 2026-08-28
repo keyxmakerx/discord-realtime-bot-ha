@@ -14,7 +14,7 @@ rather be pinged — in the channel (the default), in a DM, or not at all.
 
 - **Domain:** `laundry_discord`
 - **Install:** via [HACS](https://hacs.xyz/) as a custom repository
-- **Target:** Home Assistant OS / Core **2026.5+**, Python 3.13
+- **Target:** Home Assistant OS / Core **2024.4+** (developed and run against 2026.x), Python 3.12+
 
 ## What it does
 
@@ -64,8 +64,14 @@ are ignored while a wash is already running.
 > it is **never** allowed to time completion while `job_state` is live.
 > - **Fast start (online):** a confirmed early phase (`weight_sensing`/`wash`)
 >   starts the load immediately, before the meter (which lags 15–45 min) has even
->   moved. A change must persist `confirm_delay` (default **30s**) first, so a
->   transient flap can't start anything.
+>   moved. Two separate rules guard it, because they catch different lies: a
+>   change must persist `confirm_delay` (default **30s**) — settled, so a
+>   transient flap can't start anything — **and** it must not have arrived from
+>   `unavailable`, because settled is not the same as *new*. This washer's cloud
+>   reconnects on a timer and republishes the phase it last saw, and a replayed
+>   `wash` is perfectly settled; before that second rule it minted a "load"
+>   whose meter never moved. A phase that arrives on the heels of a reconnect
+>   only starts a load once the meter corroborates it.
 > - **Fast finish:** a confirmed `job_state = finish` completes immediately — on
 >   this washer it only ever appears at the true end, never at the wash→dry
 >   handoff, so it's safe.
@@ -137,8 +143,12 @@ are ignored while a wash is already running.
 
 > **Mid-cycle startup:** if the washer is **already running** when the bot
 > connects (e.g. you installed the integration, or restarted HA, during a load),
-> it picks the load up right away and posts a "Laundry in progress" message,
-> rather than waiting for the next cycle.
+> it picks the load up once the energy meter corroborates the phase it sees —
+> usually the next meter reading — and posts a "Laundry in progress" message
+> rather than waiting for the next cycle. It deliberately does **not** trust
+> the reported phase alone at startup: for a cloud washer that value is
+> routinely the last phase seen before HA went down, and trusting it invented
+> loads that never ran. The meter has to agree first.
 
 > **Why the ping is a separate little message:** editing an embed never makes a
 > phone buzz (that's what keeps the ETA/progress updates silent). So to actually
@@ -981,6 +991,31 @@ Collected in the UI config flow (options can be changed later without re-adding)
 > as a small separate message when the load finishes. If nobody claimed it, no
 > ping is sent. There are no role/@everyone pings, so the bot needs no special
 > mention permission.
+
+## Checking on the bot: `laundry_discord.diagnostics`
+
+Developer Tools → **Actions** → **Laundry Discord: Diagnostics**. It answers
+*is it stuck, is it lying, and is it about to say something wrong* — as
+response data right there in the UI, so it needs no logger configuration, no
+restart, and no SSH into a storage file. It changes nothing and pings nobody,
+which makes it safe to run mid-wash.
+
+What it checks: a session whose two halves disagree (wedged — nothing will
+clear it, and the finding says to run `reset_session`); a "load" the energy
+meter says never happened (the phantom a cloud reconnect used to mint); the
+washer's own sensors contradicting the bot; a session past the 12-hour safety
+net; a claim with no one to ping; and the shape of the connection drops —
+including whether they arrive **on a timer** (near-identical spacing points at
+a token refresh or polling cycle in the washer's integration, not at your
+wifi).
+
+Two of its habits are worth knowing. While the washer is **offline** it
+suspends the meter-based accusations — a frozen meter during an outage is the
+outage, not a fake load — and says so in a note instead. And the
+"machine says idle while the bot says washing" finding asks you to **run it
+again a few minutes later** before acting: every load's end passes through a
+short window that looks exactly like that, and a real wedge is the one that
+persists.
 
 ## 4. Test without doing laundry
 
