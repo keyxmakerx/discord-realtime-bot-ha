@@ -1377,6 +1377,36 @@ class LaundryCoordinator:
             # Who claimed the *previous* load, captured before the reset below
             # wipes it — they're the one person the line rolls forward without.
             prev_claimant_id = self.claimed_by_id
+            # Everything from here to the post mutates live session state, and
+            # the post can fail (Discord 5xx, a revoked token, a channel that
+            # was deleted). Snapshot first, because the rollback below used to
+            # restore the stage and the detector and nothing else -- leaving the
+            # superseded load's claimant, its queue, its handoff, its emptied
+            # flag and a session anchor for a session that does not exist. On an
+            # install where the post fails repeatedly (which is what the live
+            # logs showed) every retry silently erased another load's claim.
+            rollback = {
+                "waiting": self.waiting,
+                "claimed_by": self.claimed_by,
+                "claimed_by_id": self.claimed_by_id,
+                "quiet": self.quiet,
+                "message_id": self.message_id,
+                "queue": list(self.queue),
+                "emptied": self.emptied,
+                "handoff_name": self.handoff_name,
+                "handoff_hedged": self.handoff_hedged,
+                "cancelled": self.cancelled,
+                "paused": self.paused,
+                "stage": self.stage,
+                "catch_up": self.catch_up,
+                "_last_real_phase": self._last_real_phase,
+                "_energy_start": self._energy_start,
+                "_water_start": self._water_start,
+                "_session_started_ts": self._session_started_ts,
+                "_offline_since": self._offline_since,
+                "_last_eta_ts": self._last_eta_ts,
+                "_offline_unverified": self._offline_unverified,
+            }
             self.waiting = False
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
@@ -1443,8 +1473,18 @@ class LaundryCoordinator:
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to post laundry start message")
-                self.stage = STAGE_IDLE
+                # Put the superseded load back exactly as it was. The two
+                # timers cancelled above (handoff, stop-confirm) cannot be
+                # un-cancelled and are deliberately not faked here: losing a
+                # pending handoff is a missed ping, while a restored-but-dead
+                # timer would be a lie the rest of the machine acts on.
+                for attr, value in rollback.items():
+                    setattr(self, attr, value)
                 self._detector.reset()  # don't strand the detector as active
+                # The post awaits, so another task may have read the half-built
+                # session while it was in flight; refresh so nothing keeps the
+                # values this method was in the middle of writing.
+                self._notify_entities()
                 return
 
             self._start_eta_timer()
@@ -1802,59 +1842,78 @@ class LaundryCoordinator:
         """
         now = dt_util.utcnow().timestamp()
         claimant_id = self.claimed_by_id
-        # Expiry, the claimant exclusion and the pop are one decision, made in
-        # queue.py so they're covered by the pure tests.
-        head, self.queue = queue.select_handoff(
-            self.queue, now, float(self.queue_expiry), self.claimed_by_id
-        )
-        # All three handoff moments — the ✅ tap, the fallback timer and an
-        # unclaimed completion — arrive here, so this is where "the washer is
-        # now free" already exists. Announcing it costs nothing when nobody is
-        # listening and saves the planner inventing a second one (§14 rule 5).
+        # A load can only be handed off once. All three moments converge here,
+        # and two of them can fire for the *same* load: the backstop timer pings
+        # the head of the line, and the claimant taps ✅ afterwards. The
+        # ``expect_emptied`` guard in :meth:`_async_ping_next` catches the
+        # opposite order and not this one, so without this the queue pops twice
+        # and two people are each told the same washer is theirs — the second of
+        # them waiting on a machine that is already somebody's.
         #
-        # Announced *after* the pop, and carrying its outcome, because the
-        # answer to "is the washer free" is not the same before and after: a
-        # machine that has just been handed to the head of the 🔜 line is
-        # somebody's, and a listener told otherwise would tell a second person
-        # the same machine is theirs. ``hedged`` travels for the same reason —
-        # at the backstop nobody has confirmed anything, so "free" is a guess
-        # and a listener must be allowed to apply its own stricter test.
-        async_dispatcher_send(
-            self.hass,
-            SIGNAL_WASHER_FREE,
-            {
-                "handed_off": head is not None,
-                "hedged": hedged,
-                "claimant_id": claimant_id,
-            },
-        )
-        if head is None:
-            return  # nobody waiting — the line being empty is the normal case
-        # Recorded *here*, next to the pop that causes the problem, and before
-        # the ping rather than after it: the line has already lost them either
-        # way, so a ping that fails and gets logged must still leave the card
-        # saying who it was for. The card render below picks this up.
-        self.handoff_name = queue.entry_name(head)
-        self.handoff_hedged = hedged
-        if hedged:
-            body = (
-                "🔜 The washer's been done a while and nobody's checked in — "
-                "probably free, worth a look."
+        # ``handoff_name`` is set only when somebody was actually taken off the
+        # line, so a handoff attempted against an *empty* line leaves this open
+        # for a real one to whoever joins afterwards. A repeat still falls
+        # through to the card refresh below, because the state it renders (the
+        # ✅ button going away once ``emptied`` is set) did change.
+        head = None
+        already_handed_off = self.handoff_name is not None
+        if not already_handed_off:
+            # Expiry, the claimant exclusion and the pop are one decision, made
+            # in queue.py so they're covered by the pure tests.
+            head, self.queue = queue.select_handoff(
+                self.queue, now, float(self.queue_expiry), self.claimed_by_id
             )
-        else:
-            body = "🔜 Washer's free — you're up."
-        try:
-            # However they asked to be reached in 🤖, defaulting to a real
-            # @mention in the channel (users only) — the whole point is a push,
-            # and an embed edit never makes a phone buzz. A DM that bounces
-            # falls back to that same mention, so the handoff is never lost.
-            await self.assistant.async_route_ping(
-                head.get("id"),
-                dm_text=body,
-                channel_text=f"<@{head.get('id')}> {body}",
+            # All three handoff moments — the ✅ tap, the fallback timer and an
+            # unclaimed completion — arrive here, so this is where "the washer
+            # is now free" already exists. Announcing it costs nothing when
+            # nobody is listening and saves the planner inventing a second one
+            # (§14 rule 5).
+            #
+            # Announced *after* the pop, and carrying its outcome, because the
+            # answer to "is the washer free" is not the same before and after: a
+            # machine just handed to the head of the 🔜 line is somebody's, and
+            # a listener told otherwise would tell a second person the same
+            # machine is theirs. ``hedged`` travels for the same reason — at the
+            # backstop nobody has confirmed anything, so "free" is a guess and a
+            # listener must be allowed to apply its own stricter test.
+            async_dispatcher_send(
+                self.hass,
+                SIGNAL_WASHER_FREE,
+                {
+                    "handed_off": head is not None,
+                    "hedged": hedged,
+                    "claimant_id": claimant_id,
+                },
             )
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("Failed to ping the next person in line")
+            if head is None:
+                return  # nobody waiting — an empty line is the normal case
+        if head is not None:
+            # Recorded *here*, next to the pop that causes the problem, and
+            # before the ping rather than after it: the line has already lost
+            # them either way, so a ping that fails and gets logged must still
+            # leave the card saying who it was for. The render below picks it up.
+            self.handoff_name = queue.entry_name(head)
+            self.handoff_hedged = hedged
+            if hedged:
+                body = (
+                    "🔜 The washer's been done a while and nobody's checked in — "
+                    "probably free, worth a look."
+                )
+            else:
+                body = "🔜 Washer's free — you're up."
+            try:
+                # However they asked to be reached in 🤖, defaulting to a real
+                # @mention in the channel (users only) — the whole point is a
+                # push, and an embed edit never makes a phone buzz. A DM that
+                # bounces falls back to that same mention, so the handoff is
+                # never lost.
+                await self.assistant.async_route_ping(
+                    head.get("id"),
+                    dm_text=body,
+                    channel_text=f"<@{head.get('id')}> {body}",
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to ping the next person in line")
         # The line just moved, so the card's "Next up" is stale. Silent edit,
         # but with the state-derived view attached: on the ✅ path the button's
         # own edit may never land (expired token, transient 5xx), and without

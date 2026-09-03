@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import os
 import sys
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
@@ -821,6 +823,192 @@ def test_the_accel_split_separates_the_two_bets() -> None:
     assert seen["job_is_finish"] is False
     c._feed_detector(allow_early=True, allow_catchup=False)
     assert seen["job_is_finish"] is True
+
+
+# The three entity properties with no default; everything else falls back.
+_ENTITY_CFG = {
+    const.CONF_RUNNING_ENTITY: const.DEFAULT_RUNNING_ENTITY,
+    const.CONF_JOB_STATE_ENTITY: const.DEFAULT_JOB_STATE_ENTITY,
+    const.CONF_ETA_ENTITY: const.DEFAULT_ETA_ENTITY,
+}
+
+
+class _FakeInteraction:
+    """A component interaction with only the surface a card button touches."""
+
+    def __init__(self, message_id) -> None:
+        self.message = types.SimpleNamespace(id=message_id)
+        self.user = types.SimpleNamespace(display_name="Robin", id=7)
+        self.replies: list = []
+        self.edits: list = []
+        outer = self
+
+        class _Response:
+            async def send_message(self, text, ephemeral=False):
+                outer.replies.append((text, ephemeral))
+
+            async def edit_message(self, **kwargs):
+                outer.edits.append(kwargs)
+
+        class _Followup:
+            async def send(self, text, ephemeral=False):
+                outer.replies.append((text, ephemeral))
+
+        self.response = _Response()
+        self.followup = _Followup()
+
+
+# --- a start post that fails must not take the previous load with it ---------
+def test_a_failed_start_post_puts_the_superseded_load_back() -> None:
+    # REGRESSION (critical, observed firing on the live install as a run of
+    # "Failed to post laundry start message"): _async_start_session mutates 20
+    # fields before it posts, and the failure path restored two of them. Every
+    # failed post silently wiped the superseded load's claimant, its queue, its
+    # handoff and its emptied flag, and left a session anchor behind for a
+    # session that does not exist.
+    watched = (
+        "stage", "waiting", "claimed_by", "claimed_by_id", "quiet", "message_id",
+        "queue", "emptied", "handoff_name", "handoff_hedged", "cancelled",
+        "paused", "catch_up", "_last_real_phase", "_energy_start", "_water_start",
+        "_session_started_ts", "_offline_since", "_last_eta_ts",
+        "_offline_unverified",
+    )
+    c = _coordinator(
+        stage=const.STAGE_DONE_WAITING,
+        claimed_by="Robin",
+        claimed_by_id=7,
+        waiting=True,
+        emptied=True,
+        quiet=True,
+        message_id=4242,
+        queue=[{"id": 9, "name": "Sam", "ts": time.time()}],
+        handoff_name="Sam",
+        handoff_hedged=True,
+        cancelled=True,
+        catch_up=True,
+        _energy_start=1.5,
+        _water_start=20.0,
+        _session_started_ts=123.0,
+        _offline_since=99.0,
+        _last_eta_ts=456.0,
+        _offline_unverified=True,
+        _last_real_phase="spin",
+    )
+    c._cfg = dict(_ENTITY_CFG)
+    before = {name: getattr(c, name) for name in watched}
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("Discord is down")
+
+    c.bot.async_post = _boom
+    logger = logging.getLogger(coord_mod.__name__)
+    was = logger.level
+    logger.setLevel(logging.CRITICAL)  # the handler logs the traceback we caused
+    try:
+        _run(c._async_start_session())
+    finally:
+        logger.setLevel(was)
+
+    for name, value in before.items():
+        assert getattr(c, name) == value, f"{name} not restored: {getattr(c, name)!r}"
+    # ...and the detector must not be left believing a wash is running.
+    assert c._detector.phase == "idle"
+
+
+# --- a tap on a card the bot is no longer tracking ---------------------------
+def test_a_tap_on_an_older_card_cannot_touch_the_live_load() -> None:
+    # Persistent views are registered by custom_id, not per message, so every
+    # card the bot ever posted still dispatches into these callbacks. Without a
+    # message check, 🧺 on a three-week-old card claims *today's* load and then
+    # rewrites that old card with today's embed.
+    c = _coordinator(stage=const.STAGE_WASHING, message_id=999)
+    c._cfg = dict(_ENTITY_CFG)
+    claimed: list = []
+
+    async def _claim(who, user_id):
+        claimed.append((who, user_id))
+        return True
+
+    async def _dm_notice(_interaction):
+        return None
+
+    c.handle_claim = _claim
+    c.assistant.async_followup_dm_notice = _dm_notice
+    button = bot_mod._ClaimButton(c)
+
+    stale = _FakeInteraction(message_id=111)
+    _run(button.callback(stale))
+    assert claimed == []                       # the live load was never touched
+    assert stale.edits == []                   # and the old card was not rewritten
+    assert stale.replies and stale.replies[0][1] is True   # a private refusal
+
+    live = _FakeInteraction(message_id=999)
+    _run(button.callback(live))
+    assert claimed == [("Robin", 7)]           # the current card still works
+
+    # 🤖 is the deliberate exception: it opens a personal panel and touches no
+    # load, so it must keep working from a card somebody scrolled back to.
+    opened: list = []
+
+    async def _open(interaction):
+        opened.append(interaction)
+
+    c.assistant.async_open_panel = _open
+    _run(bot_mod._AssistantButton(c).callback(_FakeInteraction(message_id=111)))
+    assert len(opened) == 1
+
+
+# --- the washer can only be handed to one person per load --------------------
+def test_the_washer_is_handed_off_only_once_per_load() -> None:
+    # The backstop timer pings the head of the line, and the claimant then taps
+    # ✅ afterwards. `expect_emptied` catches the opposite order and not this
+    # one, so the queue popped twice and two people were each told the same
+    # washer was theirs.
+    was_send = coord_mod.async_dispatcher_send
+    coord_mod.async_dispatcher_send = lambda *a, **kw: None
+    try:
+        now = time.time()
+        pings: list = []
+
+        async def _route(user_id, **kwargs):
+            pings.append(user_id)
+
+        # The backstop has already handed it to Alex.
+        c = _coordinator(
+            stage=const.STAGE_DONE_WAITING,
+            claimed_by="Robin",
+            claimed_by_id=7,
+            emptied=True,
+            message_id=4242,
+            queue=[{"id": 9, "name": "Sam", "ts": now}],
+            handoff_name="Alex",
+            handoff_hedged=True,
+        )
+        c._cfg = dict(_ENTITY_CFG)
+        c.assistant.async_route_ping = _route
+        _run(c._async_ping_next_locked(hedged=False))
+        assert pings == []                              # nobody pinged twice
+        assert [e["id"] for e in c.queue] == [9]        # Sam keeps his place
+        assert c.handoff_name == "Alex"                 # and Alex keeps the washer
+        assert ("edit", 4242) in c.bot.calls            # the card still refreshes
+
+        # The first handoff of a load is unaffected.
+        fresh = _coordinator(
+            stage=const.STAGE_DONE_WAITING,
+            claimed_by="Robin",
+            claimed_by_id=7,
+            emptied=True,
+            message_id=4242,
+            queue=[{"id": 9, "name": "Sam", "ts": now}],
+        )
+        fresh._cfg = dict(_ENTITY_CFG)
+        fresh.assistant.async_route_ping = _route
+        _run(fresh._async_ping_next_locked(hedged=False))
+        assert pings == [9]
+        assert fresh.queue == []
+        assert fresh.handoff_name == "Sam"
+    finally:
+        coord_mod.async_dispatcher_send = was_send
 
 
 def _run_all() -> None:
