@@ -1017,6 +1017,14 @@ again a few minutes later** before acting: every load's end passes through a
 short window that looks exactly like that, and a real wedge is the one that
 persists.
 
+**Before acting on what it tells you**, check
+[`docs/field-notes.md`](docs/field-notes.md). It records what the real machine
+has been observed doing — which of its sensors get stuck asserted for hours
+after a cycle, how far behind the cloud runs, and which readings are honest —
+together with a list of things that *look* like defects but are designed
+behaviour. It exists because plausible fixes have twice been aimed at the
+wrong thing.
+
 ## 4. Test without doing laundry
 
 1. Developer Tools → **Actions** → call `laundry_discord.test_post`.
