@@ -32,6 +32,7 @@ import os
 import sys
 import time
 import types
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
@@ -1009,6 +1010,61 @@ def test_the_washer_is_handed_off_only_once_per_load() -> None:
         assert fresh.handoff_name == "Sam"
     finally:
         coord_mod.async_dispatcher_send = was_send
+
+
+class _State:
+    """A minimal HA State: the value, and when it last actually changed."""
+
+    def __init__(self, state, last_changed_ts) -> None:
+        self.state = state
+        self.last_changed = datetime.fromtimestamp(last_changed_ts, timezone.utc)
+        self.last_updated = self.last_changed
+
+
+class _States:
+    def __init__(self, mapping) -> None:
+        self._mapping = mapping
+
+    def get(self, entity_id):
+        return self._mapping.get(entity_id)
+
+
+# --- a meter that never reported must not be read as a finished load ---------
+def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
+    # REGRESSION (v0.29.1, observed live 2026-09-04): the flat-energy backstop
+    # guarded on `energy is not None`, which only says the entity *has* a value
+    # -- and `last_rise_ts` is seeded when the load starts rather than on a real
+    # rise. A meter frozen since before the session began therefore satisfied
+    # "flat for an hour" on a schedule, and the bot announced a load done 60
+    # minutes in while job_state still read `drying`. The drum ran for hours.
+    now = time.time()
+    started = now - 7200  # the load began two hours ago
+    c = _coordinator(stage=const.STAGE_WASHING, _session_started_ts=started)
+    c._cfg = dict(_ENTITY_CFG)
+    frozen = _State("13.9", started - 3600)  # last moved *before* this load
+    c.hass.states = _States({
+        const.DEFAULT_ENERGY_ENTITY: frozen,
+        const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
+    })
+    c._detector = EnergyDetector(start_jump=0.3, idle_timeout=3600)
+    c._detector.phase = coord_mod.RUN_ACTIVE
+    c._detector.last_energy = 13.9
+    c._detector.last_rise_ts = started
+    finished: list = []
+    c._on_detector_finished = lambda: finished.append(True)
+
+    c._feed_detector()
+    assert finished == [], "a dead meter must not complete a load"
+    assert c._detector.phase == coord_mod.RUN_ACTIVE
+
+    # The backstop is only vetoed, not removed: once the meter has reported for
+    # *this* load, a genuinely flat hour still ends it.
+    c.hass.states = _States({
+        const.DEFAULT_ENERGY_ENTITY: _State("13.9", started + 60),
+        const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
+    })
+    c._feed_detector()
+    assert finished == [True], "a reporting meter that went flat still finishes"
 
 
 def _run_all() -> None:

@@ -153,3 +153,57 @@ sensors.
 
 Nothing here is safe to change without first watching a self-clean end with
 water, energy and both stuck sensors recorded side by side.
+
+---
+
+## 4. Confirmed real: a dead meter read as a finished load
+
+**Observed 2026-09-04.** The bot announced a load done while the washer was
+still drying. Diagnostics and the entity timeline at the moment it was wrong:
+
+| fact | value |
+|---|---|
+| `stage` | `done_waiting`, claimed | 
+| `watched.job_state` | **`drying`** (changed 2 h ago) |
+| `sensor.washer_energy` | `13.9`, **last changed 6 h ago** |
+| `detector` | `last_energy 13.9`, `idle_energy 13.9`, `last_rise_ts null` |
+| `energy_start` | `13.9` |
+| `sensor.washer_water_consumption` | 614.8 → **730.2 L** (+115 L) |
+
+Water proves a real load ran (§1.4 again). The energy meter had not moved since
+*before* that load started.
+
+Every other completion route is excluded by the same snapshot: `job_state` never
+reached `finish`; `machine_state` never left `run`, and a stop would have been
+worded "stopped early"; `offline_since` and `last_eta_ts` are both null, so the
+offline path could not fire; and the ETA (`2026-09-03T21:26:55Z`) predates the
+session, so the staleness guard in `_eta_status` correctly rejected it.
+
+That leaves the flat-energy backstop — and the stale-ETA guard working is
+precisely *why* it fired. With the ETA rejected, the 60-minute flat-meter net
+was the only rule left.
+
+**The defect.** `detect.observe` guarded the backstop with `energy is not None`
+under a comment reading "the meter IS reporting". Those are not the same claim:
+`not None` says only that the entity *has* a value. Worse, `last_rise_ts` is
+seeded when the load starts rather than on an observed rise, so for a meter that
+never reports, "flat for `idle_timeout`" becomes true on a schedule regardless of
+what the drum is doing.
+
+**The fix (v0.31.0).** A new `meter_reporting` argument, computed by the
+coordinator as "the energy entity's `last_changed` is at or after
+`_session_started_ts`" — has this meter produced a reading *for this load*.
+False vetoes the backstop. `last_changed` and not `last_updated` deliberately:
+the question is whether the reading moved, and a republish carrying the same
+number is not a meter doing anything.
+
+**Why not just change `energy_idle`.** It cannot fix both directions. §3 has the
+same 60-minute timer running too *slow* to end a self-clean; this has it running
+too *fast* against a stalled meter. One number cannot be both, which is why the
+veto is a separate condition rather than a tuning change.
+
+**What is still not fixed.** With the meter dead, the ETA stale and `job_state`
+never reaching `finish`, the only remaining net is the 12-hour cap. A load in
+that state now stays open far too long instead of closing far too early. That is
+the better failure of the two — a stale card beats a false ping — but it is not
+a good one, and it is the same gap §3 describes from the other side.

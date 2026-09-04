@@ -730,6 +730,33 @@ class LaundryCoordinator:
             return 0.0
         return dt_util.utcnow().timestamp() - self._offline_since
 
+    def _meter_reported_this_session(self) -> bool:
+        """Has the energy meter produced a reading since this load began?
+
+        The flat-energy backstop means "the meter rose and then stopped rising,
+        so the load is over". That sentence is only true of a meter that is
+        alive. A value frozen from *before* the session started is not a flat
+        meter, it is no meter — and because ``detect.last_rise_ts`` is seeded
+        when the load starts rather than on a real rise, "flat for an hour"
+        then becomes true on a schedule, whatever the washer is doing.
+
+        Deliberately ``last_changed`` and not ``last_updated``: this asks
+        whether the reading actually *moved* for this load, which is the
+        evidence the backstop spends. An attribute republish carrying the same
+        number is not a meter doing anything.
+
+        True when no session is tracked — the guard is about an active load,
+        and every other caller wants the existing behaviour.
+        """
+        if self._session_started_ts is None:
+            return True
+        if not self.energy_entity:
+            return False
+        st = self.hass.states.get(self.energy_entity)
+        if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
+            return False
+        return st.last_changed.timestamp() >= self._session_started_ts
+
     def _eta_status(self) -> tuple[bool, bool]:
         """(has_eta, eta_passed) for the washer's own completion estimate.
 
@@ -970,6 +997,7 @@ class LaundryCoordinator:
             has_eta=has_eta,
             eta_passed=eta_passed,
             machine_idle=self._machine_state() == MACHINE_STOP,
+            meter_reporting=self._meter_reported_this_session(),
         )
         if ev == EV_STARTED:
             self._on_detector_started(phase)
