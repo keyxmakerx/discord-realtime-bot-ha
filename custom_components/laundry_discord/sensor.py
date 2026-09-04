@@ -26,6 +26,7 @@ async def async_setup_entry(
             LaundryClaimedBySensor(coordinator, entry),
             LaundryStageSensor(coordinator, entry),
             LaundryConnectionHealthSensor(coordinator, entry),
+            LaundryHealthSensor(coordinator, entry),
         ]
     )
 
@@ -149,4 +150,52 @@ class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
             "minutes_since_last_drop": (
                 None if minutes is None else int(minutes // 15) * 15
             ),
+        }
+
+
+class LaundryHealthSensor(LaundryEntity, SensorEntity):
+    """The diagnostics findings, as an entity you can put on a dashboard.
+
+    Same checks as the ``laundry_discord.diagnostics`` action — this is where
+    they live between runs. The action still exists and still returns the full
+    picture; this is the always-on version, so "is the bot alright" is a glance
+    rather than a service call, and an automation can alert on it.
+
+    **State is the worst severity, not the sentence.** ``ok`` / ``note`` /
+    ``warning`` / ``problem`` is a four-value state that changes only when the
+    situation does; the readable summary is an attribute. That split is not
+    cosmetic — the recorder writes a history row on every state change, and a
+    state that carried the wording would write one whenever a count moved.
+
+    ``findings`` is unrecorded for the same reason, one level down: several
+    findings carry an age in minutes, so the list differs on most refreshes.
+    It is worth having live on the card and worth nothing in history, where
+    the severity above already tells the story.
+    """
+
+    _attr_name = "Laundry Health"
+    _attr_icon = "mdi:heart-pulse"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _unrecorded_attributes = frozenset({"findings"})
+
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_health"
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.health.get("severity", "unknown")
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        health = self.coordinator.health
+        findings = health.get("findings") or []
+        return {
+            "summary": health.get("summary"),
+            "problems": sum(1 for f in findings if f.get("severity") == "problem"),
+            "warnings": sum(1 for f in findings if f.get("severity") == "warning"),
+            # The one-line headlines, which is what a dashboard card can show.
+            # The full detail stays in the action, which has room for it.
+            "headlines": [f.get("headline") for f in findings],
+            "findings": findings,
         }

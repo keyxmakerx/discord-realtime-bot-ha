@@ -175,7 +175,7 @@ DEFAULT_TRADES = False
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
 
 # --- Platforms ---
-PLATFORMS = ["sensor", "binary_sensor"]
+PLATFORMS = ["sensor", "binary_sensor", "button", "number", "switch"]
 
 # --- Storage ---
 STORAGE_VERSION = 1

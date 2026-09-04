@@ -1025,6 +1025,47 @@ together with a list of things that *look* like defects but are designed
 behaviour. It exists because plausible fixes have twice been aimed at the
 wrong thing.
 
+## Dashboard
+
+[`dashboards/laundry.yaml`](dashboards/laundry.yaml) is a ready-made Lovelace
+dashboard for the whole integration: health, what the bot believes, what the
+washer says about itself, the three manual actions, every tuning knob, and
+history.
+
+**Settings → Dashboards → + Add dashboard → New dashboard from scratch**, open
+it, then **⋮ → Edit → ⋮ → Raw configuration editor**, and paste the file over
+what is there.
+
+> **Check your entity ids first.** The cards assume `sensor.laundry_stage`,
+> `sensor.laundry_health` and so on. If one of those slugs was already taken
+> when the entity was created, Home Assistant appended `_2`, and the card will
+> read *"Entity not available"* — which looks exactly like a broken
+> integration. **Settings → Devices & services → Laundry Discord Bot** lists
+> the real ids; a find-and-replace in the YAML is the whole fix.
+
+The entities it is built from, all created automatically:
+
+| Entity | What it is |
+|---|---|
+| `sensor.laundry_health` | The diagnostics findings, live. State is the worst severity (`ok`/`note`/`warning`/`problem`); the readable summary and the full findings are attributes. |
+| `sensor.laundry_stage` | Idle / Washing / Drying / Done. |
+| `sensor.laundry_claimed_by`, `binary_sensor.laundry_waiting` | Who has it, and whether it still needs emptying. |
+| `sensor.laundry_connection_health` | Cloud drops in the last 24h. |
+| `button.laundry_run_diagnostics` | Re-check now instead of waiting for the 5-minute tick. |
+| `button.laundry_test_post`, `button.laundry_reset_session` | The two debug actions, one tap each. |
+| `number.laundry_*` | The timing knobs — flat-meter timeout, confirm delay, offline load jump, handoff backstop, queue expiry, availability grace. |
+| `switch.laundry_*` | The house-wide features — completion ping, 🤖 button, habit learning, reminder DMs, slot trades. |
+
+**Changing a number or a switch reloads the integration**, which briefly
+reconnects the Discord bot. That is the same thing the options flow has always
+done, and it is what makes a new value reach the parts of the bot that read
+config when they are built. Fine for tuning; don't automate against them.
+
+The per-person settings (📬 DM, 👁 monitoring, 🔮 guessing, 🔔 what-I-send-you)
+are deliberately **not** here. They belong to the person who set them, they are
+set in Discord where that person can see them, and somebody's notification
+consent is not a thing to be flipped from a shared wall tablet.
+
 ## 4. Test without doing laundry
 
 1. Developer Tools → **Actions** → call `laundry_discord.test_post`.

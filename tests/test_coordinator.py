@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import logging
 import os
 import sys
@@ -1065,6 +1066,94 @@ def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
     })
     c._feed_detector()
     assert finished == [True], "a reporting meter that went flat still finishes"
+
+
+# --- the shipped dashboard must name entities that actually exist -----------
+def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
+    # The dashboard is a text file full of entity ids, and a wrong one does not
+    # error -- the card just renders "Entity not available", which is
+    # indistinguishable from a broken integration to whoever is reading it.
+    # This derives the ids from the platform definitions rather than repeating
+    # them, so renaming an entity breaks the test rather than the dashboard.
+    import yaml
+    from homeassistant.util import slugify
+
+    from custom_components.laundry_discord import number as number_mod
+    from custom_components.laundry_discord import switch as switch_mod
+
+    pkg = os.path.join(HERE, "..", "custom_components", "laundry_discord")
+
+    def _names(filename):
+        """Class-level ``_attr_name`` strings, read from the source.
+
+        Read with ``ast`` rather than by importing and using getattr: Home
+        Assistant's entity metaclass rewrites every ``_attr_*`` class attribute
+        into a descriptor, so the value is not a string by the time it is an
+        attribute. The source is the honest place to ask.
+        """
+        tree = ast.parse(io.open(os.path.join(pkg, filename), encoding="utf-8").read())
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and any(
+                        isinstance(t, ast.Name) and t.id == "_attr_name"
+                        for t in stmt.targets
+                    )
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                ):
+                    found.append(stmt.value.value)
+        return found
+
+    expected = set()
+    for domain, filename in (
+        ("sensor", "sensor.py"),
+        ("binary_sensor", "binary_sensor.py"),
+        ("button", "button.py"),
+    ):
+        expected.update(f"{domain}.{slugify(name)}" for name in _names(filename))
+    expected.update(f"number.{slugify(row[2])}" for row in number_mod._NUMBERS)
+    expected.update(f"switch.{slugify(row[2])}" for row in switch_mod._SWITCHES)
+    assert len(expected) >= 15, f"only found {len(expected)} entities: {expected}"
+
+    path = os.path.join(HERE, "..", "dashboards", "laundry.yaml")
+    doc = yaml.safe_load(io.open(path, encoding="utf-8").read())
+
+    def _walk(node):
+        """Every entity id the dashboard names, in either card spelling.
+
+        `entities:` takes a bare string *or* a mapping with an `entity:` key,
+        and cards nest, so this recurses through everything rather than
+        special-casing the two shapes -- the first version of this test only
+        saw the string form and passed while four cards were unchecked.
+        """
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "entity" and isinstance(value, str):
+                    yield value
+                else:
+                    yield from _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, str):
+                    yield item
+                else:
+                    yield from _walk(item)
+
+    referenced = set(_walk(doc))
+    assert referenced, "the dashboard referenced no entities at all"
+    # Only our own entities are checked: the washer's ids belong to whichever
+    # integration supplies them and are documented as needing a find-replace.
+    ours = {e for e in referenced if e.split(".", 1)[-1].startswith("laundry")}
+    missing = sorted(ours - expected)
+    assert not missing, f"dashboard names entities nothing creates: {missing}"
+    # ...and the reverse, so a new control cannot be added without a card.
+    unused = sorted(expected - referenced)
+    assert not unused, f"entities exist but the dashboard never shows them: {unused}"
 
 
 def _run_all() -> None:

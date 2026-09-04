@@ -393,6 +393,21 @@ def summarise_entries(entries):
     return f"{len(rows)} entries, {troubled} with problems"
 
 
+def worst_severity(findings):
+    """The most serious severity present, or ``"ok"`` when nothing was found.
+
+    A short, low-cardinality value, because this is what an entity's *state*
+    becomes: the recorder writes a row on every change, and a state that is a
+    whole sentence changes whenever the wording does. The sentence lives in an
+    attribute, where it belongs.
+    """
+    rows = findings if isinstance(findings, list) else []
+    for severity in (PROBLEM, WARNING, NOTE):
+        if any(f.get("severity") == severity for f in rows):
+            return severity
+    return "ok"
+
+
 def summarise(findings):
     """One line for the log and the response header."""
     rows = findings if isinstance(findings, list) else []

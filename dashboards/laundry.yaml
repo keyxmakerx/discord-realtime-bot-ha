@@ -1,0 +1,159 @@
+# Laundry Discord Bot — a dashboard for the whole integration.
+#
+# HOW TO USE
+#   Settings → Dashboards → + Add dashboard → New dashboard from scratch,
+#   open it, then ⋮ (top right) → Edit → ⋮ again → Raw configuration editor,
+#   and paste this file over what is there.
+#
+# BEFORE YOU DO: check your entity ids.
+#   These assume sensor.laundry_stage, sensor.laundry_health and so on. If an
+#   entity was created while another one held that slug, Home Assistant will
+#   have given it a _2 suffix and the cards below will read "Entity not
+#   available". Settings → Devices & services → Laundry Discord Bot lists the
+#   real ids; a find-and-replace here is the whole fix.
+#
+# Cards are core-only — nothing here needs a HACS frontend module.
+
+views:
+  - title: Laundry
+    path: laundry
+    icon: mdi:washing-machine
+    cards:
+
+      # ---- is the bot alright -------------------------------------------
+      - type: markdown
+        title: Health
+        content: >-
+          {% set sev = states('sensor.laundry_health') %}
+          {% set icon = {'ok':'✅','note':'ℹ️','warning':'⚠️','problem':'🛑'}.get(sev,'❔') %}
+          ## {{ icon }} {{ state_attr('sensor.laundry_health','summary') or 'not checked yet' }}
+
+          {% set lines = state_attr('sensor.laundry_health','headlines') or [] %}
+          {% if lines %}
+          {% for line in lines %}
+          - {{ line }}
+          {% endfor %}
+          {% else %}
+          Nothing to report. The full detail is always available from the
+          `laundry_discord.diagnostics` action.
+          {% endif %}
+
+      # ---- what the bot currently believes -------------------------------
+      - type: entities
+        title: The bot's view
+        show_header_toggle: false
+        entities:
+          - entity: sensor.laundry_stage
+            name: Stage
+          - entity: sensor.laundry_claimed_by
+            name: Claimed by
+          - entity: binary_sensor.laundry_waiting
+            name: Waiting to be emptied
+          - type: attribute
+            entity: sensor.laundry_stage
+            attribute: next_up
+            name: Next up
+          - type: attribute
+            entity: sensor.laundry_stage
+            attribute: queue_count
+            name: In the line
+          - entity: sensor.laundry_connection_health
+            name: Cloud drops (24h)
+
+      # ---- what the washer says about itself -----------------------------
+      # The only external truth there is. When this and the card above
+      # disagree, this one is usually right -- and water is the honest sensor
+      # (see docs/field-notes.md).
+      - type: entities
+        title: What the washer says
+        show_header_toggle: false
+        entities:
+          - entity: sensor.washer_washer_job_state
+            name: Job state
+          - entity: sensor.washer_washer_machine_state
+            name: Machine state
+          - entity: binary_sensor.washer_running
+            name: Running
+          - entity: sensor.washer_washer_completion_time
+            name: Estimated finish
+          - entity: sensor.washer_energy
+            name: Energy (cumulative)
+          - entity: sensor.washer_water_consumption
+            name: Water (cumulative)
+
+      # ---- the three things worth doing by hand --------------------------
+      - type: entities
+        title: Actions
+        show_header_toggle: false
+        entities:
+          - entity: button.laundry_run_diagnostics
+            name: Re-check health now
+          - entity: button.laundry_test_post
+            name: Post a test card
+          - entity: button.laundry_reset_session
+            name: Force-close a stuck session
+
+      # ---- tuning --------------------------------------------------------
+      # Changing any of these reloads the integration, which briefly
+      # reconnects the Discord bot. Fine to tune; don't automate against them.
+      - type: entities
+        title: Timing
+        show_header_toggle: false
+        entities:
+          - entity: number.laundry_flat_meter_timeout
+            name: Flat-meter timeout
+          - entity: number.laundry_confirm_delay
+            name: Confirm delay
+          - entity: number.laundry_load_jump_threshold
+            name: Offline load jump
+          - entity: number.laundry_handoff_fallback
+            name: Handoff backstop
+          - entity: number.laundry_queue_expiry
+            name: Queue entries expire after
+          - entity: number.laundry_availability_grace
+            name: Availability grace
+
+      - type: entities
+        title: Features
+        show_header_toggle: false
+        entities:
+          - entity: switch.laundry_ping_on_complete
+            name: Ping the claimant when done
+          - entity: switch.laundry_show_assistant
+            name: Show the 🤖 button
+          - entity: switch.laundry_learn_habits
+            name: Learn wash habits
+          - entity: switch.laundry_reminder_dms
+            name: Reminder DMs
+          - entity: switch.laundry_slot_trades
+            name: Slot trades
+
+      # ---- history and what actually happened ----------------------------
+      - type: history-graph
+        title: The last day
+        hours_to_show: 24
+        entities:
+          - entity: sensor.laundry_stage
+          - entity: sensor.washer_washer_job_state
+          - entity: sensor.washer_washer_machine_state
+          - entity: binary_sensor.washer_running
+
+      # Energy and water on their own graph: they are numbers, and a state
+      # graph of a cumulative meter is unreadable next to categorical states.
+      - type: statistics-graph
+        title: Energy and water
+        days_to_show: 7
+        stat_types:
+          - max
+        entities:
+          - sensor.washer_energy
+          - sensor.washer_water_consumption
+
+      - type: logbook
+        title: Recent activity
+        hours_to_show: 48
+        entities:
+          - sensor.laundry_stage
+          - sensor.laundry_claimed_by
+          - binary_sensor.laundry_waiting
+          - sensor.laundry_health

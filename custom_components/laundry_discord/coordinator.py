@@ -82,6 +82,7 @@ from .const import (
     UNCLAIMED,
 )
 from . import cancel as cancel_mod
+from . import diagnose as diagnose_mod
 from . import queue
 from .assistant import LaundryAssistant
 from .detect import (
@@ -467,6 +468,7 @@ class LaundryCoordinator:
         # no state events arrive) and keep the health sensor fresh.
         self._feed_detector()
         self._check_time_completion()
+        self.refresh_health()
         self._notify_entities()
 
     async def async_run_bot(self) -> None:
@@ -788,6 +790,50 @@ class LaundryCoordinator:
             return (False, False)  # stale estimate frozen from a previous load
         self._last_eta_ts = target.timestamp()  # remember for offline completion
         return (True, dt_util.utcnow() >= target)
+
+    def refresh_health(self) -> None:
+        """Recompute the health findings and push them to the sensor.
+
+        Cached rather than computed inside the sensor, for the reason the
+        connection-health sensor's attributes are bucketed: the recorder writes
+        a row whenever a state *or an attribute* changes, and several findings
+        carry an age in minutes. Recomputed on read, those would differ on every
+        entity write and the one diagnostic meant to keep the log quiet would
+        instead write history all day. One recompute per 5-minute tick (or per
+        button press), one value until the next.
+
+        Never raises. This runs on a timer, and a health check that can take the
+        coordinator down with it is worse than no health check.
+        """
+        try:
+            snap = self.diagnostic_snapshot()
+            findings = diagnose_mod.check(
+                snap["session"],
+                dt_util.utcnow().timestamp(),
+                watched=snap["watched"],
+                max_session_minutes=snap["config"]["max_session_minutes"],
+            )
+            self._health = {
+                "severity": diagnose_mod.worst_severity(findings),
+                "summary": diagnose_mod.summarise(findings),
+                "findings": findings,
+            }
+        except Exception:  # noqa: BLE001 - see the docstring
+            _LOGGER.exception("Health check failed")
+            self._health = {
+                "severity": "unknown",
+                "summary": "the health check itself failed — see the log",
+                "findings": [],
+            }
+
+    @property
+    def health(self) -> dict:
+        """Last computed health, or a neutral placeholder before the first tick."""
+        return getattr(self, "_health", None) or {
+            "severity": "unknown",
+            "summary": "not checked yet",
+            "findings": [],
+        }
 
     def diagnostic_snapshot(self) -> dict:
         """Everything the health check needs, gathered in one place.
