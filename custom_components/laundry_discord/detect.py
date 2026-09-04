@@ -179,6 +179,7 @@ class EnergyDetector:
         has_eta: bool = False,
         eta_passed: bool = False,
         machine_idle: bool = False,
+        meter_reporting: bool = True,
     ) -> str | None:
         """Process one sample; return an event or ``None``.
 
@@ -198,6 +199,9 @@ class EnergyDetector:
         backstop applies instead. ``machine_idle`` is true when the washer
         reports stopped/idle; it vetoes an energy-*jump* start (meter catch-up on
         a reconnect is not a load), but never blocks a wash-phase start.
+        ``meter_reporting`` is false when the meter has produced no reading for
+        the current load; it vetoes the flat-energy backstop, which otherwise
+        reads a dead meter as a finished one.
         """
         rose = False
         jumped = False
@@ -247,11 +251,23 @@ class EnergyDetector:
                 if eta_passed and flat_for >= self.eta_grace:
                     self.reset()
                     return EV_FINISHED
-            elif energy is not None and flat_for >= self.idle_timeout:
+            elif energy is not None and meter_reporting and flat_for >= self.idle_timeout:
                 # No usable estimate but the meter IS reporting (e.g. an offline
                 # batch load): energy-only flat backstop. When energy is None the
                 # device is unavailable — we have no data, so we do NOT guess a
                 # finish here; the coordinator's offline-aware path handles that.
+                #
+                # ``meter_reporting`` is the other half of that same sentence,
+                # and it cost a false completion to learn. ``energy is not None``
+                # only says the entity *has* a value, not that the value is a
+                # live one, and ``last_rise_ts`` is seeded when the load starts
+                # rather than on a real rise -- so a meter frozen since before
+                # the session began satisfies "flat for an hour" the moment the
+                # timer runs out, having never reported anything at all. On
+                # 2026-09-04 that ended a load 60 minutes in while job_state
+                # still read `drying`, and the drum ran for hours afterwards.
+                # The coordinator decides what counts as reporting, because
+                # only it can see when the entity last changed.
                 self.reset()
                 return EV_FINISHED
         return None

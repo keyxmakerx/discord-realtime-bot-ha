@@ -126,6 +126,39 @@ async def _ephemeral_followup(
         _LOGGER.debug("Could not send the tap confirmation", exc_info=True)
 
 
+async def _is_live_card(
+    coordinator: "LaundryCoordinator", interaction: discord.Interaction
+) -> bool:
+    """Whether this tap came from the card the bot is currently tracking.
+
+    Persistent views are registered by ``custom_id``, not per message, so
+    **every card the bot has ever posted stays live**: discord.py routes a tap
+    on a three-week-old message into these callbacks exactly as it routes one
+    on today's. Without this check, tapping 🧺 on an old card claims the
+    *current* load for somebody who was looking at a finished one, and the
+    ``edit_message`` that follows rewrites that historical card with today's
+    embed — two wrong things at once, neither of them visible to the tapper.
+
+    The one deliberate exception is 🤖, whose whole point is that it works from
+    an old card (see :class:`_AssistantButton`); it opens a personal panel and
+    touches no load.
+
+    A card the bot cannot identify — ``message_id`` unset, or an interaction
+    carrying no message — counts as stale. Refusing a tap costs one ephemeral
+    line; acting on the wrong load costs a load.
+    """
+    message = getattr(interaction, "message", None)
+    current = coordinator.message_id
+    if current is not None and message is not None and message.id == current:
+        return True
+    await interaction.response.send_message(
+        "That's an older laundry card. Scroll down to the newest one in this "
+        "channel — this one is just history.",
+        ephemeral=True,
+    )
+    return False
+
+
 class _ClaimButton(discord.ui.Button):
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
         super().__init__(
@@ -141,6 +174,8 @@ class _ClaimButton(discord.ui.Button):
         who = interaction.user.display_name
         user_id = interaction.user.id
         try:
+            if not await _is_live_card(self.coordinator, interaction):
+                return
             if await self.coordinator.handle_claim(who, user_id):
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),
@@ -169,6 +204,8 @@ class _UnclaimButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         try:
+            if not await _is_live_card(self.coordinator, interaction):
+                return
             if await self.coordinator.handle_unclaim():
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),
@@ -205,6 +242,8 @@ class _QuietButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         try:
+            if not await _is_live_card(self.coordinator, interaction):
+                return
             if await self.coordinator.handle_toggle_quiet():
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),
@@ -243,6 +282,8 @@ class _NextUpButton(discord.ui.Button):
         who = interaction.user.display_name
         user_id = interaction.user.id
         try:
+            if not await _is_live_card(self.coordinator, interaction):
+                return
             result = await self.coordinator.handle_next_toggle(who, user_id)
             # Read the place now, not after the edit: `edit_message` is a round
             # trip, and anybody else's tap inside that window would move the
@@ -300,6 +341,8 @@ class _EmptiedButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         try:
+            if not await _is_live_card(self.coordinator, interaction):
+                return
             if await self.coordinator.handle_emptied():
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),

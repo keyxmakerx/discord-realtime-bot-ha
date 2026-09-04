@@ -27,9 +27,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
+import logging
 import os
 import sys
 import time
+import types
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
@@ -821,6 +825,335 @@ def test_the_accel_split_separates_the_two_bets() -> None:
     assert seen["job_is_finish"] is False
     c._feed_detector(allow_early=True, allow_catchup=False)
     assert seen["job_is_finish"] is True
+
+
+# The three entity properties with no default; everything else falls back.
+_ENTITY_CFG = {
+    const.CONF_RUNNING_ENTITY: const.DEFAULT_RUNNING_ENTITY,
+    const.CONF_JOB_STATE_ENTITY: const.DEFAULT_JOB_STATE_ENTITY,
+    const.CONF_ETA_ENTITY: const.DEFAULT_ETA_ENTITY,
+}
+
+
+class _FakeInteraction:
+    """A component interaction with only the surface a card button touches."""
+
+    def __init__(self, message_id) -> None:
+        self.message = types.SimpleNamespace(id=message_id)
+        self.user = types.SimpleNamespace(display_name="Robin", id=7)
+        self.replies: list = []
+        self.edits: list = []
+        outer = self
+
+        class _Response:
+            async def send_message(self, text, ephemeral=False):
+                outer.replies.append((text, ephemeral))
+
+            async def edit_message(self, **kwargs):
+                outer.edits.append(kwargs)
+
+        class _Followup:
+            async def send(self, text, ephemeral=False):
+                outer.replies.append((text, ephemeral))
+
+        self.response = _Response()
+        self.followup = _Followup()
+
+
+# --- a start post that fails must not take the previous load with it ---------
+def test_a_failed_start_post_puts_the_superseded_load_back() -> None:
+    # REGRESSION (critical, observed firing on the live install as a run of
+    # "Failed to post laundry start message"): _async_start_session mutates 20
+    # fields before it posts, and the failure path restored two of them. Every
+    # failed post silently wiped the superseded load's claimant, its queue, its
+    # handoff and its emptied flag, and left a session anchor behind for a
+    # session that does not exist.
+    watched = (
+        "stage", "waiting", "claimed_by", "claimed_by_id", "quiet", "message_id",
+        "queue", "emptied", "handoff_name", "handoff_hedged", "cancelled",
+        "paused", "catch_up", "_last_real_phase", "_energy_start", "_water_start",
+        "_session_started_ts", "_offline_since", "_last_eta_ts",
+        "_offline_unverified",
+    )
+    c = _coordinator(
+        stage=const.STAGE_DONE_WAITING,
+        claimed_by="Robin",
+        claimed_by_id=7,
+        waiting=True,
+        emptied=True,
+        quiet=True,
+        message_id=4242,
+        queue=[{"id": 9, "name": "Sam", "ts": time.time()}],
+        handoff_name="Sam",
+        handoff_hedged=True,
+        cancelled=True,
+        catch_up=True,
+        _energy_start=1.5,
+        _water_start=20.0,
+        _session_started_ts=123.0,
+        _offline_since=99.0,
+        _last_eta_ts=456.0,
+        _offline_unverified=True,
+        _last_real_phase="spin",
+    )
+    c._cfg = dict(_ENTITY_CFG)
+    before = {name: getattr(c, name) for name in watched}
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("Discord is down")
+
+    c.bot.async_post = _boom
+    logger = logging.getLogger(coord_mod.__name__)
+    was = logger.level
+    logger.setLevel(logging.CRITICAL)  # the handler logs the traceback we caused
+    try:
+        _run(c._async_start_session())
+    finally:
+        logger.setLevel(was)
+
+    for name, value in before.items():
+        assert getattr(c, name) == value, f"{name} not restored: {getattr(c, name)!r}"
+    # ...and the detector must not be left believing a wash is running.
+    assert c._detector.phase == "idle"
+
+
+# --- a tap on a card the bot is no longer tracking ---------------------------
+def test_a_tap_on_an_older_card_cannot_touch_the_live_load() -> None:
+    # Persistent views are registered by custom_id, not per message, so every
+    # card the bot ever posted still dispatches into these callbacks. Without a
+    # message check, 🧺 on a three-week-old card claims *today's* load and then
+    # rewrites that old card with today's embed.
+    c = _coordinator(stage=const.STAGE_WASHING, message_id=999)
+    c._cfg = dict(_ENTITY_CFG)
+    claimed: list = []
+
+    async def _claim(who, user_id):
+        claimed.append((who, user_id))
+        return True
+
+    async def _dm_notice(_interaction):
+        return None
+
+    c.handle_claim = _claim
+    c.assistant.async_followup_dm_notice = _dm_notice
+    button = bot_mod._ClaimButton(c)
+
+    stale = _FakeInteraction(message_id=111)
+    _run(button.callback(stale))
+    assert claimed == []                       # the live load was never touched
+    assert stale.edits == []                   # and the old card was not rewritten
+    assert stale.replies and stale.replies[0][1] is True   # a private refusal
+
+    live = _FakeInteraction(message_id=999)
+    _run(button.callback(live))
+    assert claimed == [("Robin", 7)]           # the current card still works
+
+    # 🤖 is the deliberate exception: it opens a personal panel and touches no
+    # load, so it must keep working from a card somebody scrolled back to.
+    opened: list = []
+
+    async def _open(interaction):
+        opened.append(interaction)
+
+    c.assistant.async_open_panel = _open
+    _run(bot_mod._AssistantButton(c).callback(_FakeInteraction(message_id=111)))
+    assert len(opened) == 1
+
+
+# --- the washer can only be handed to one person per load --------------------
+def test_the_washer_is_handed_off_only_once_per_load() -> None:
+    # The backstop timer pings the head of the line, and the claimant then taps
+    # ✅ afterwards. `expect_emptied` catches the opposite order and not this
+    # one, so the queue popped twice and two people were each told the same
+    # washer was theirs.
+    was_send = coord_mod.async_dispatcher_send
+    coord_mod.async_dispatcher_send = lambda *a, **kw: None
+    try:
+        now = time.time()
+        pings: list = []
+
+        async def _route(user_id, **kwargs):
+            pings.append(user_id)
+
+        # The backstop has already handed it to Alex.
+        c = _coordinator(
+            stage=const.STAGE_DONE_WAITING,
+            claimed_by="Robin",
+            claimed_by_id=7,
+            emptied=True,
+            message_id=4242,
+            queue=[{"id": 9, "name": "Sam", "ts": now}],
+            handoff_name="Alex",
+            handoff_hedged=True,
+        )
+        c._cfg = dict(_ENTITY_CFG)
+        c.assistant.async_route_ping = _route
+        _run(c._async_ping_next_locked(hedged=False))
+        assert pings == []                              # nobody pinged twice
+        assert [e["id"] for e in c.queue] == [9]        # Sam keeps his place
+        assert c.handoff_name == "Alex"                 # and Alex keeps the washer
+        assert ("edit", 4242) in c.bot.calls            # the card still refreshes
+
+        # The first handoff of a load is unaffected.
+        fresh = _coordinator(
+            stage=const.STAGE_DONE_WAITING,
+            claimed_by="Robin",
+            claimed_by_id=7,
+            emptied=True,
+            message_id=4242,
+            queue=[{"id": 9, "name": "Sam", "ts": now}],
+        )
+        fresh._cfg = dict(_ENTITY_CFG)
+        fresh.assistant.async_route_ping = _route
+        _run(fresh._async_ping_next_locked(hedged=False))
+        assert pings == [9]
+        assert fresh.queue == []
+        assert fresh.handoff_name == "Sam"
+    finally:
+        coord_mod.async_dispatcher_send = was_send
+
+
+class _State:
+    """A minimal HA State: the value, and when it last actually changed."""
+
+    def __init__(self, state, last_changed_ts) -> None:
+        self.state = state
+        self.last_changed = datetime.fromtimestamp(last_changed_ts, timezone.utc)
+        self.last_updated = self.last_changed
+
+
+class _States:
+    def __init__(self, mapping) -> None:
+        self._mapping = mapping
+
+    def get(self, entity_id):
+        return self._mapping.get(entity_id)
+
+
+# --- a meter that never reported must not be read as a finished load ---------
+def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
+    # REGRESSION (v0.29.1, observed live 2026-09-04): the flat-energy backstop
+    # guarded on `energy is not None`, which only says the entity *has* a value
+    # -- and `last_rise_ts` is seeded when the load starts rather than on a real
+    # rise. A meter frozen since before the session began therefore satisfied
+    # "flat for an hour" on a schedule, and the bot announced a load done 60
+    # minutes in while job_state still read `drying`. The drum ran for hours.
+    now = time.time()
+    started = now - 7200  # the load began two hours ago
+    c = _coordinator(stage=const.STAGE_WASHING, _session_started_ts=started)
+    c._cfg = dict(_ENTITY_CFG)
+    frozen = _State("13.9", started - 3600)  # last moved *before* this load
+    c.hass.states = _States({
+        const.DEFAULT_ENERGY_ENTITY: frozen,
+        const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
+    })
+    c._detector = EnergyDetector(start_jump=0.3, idle_timeout=3600)
+    c._detector.phase = coord_mod.RUN_ACTIVE
+    c._detector.last_energy = 13.9
+    c._detector.last_rise_ts = started
+    finished: list = []
+    c._on_detector_finished = lambda: finished.append(True)
+
+    c._feed_detector()
+    assert finished == [], "a dead meter must not complete a load"
+    assert c._detector.phase == coord_mod.RUN_ACTIVE
+
+    # The backstop is only vetoed, not removed: once the meter has reported for
+    # *this* load, a genuinely flat hour still ends it.
+    c.hass.states = _States({
+        const.DEFAULT_ENERGY_ENTITY: _State("13.9", started + 60),
+        const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
+    })
+    c._feed_detector()
+    assert finished == [True], "a reporting meter that went flat still finishes"
+
+
+# --- the shipped dashboard must name entities that actually exist -----------
+def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
+    # The dashboard is a text file full of entity ids, and a wrong one does not
+    # error -- the card just renders "Entity not available", which is
+    # indistinguishable from a broken integration to whoever is reading it.
+    # This derives the ids from the platform definitions rather than repeating
+    # them, so renaming an entity breaks the test rather than the dashboard.
+    import yaml
+    from homeassistant.util import slugify
+
+    from custom_components.laundry_discord import number as number_mod
+    from custom_components.laundry_discord import switch as switch_mod
+
+    pkg = os.path.join(HERE, "..", "custom_components", "laundry_discord")
+
+    def _names(filename):
+        """Class-level ``_attr_name`` strings, read from the source.
+
+        Read with ``ast`` rather than by importing and using getattr: Home
+        Assistant's entity metaclass rewrites every ``_attr_*`` class attribute
+        into a descriptor, so the value is not a string by the time it is an
+        attribute. The source is the honest place to ask.
+        """
+        tree = ast.parse(io.open(os.path.join(pkg, filename), encoding="utf-8").read())
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and any(
+                        isinstance(t, ast.Name) and t.id == "_attr_name"
+                        for t in stmt.targets
+                    )
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                ):
+                    found.append(stmt.value.value)
+        return found
+
+    expected = set()
+    for domain, filename in (
+        ("sensor", "sensor.py"),
+        ("binary_sensor", "binary_sensor.py"),
+        ("button", "button.py"),
+    ):
+        expected.update(f"{domain}.{slugify(name)}" for name in _names(filename))
+    expected.update(f"number.{slugify(row[2])}" for row in number_mod._NUMBERS)
+    expected.update(f"switch.{slugify(row[2])}" for row in switch_mod._SWITCHES)
+    assert len(expected) >= 15, f"only found {len(expected)} entities: {expected}"
+
+    path = os.path.join(HERE, "..", "dashboards", "laundry.yaml")
+    doc = yaml.safe_load(io.open(path, encoding="utf-8").read())
+
+    def _walk(node):
+        """Every entity id the dashboard names, in either card spelling.
+
+        `entities:` takes a bare string *or* a mapping with an `entity:` key,
+        and cards nest, so this recurses through everything rather than
+        special-casing the two shapes -- the first version of this test only
+        saw the string form and passed while four cards were unchecked.
+        """
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "entity" and isinstance(value, str):
+                    yield value
+                else:
+                    yield from _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, str):
+                    yield item
+                else:
+                    yield from _walk(item)
+
+    referenced = set(_walk(doc))
+    assert referenced, "the dashboard referenced no entities at all"
+    # Only our own entities are checked: the washer's ids belong to whichever
+    # integration supplies them and are documented as needing a find-replace.
+    ours = {e for e in referenced if e.split(".", 1)[-1].startswith("laundry")}
+    missing = sorted(ours - expected)
+    assert not missing, f"dashboard names entities nothing creates: {missing}"
+    # ...and the reverse, so a new control cannot be added without a card.
+    unused = sorted(expected - referenced)
+    assert not unused, f"entities exist but the dashboard never shows them: {unused}"
 
 
 def _run_all() -> None:
