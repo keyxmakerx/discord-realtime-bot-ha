@@ -1037,11 +1037,27 @@ it, then **⋮ → Edit → ⋮ → Raw configuration editor**, and paste the fi
 what is there.
 
 > **Check your entity ids first.** The cards assume `sensor.laundry_stage`,
-> `sensor.laundry_health` and so on. If one of those slugs was already taken
-> when the entity was created, Home Assistant appended `_2`, and the card will
-> read *"Entity not available"* — which looks exactly like a broken
-> integration. **Settings → Devices & services → Laundry Discord Bot** lists
-> the real ids; a find-and-replace in the YAML is the whole fix.
+> `sensor.laundry_health` and so on. A card naming an id you don't have reads
+> *"Entity not available"*, which looks exactly like a broken integration.
+> **Settings → Devices & services → Laundry Discord Bot** lists the real ones.
+>
+> **Upgrading from an early version?** Entities registered before this
+> integration set `has_entity_name = False` carry the device name — and
+> sometimes the area — baked into their id, because Home Assistant fixes an
+> entity id at first registration and never revisits it. On one install they
+> came out as:
+>
+> ```
+> sensor.laundry_discord_bot_laundry_stage
+> sensor.laundry_room_laundry_discord_bot_laundry_connection_health
+> ```
+>
+> Entities added by a *later* version register under the current scheme and
+> get short ids, so leaving the old ones alone means living with both forever.
+> Rename them (entity → ⚙ → **Entity ID**) to `sensor.laundry_stage` and
+> friends, and everything lines up. Renaming does **not** migrate recorder
+> history: the old rows stay filed under the old id and the graphs start
+> fresh. That is the whole cost, and it is a one-time one.
 
 The entities it is built from, all created automatically:
 
