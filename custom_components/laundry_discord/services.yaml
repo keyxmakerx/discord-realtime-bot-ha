@@ -13,6 +13,19 @@ reset_session:
     announces nothing and pings nobody, and the next real load posts a fresh
     card. Harmless when nothing is being tracked.
 
+track_load:
+  name: Track the load running now
+  description: >-
+    Start tracking a wash that is already running but that the bot never
+    picked up, posting a normal card with a working Claim button. The escape
+    hatch for a missed load — the mirror of Reset session, which is for a load
+    the bot invented. Trusts no sensor: you are standing in front of the
+    washer and it is running, which is better evidence than anything the
+    machine publishes about itself. The load is tracked as a catch-up, so the
+    card reads "in progress" and no energy/water total is claimed for it. Does
+    nothing if a load is already being tracked — reset the session first if
+    the bot is tracking the wrong one.
+
 diagnostics:
   name: Diagnostics
   description: >-

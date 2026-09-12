@@ -1,10 +1,10 @@
 """Buttons for the Laundry Discord Bot integration.
 
-The three service calls, as entities. They exist so the things somebody
-actually needs mid-incident — "is it stuck", "unstick it", "does Discord still
-work" — are one tap on a dashboard rather than Developer Tools, YAML mode and
-a remembered action name. Nothing here is new behaviour; each button is the
-service it names.
+The service calls, as entities. They exist so the things somebody actually
+needs mid-incident — "is it stuck", "unstick it", "pick up the load you
+missed", "does Discord still work" — are one tap on a dashboard rather than
+Developer Tools, YAML mode and a remembered action name. Nothing here is new
+behaviour; each button is the service it names.
 
 ``reset_session`` is deliberately **not** given a confirmation dialog: HA's
 button platform has no such thing, and the action it runs is already the safe
@@ -34,6 +34,7 @@ async def async_setup_entry(
         [
             LaundryTestPostButton(coordinator, entry),
             LaundryResetSessionButton(coordinator, entry),
+            LaundryTrackLoadButton(coordinator, entry),
             LaundryDiagnosticsButton(coordinator, entry),
         ]
     )
@@ -67,6 +68,30 @@ class LaundryResetSessionButton(LaundryEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self.coordinator.async_reset_session()
+
+
+class LaundryTrackLoadButton(LaundryEntity, ButtonEntity):
+    """Pick up a load that is running now but that the bot never noticed.
+
+    The counterpart to Reset Session, and the one this dashboard was missing.
+    Detection fails in both directions on this machine, but only the invented
+    load had a button; a *missed* load left nothing to press and no path back
+    except waiting for the next one.
+
+    It posts a real card, so unlike Reset Session this button is visible to the
+    house — which is the point of pressing it.
+    """
+
+    _attr_name = "Laundry Track Load"
+    _attr_icon = "mdi:washing-machine-alert"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_button_track_load"
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_track_current_load()
 
 
 class LaundryDiagnosticsButton(LaundryEntity, ButtonEntity):

@@ -345,6 +345,12 @@ SERVICE_RESET_SESSION = "reset_session"
 # every line here is debug, so a household running at the default level sees
 # nothing from this integration even while it misbehaves.
 SERVICE_DIAGNOSTICS = "diagnostics"
+# The other manual escape hatch, and the one that was missing. reset_session
+# retracts a load the bot invented; this picks up a load the bot missed. The
+# two failures are equally common on this washer and only one of them had a
+# way out — a missed load produces no card, no claim button and no completion
+# ping, and nothing in the system recovers from it on its own.
+SERVICE_TRACK_LOAD = "track_load"
 
 # --- Session stages ---
 STAGE_IDLE = "idle"

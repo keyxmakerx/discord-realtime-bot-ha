@@ -50,6 +50,13 @@ NO_ETA_MINUTES = 45
 # coincidence. Generous against the default 30s debounce.
 FLAP_PROXIMITY_SECONDS = 120
 
+# The phases a *fresh* cycle begins at. The distinction is load-bearing and is
+# the same one `detect.load_is_active` rests on: this washer freezes on the
+# mid/late phase it ended on, so a stale `drying` sitting there while the bot
+# is idle is the documented freeze and says nothing. An *early* phase is not a
+# shape the machine gets stuck in -- somebody started a wash.
+EARLY_PHASES = ("weight_sensing", "wash")
+
 
 def _num(value):
     """A finite float, or None — every field here comes off disk or an entity.
@@ -273,6 +280,69 @@ def check(session, now, *, watched=None, max_session_minutes=720):
             "wrong rather than lagging.",
             {"stage": stage, "running": running, "machine_state": machine},
         ))
+
+    # --- ...and the mirror: the washer is washing and the bot has not noticed
+    # This is the failure the household actually feels, and until now it was
+    # the one thing the health check could not see. Every check above asks
+    # whether a *tracked* load is real; none asked the opposite question, so on
+    # 2026-09-12 the bot sat at `done` while the washer ran a full cycle and
+    # the health sensor reported "healthy -- nothing to report". A diagnostic
+    # that is blind to the complaint that prompted it is not a diagnostic.
+    #
+    # Gated on an EARLY phase rather than on `running`/`machine_state`, which
+    # is the whole trick. Those two stay asserted for hours after the drum
+    # stops (field notes 1.1), so either of them alone would cry wolf daily.
+    # An early phase does not stick.
+    job = watched.get("job_state")
+    if not tracked and job in EARLY_PHASES:
+        # Has anything been consumed since the last completion? `idle_energy`
+        # is the meter reading captured when the detector went idle, so this
+        # asks the one question that separates the two ways to arrive here --
+        # and it needs no sensor that has not already earned its place.
+        meter_moved = (
+            last_energy is not None
+            and idle_energy is not None
+            and last_energy > idle_energy
+        )
+        if meter_moved:
+            found.append(_finding(
+                PROBLEM, "untracked_load_running",
+                f"The washer is at {job} and the bot is not tracking a load.",
+                "The meter has also moved since the last load ended, so this "
+                "is a real wash that the bot missed -- there is no card, no "
+                "claim button, and nobody will be pinged when it finishes. "
+                "Press 'Track the load running now' (or run "
+                "laundry_discord.track_load) to pick it up mid-cycle.",
+                {
+                    "stage": stage,
+                    "job_state": job,
+                    "running": watched.get("running"),
+                    "machine_state": watched.get("machine_state"),
+                    "energy_now": last_energy,
+                    "idle_energy": idle_energy,
+                },
+            ))
+        else:
+            found.append(_finding(
+                WARNING, "early_phase_while_idle",
+                f"The washer is at {job} and the bot is not tracking a load.",
+                "The meter has not moved since the last load ended, which "
+                "leaves two readings and they need a human to tell apart. "
+                "Either a wash genuinely just started and this meter is "
+                "inside its documented 15-45 minute lag -- in which case the "
+                "bot will pick it up on its own -- or a cloud reconnect "
+                "replayed a stale phase and there is nothing in the drum. "
+                "Look at the machine. If it is running, press 'Track the "
+                "load running now'.",
+                {
+                    "stage": stage,
+                    "job_state": job,
+                    "running": watched.get("running"),
+                    "machine_state": watched.get("machine_state"),
+                    "energy_now": last_energy,
+                    "idle_energy": idle_energy,
+                },
+            ))
 
     # --- the outage itself, since it suppressed the checks above -------------
     if tracked and offline:
