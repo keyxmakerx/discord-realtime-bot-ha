@@ -6,11 +6,13 @@
 #   and paste this file over what is there.
 #
 # BEFORE YOU DO: check your entity ids.
-#   These assume sensor.laundry_stage, sensor.laundry_health and so on. If an
-#   entity was created while another one held that slug, Home Assistant will
-#   have given it a _2 suffix and the cards below will read "Entity not
-#   available". Settings → Devices & services → Laundry Discord Bot lists the
-#   real ids; a find-and-replace here is the whole fix.
+#   These assume the short form -- sensor.laundry_stage, sensor.laundry_health
+#   and so on. Home Assistant composes an entity id at first registration from
+#   the device's area and name, so most installs get a prefix instead, e.g.
+#   sensor.laundry_room_laundry_discord_bot_laundry_stage. That is normal, not
+#   a broken install. Settings → Devices & services → Laundry Discord Bot
+#   lists your real ids; a find-and-replace here is the whole fix, and it
+#   beats renaming the entities (which loses their recorder history).
 #
 # Cards are core-only — nothing here needs a HACS frontend module.
 
@@ -28,10 +30,14 @@ views:
           {% set icon = {'ok':'✅','note':'ℹ️','warning':'⚠️','problem':'🛑'}.get(sev,'❔') %}
           ## {{ icon }} {{ state_attr('sensor.laundry_health','summary') or 'not checked yet' }}
 
-          {% set lines = state_attr('sensor.laundry_health','headlines') or [] %}
-          {% if lines %}
-          {% for line in lines %}
-          - {{ line }}
+          {% set found = state_attr('sensor.laundry_health','findings') or [] %}
+          {% if found %}
+          {% for f in found %}
+          {% set mark = {'note':'ℹ️','warning':'⚠️','problem':'🛑'}.get(f.severity,'•') %}
+          **{{ mark }} {{ f.headline }}**
+
+          {{ f.detail }}
+
           {% endfor %}
           {% else %}
           Nothing to report. The full detail is always available from the
@@ -81,13 +87,19 @@ views:
           - entity: sensor.washer_water_consumption
             name: Water (cumulative)
 
-      # ---- the three things worth doing by hand --------------------------
+      # ---- the four things worth doing by hand ---------------------------
+      # The last two are mirrors of each other and it is worth knowing which
+      # is which before you need one: Track is for a wash that IS running and
+      # the bot never noticed (it posts a card); Force-close is for a load the
+      # bot thinks is running and isn't (it announces nothing).
       - type: entities
         title: Actions
         show_header_toggle: false
         entities:
           - entity: button.laundry_run_diagnostics
             name: Re-check health now
+          - entity: button.laundry_track_load
+            name: Track the load running now
           - entity: button.laundry_test_post
             name: Post a test card
           - entity: button.laundry_reset_session
@@ -137,6 +149,22 @@ views:
           - entity: sensor.washer_washer_job_state
           - entity: sensor.washer_washer_machine_state
           - entity: binary_sensor.washer_running
+
+      # The two meters at full resolution, over a window short enough that
+      # the recorder still has every sample. This is the card that answers the
+      # question docs/field-notes.md 3 leaves open -- what water does during
+      # and after a self-clean, and whether it moves when the energy meter has
+      # stopped. Nothing in detection reads water, and nothing will until
+      # there is a picture here of a self-clean ending. Until then this is a
+      # measurement, not a signal.
+      - type: history-graph
+        title: The meters, close up
+        hours_to_show: 12
+        entities:
+          - entity: sensor.washer_energy
+            name: Energy
+          - entity: sensor.washer_water_consumption
+            name: Water
 
       # Energy and water on their own graph: they are numbers, and a state
       # graph of a cumulative meter is unreadable next to categorical states.

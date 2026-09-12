@@ -290,6 +290,117 @@ def test_the_multi_entry_summary_counts_entries_not_findings():
     assert _d.summarise_entries("junk") == "0 entries, 0 with problems"
 
 
+# --------------------------------------------------------------------------- #
+# The 2026-09-12 incident: the bot sat at "done" while the washer washed, and
+# the health check said "healthy -- nothing to report". Every check in the
+# module asked whether a TRACKED load was real; none asked the opposite. These
+# pin the mirror shut. See docs/field-notes.md 5.
+# --------------------------------------------------------------------------- #
+
+def _missed(**over):
+    """The bot idle/done, energy having climbed since the last completion."""
+    session = {
+        "stage": "done_waiting", "waiting": False, "claimed_by": "Ginko",
+        "claimed_by_id": 4188, "queue": [], "emptied": False,
+        "message_id": 1542881883527057553, "paused": False, "cancelled": False,
+        "last_real_phase": None, "energy_start": None,
+        "session_started_ts": None, "offline_since": None,
+        "last_eta_ts": None, "offline_unverified": False,
+        "detector": {
+            "phase": "idle", "last_energy": 22.10,
+            "last_rise_ts": None, "idle_energy": 16.90,
+        },
+        "flap_times": [],
+    }
+    session.update(over)
+    return session
+
+
+_WASHING = {
+    "running": "on", "machine_state": "run", "job_state": "wash",
+    "energy": "22.1", "water": "1011.2",
+}
+
+
+def test_a_load_the_bot_missed_is_reported_as_a_problem():
+    # The complaint that started all of this, and the one thing the health
+    # check could not see. PROBLEM, not WARNING: nothing clears it on its own
+    # — there is no card to time out and no session for a safety net to close.
+    found = check(_missed(), STARTED, watched=_WASHING)
+    codes = _codes(found)
+    assert "untracked_load_running" in codes
+    assert "early_phase_while_idle" not in codes  # the ambiguous twin, not this
+    hit = next(f for f in found if f["code"] == "untracked_load_running")
+    assert hit["severity"] == PROBLEM
+    # The finding has to carry the way out, or it is just bad news.
+    assert "track_load" in hit["detail"]
+    assert _d.worst_severity(found) == PROBLEM
+
+
+def test_the_same_state_with_a_still_meter_is_only_the_ambiguous_warning():
+    # Identical except the meter has not moved since the last load ended. Now
+    # there are genuinely two readings — a fresh load inside the documented
+    # 15-45 minute meter lag, or a reconnect replaying a stale phase — and
+    # nothing stored separates them. Say so; don't pick one.
+    found = check(
+        _missed(detector={
+            "phase": "idle", "last_energy": 16.90,
+            "last_rise_ts": None, "idle_energy": 16.90,
+        }),
+        STARTED, watched=_WASHING,
+    )
+    codes = _codes(found)
+    assert "early_phase_while_idle" in codes
+    assert "untracked_load_running" not in codes
+    hit = next(f for f in found if f["code"] == "early_phase_while_idle")
+    assert hit["severity"] == WARNING
+    assert "Look at the machine" in hit["detail"]
+
+
+def test_a_phase_frozen_mid_cycle_while_idle_is_not_accused():
+    # field-notes 1.1: this washer freezes on the mid/late phase it ended on,
+    # and `running`/`machine_state` stay asserted for HOURS afterwards. A check
+    # that fired on those would fire after every single load. The gate is the
+    # EARLY phase precisely because that is not a shape the machine sticks in.
+    for phase in ("drying", "rinse", "spin", "finish", "none"):
+        found = check(
+            _missed(), STARTED,
+            watched={"running": "on", "machine_state": "run", "job_state": phase},
+        )
+        codes = _codes(found)
+        assert "untracked_load_running" not in codes, phase
+        assert "early_phase_while_idle" not in codes, phase
+        assert _d.worst_severity(found) == "ok", phase
+
+
+def test_weight_sensing_counts_as_an_early_phase_too():
+    # The other half of a fresh cycle's opening. Missing it would leave the
+    # check blind for the first minutes of every load.
+    found = check(
+        _missed(), STARTED,
+        watched=dict(_WASHING, job_state="weight_sensing"),
+    )
+    assert "untracked_load_running" in _codes(found)
+
+
+def test_a_load_being_tracked_is_never_called_untracked():
+    # The obvious false positive: a healthy wash in progress, which is the
+    # state this check spends most of its life looking at.
+    found = check(
+        _incident(stage="washing"), STARTED + 600, watched=_WASHING,
+    )
+    codes = _codes(found)
+    assert "untracked_load_running" not in codes
+    assert "early_phase_while_idle" not in codes
+
+
+def test_the_health_sensor_no_longer_reads_ok_through_the_incident():
+    # The regression in one line. On 2026-09-12 this exact state produced
+    # `sensor.laundry_health == "ok"` and a card that said "Nothing to
+    # report", while the washer ran a full cycle nobody was told about.
+    assert _d.worst_severity(check(_missed(), STARTED, watched=_WASHING)) != "ok"
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

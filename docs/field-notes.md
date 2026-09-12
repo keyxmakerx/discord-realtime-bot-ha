@@ -65,6 +65,22 @@ Use it as the tiebreaker when the machine's own account of itself is
 self-contradictory. Note it is currently read **only** for the energy/water
 summary (`_water_start`) and takes no part in detection.
 
+> **Honest value, untrustworthy clock.** Water says *whether* a load ran. It
+> does not say *when*, and the difference is the whole reason it is still not
+> wired into detection. Water arrives through the same SmartThings cloud as
+> everything else, and §1.2 has that cloud pushing `job_state`, `energy` and
+> `completion_time` in a **single batch 70 minutes after** the cycle they
+> describe. There is no reason water is exempt. A batched water delta landing
+> after a load ended is indistinguishable, at the moment it lands, from a drum
+> filling right now — so "water moved, therefore something is running" is the
+> *same* inference that the replayed-phase phantom is built on, with a
+> different sensor in it.
+>
+> This has now been proposed twice (2026-09-04, 2026-09-12) and backed out
+> twice. It is not a bad idea; it is an unmeasured one. The measurement that
+> would settle it is in §3, and the "The meters, close up" card on the
+> dashboard exists to capture it.
+
 ### 1.5 Connection drops ran on a 51-minute timer, then stopped
 
 17 drops spaced **3087 s ± 0.6 s**, from 2026-09-02 20:00 UTC to 2026-09-03
@@ -207,3 +223,71 @@ never reaching `finish`, the only remaining net is the 12-hour cap. A load in
 that state now stays open far too long instead of closing far too early. That is
 the better failure of the two — a stale card beats a false ping — but it is not
 a good one, and it is the same gap §3 describes from the other side.
+
+---
+
+## 5. Confirmed real: the health check could not see the actual complaint
+
+**Observed 2026-09-12.** The bot sat at `Done — claimed` while the washer ran.
+The dashboard's Health card said **"✅ healthy — Nothing to report"** at the same
+moment, and that is the part worth recording: every check in `diagnose.py` asked
+whether a *tracked* load was real, and not one asked the opposite question. The
+one failure the household actually feels — the bot missing a load — was the one
+thing the diagnostic was structurally blind to.
+
+The state at the time:
+
+| fact | value |
+|---|---|
+| bot `stage` | `Done — claimed` (completed 16:38, claimant Ginko) |
+| handoff backstop | fired 17:03, nudged Yuki (25 min, as configured) |
+| `sensor.…_job_state` | **`Wash`** |
+| `sensor.…_machine_state` | `Running` |
+| `binary_sensor.washer_running` | `On` |
+| `sensor.…_completion_time` | "in 3 hours" |
+| `sensor.washer_energy` | `22.10 kWh` |
+| `sensor.washer_water_consumption` | `1011.2 L` |
+| `sensor.…_power` | `0.00 W` |
+| `sensor.…_energy_meter`, `…_power_meter` | **`Unavailable`** |
+| `sensor.laundry_health` | `ok` |
+
+**Two readings, and the snapshot does not separate them.** Either the 16:38
+completion was false and the same load was still running, or it was correct and
+a *new* load started afterwards (Yuki was nudged at 17:03 that the machine was
+free) which the bot never picked up. A three-hour estimate and a `Wash` phase
+both fit a freshly started cycle better than the tail of an old one, but that is
+inference, not evidence, and no stored fact settles it.
+
+What *is* settled: `job_state` read `Wash`, and §1.1 establishes that this washer
+freezes on the **mid/late** phase it ended on. An early phase is not a shape it
+gets stuck in. So whichever reading is right, the bot should have been tracking
+something and was not.
+
+**The fix (v0.33.0).** Two things, and deliberately neither of them a change to
+detection:
+
+* `diagnose.check` gained the mirror of `machine_says_idle`. Not tracking +
+  `job_state` in an **early** phase is now a finding — `untracked_load_running`
+  (PROBLEM) when the meter has also moved since the last completion, i.e. a real
+  wash is confirmed; `early_phase_while_idle` (WARNING) when it has not, which is
+  the genuinely ambiguous case: a fresh load inside the meter's 15–45 minute lag,
+  or a reconnect replaying a stale phase. Gated on the early phase and not on
+  `running`/`machine_state`, which §1.1 disqualifies — either of those alone
+  would fire daily.
+* A `track_load` action and a **Track the load running now** button. The mirror
+  of `reset_session`: that one retracts a load the bot invented, this one picks
+  up a load the bot missed. It reads no sensor. A person standing in front of a
+  running washer is better evidence than anything this machine publishes about
+  itself, and every automatic route has to weigh sensors that freeze, lag an
+  hour, or get replayed wholesale. Tracked as a catch-up, so the card reads "in
+  progress" and claims no usage baseline it cannot know.
+
+**Note what was *not* done.** The obvious fix — re-arm the completion timer
+whenever water rises, so a dead energy meter can no longer time a load out — was
+written and reverted. See the box in §1.4.
+
+**What is still not fixed.** Detection still cannot start a load whose energy
+meter is stuck, and the ambiguity above still needs a human to resolve. The
+button is an escape hatch, not a repair: it converts a silent failure into a
+visible one with a way out, which is worth shipping on its own, but the next
+real fix is still waiting on the §3 measurement.

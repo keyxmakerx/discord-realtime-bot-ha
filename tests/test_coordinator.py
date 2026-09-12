@@ -1069,6 +1069,81 @@ def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
 
 
 # --- the shipped dashboard must name entities that actually exist -----------
+# --- picking up a load the bot never noticed ---------------------------------
+def _trackable(**state):
+    c = _coordinator(**state)
+    c._cfg = dict(_ENTITY_CFG)
+    c._start_eta_timer = lambda: None  # needs a real HA time tracker
+    return c
+
+
+def test_the_missed_load_button_picks_the_wash_up_as_a_catch_up() -> None:
+    # The escape hatch for the 2026-09-12 failure: the washer runs a full cycle
+    # and the bot never opens a session, so there is no card, no Claim button
+    # and no completion ping. reset_session was the only manual route and it
+    # goes the wrong way. See docs/field-notes.md 5.
+    c = _trackable(stage=const.STAGE_DONE_WAITING, claimed_by="Ginko",
+                   claimed_by_id=4188, message_id=4242)
+    assert _run(c.async_track_current_load()) is True
+    assert c.stage == const.STAGE_WASHING
+    # A catch-up, not a fresh start: we have no idea how long it has been
+    # running, so the card must not claim a start time or a usage baseline.
+    assert c.catch_up is True
+    assert c._energy_start is None and c._water_start is None
+    # ...and the previous load's claim is cleared, as any new load clears it.
+    assert c.claimed_by == const.UNCLAIMED and c.claimed_by_id is None
+    # The detector has to move WITH the session. Left idle behind an active
+    # stage it is the wedge `diagnose` calls unrecoverable: neither half can
+    # end a load the other is not in.
+    assert c._detector.phase == "active"
+    assert c._detector.last_rise_ts is not None
+    # Dated from now, not from whenever the meter last moved -- this machine's
+    # meter can be an hour stale, and a backstop armed from a stale reading
+    # would fire almost immediately on the load a human just vouched for.
+    assert c._detector.last_rise_ts >= c._session_started_ts - 1
+    # Saved after the detector moved, or a restart restores the wedge.
+    assert c.saves, "the detector change was never persisted"
+
+
+def test_it_will_not_hijack_a_load_that_is_already_being_tracked() -> None:
+    # Not an override. If the bot has hold of the WRONG load the answer is
+    # reset_session first -- silently repointing a live card at a different
+    # wash would strand whoever claimed it.
+    for stage in (const.STAGE_WASHING, const.STAGE_DRYING, const.STAGE_SELF_CLEAN):
+        c = _trackable(stage=stage, claimed_by="Robin", claimed_by_id=7,
+                       message_id=4242)
+        assert _run(c.async_track_current_load()) is False
+        assert c.stage == stage
+        assert c.claimed_by == "Robin"      # untouched
+        assert c._detector.phase == "idle"  # and never armed
+
+
+def test_a_failed_post_leaves_no_wedge_behind() -> None:
+    # The ordering this method is written around. `_async_start_session` can
+    # fail at the Discord post and roll its own stage back, so seeding the
+    # detector BEFORE the call would leave it ACTIVE against an idle session --
+    # which refuses every subsequent real load, permanently, until somebody
+    # runs reset_session. The detector is therefore moved only after the post
+    # is known to have landed.
+    c = _trackable(stage=const.STAGE_DONE_WAITING, claimed_by="Ginko",
+                   claimed_by_id=4188, message_id=4242)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("Discord is down")
+
+    c.bot.async_post = _boom
+    logger = logging.getLogger(coord_mod.__name__)
+    was = logger.level
+    logger.setLevel(logging.CRITICAL)  # the handler logs the traceback we caused
+    try:
+        assert _run(c.async_track_current_load()) is False
+    finally:
+        logger.setLevel(was)
+    assert c.stage == const.STAGE_DONE_WAITING     # rolled back
+    assert c.claimed_by == "Ginko"                 # ...with the claim intact
+    assert c._detector.phase == "idle"             # and no wedge
+
+
 def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
     # The dashboard is a text file full of entity ids, and a wrong one does not
     # error -- the card just renders "Entity not available", which is

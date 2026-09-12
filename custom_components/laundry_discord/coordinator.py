@@ -881,6 +881,18 @@ class LaundryCoordinator:
                 "job_state": self._entity_state(self.job_state_entity),
                 "eta": self._entity_state(self.eta_entity),
                 "energy": self._entity_state(self.energy_entity),
+                # Reported, and deliberately NOT acted on. field-notes 1.4
+                # records water as the only sensor that told the truth about
+                # whether a load ran, and 3 records the condition attached to
+                # that: nothing gets built on it until a self-clean has been
+                # watched end with water, energy and the two stuck sensors
+                # recorded side by side. Carrying it here (and on the history
+                # card) is how that observation becomes possible without
+                # betting detection on a reading whose *timing* arrives
+                # through the same batching, ~70-minutes-late cloud as
+                # everything else -- see 1.2. Honest value, untrustworthy
+                # clock; it is evidence for a person, not an input to a rule.
+                "water": self._entity_state(self.water_entity),
             },
             "config": {
                 "confirm_delay": self.confirm_delay,
@@ -2124,6 +2136,68 @@ class LaundryCoordinator:
             _LOGGER.debug("Session force-closed via reset_session")
             await self._async_save()
             self._notify_entities()
+
+    async def async_track_current_load(self) -> bool:
+        """Service: start tracking the load that is running *right now*.
+
+        The mirror of :meth:`async_reset_session`, and it exists for the same
+        reason: detection on this machine fails in both directions, and only
+        one of them had a way out. ``reset_session`` retracts a load the bot
+        invented; until now nothing picked up a load the bot missed, and a
+        missed load has no self-healing path at all — no card, no claim
+        button, and no completion ping for whoever is actually using the
+        machine. The household waits for the next load, which can be a day.
+
+        Everything automatic here has to weigh evidence from sensors that
+        freeze (``running``, ``machine_state``), lag 15-45 minutes and
+        sometimes an hour (the energy meter), or get replayed wholesale by a
+        cloud reconnect (``job_state``). A person standing in front of the
+        washer has none of those problems. So this route trusts no sensor: it
+        takes "it is running, I can see it" as the fact and builds the session
+        around it.
+
+        Tracked as a **catch-up**, because it is one — the card reads "in
+        progress" rather than claiming a start time it cannot know, and no
+        usage baseline is captured, since a mid-load reading would make the
+        energy/water summary understate the wash by however much of it already
+        happened.
+
+        Returns True when a session was opened. False means one was already
+        being tracked (this is not an override — ``reset_session`` first if the
+        bot is tracking the *wrong* load) or the Discord post failed, in which
+        case ``_async_start_session`` has already rolled its own state back.
+        """
+        if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
+            _LOGGER.debug(
+                "track_load ignored; already tracking (stage=%s)", self.stage
+            )
+            return False
+        await self._async_start_session(offline=True)
+        if self.stage not in (STAGE_WASHING, STAGE_DRYING):
+            return False  # the post failed and rolled itself back
+        # Only now is the detector moved, and the order is the point. The two
+        # halves of the state machine must never disagree — `diagnose` calls
+        # that a wedge and it is right, neither half can end a load the other
+        # is not in — and `_async_start_session` can fail at the Discord post
+        # and restore its stage. Seeding the detector first would leave it
+        # ACTIVE against an idle session, refusing every subsequent real load.
+        now = dt_util.utcnow().timestamp()
+        self._detector.phase = RUN_ACTIVE
+        self._detector.last_energy = self._entity_float(self.energy_entity)
+        # The flat-meter backstop is armed from here rather than from whenever
+        # the meter last moved: this load has been running for an unknown
+        # while, and dating the timer from a reading that may be an hour old
+        # would let the backstop fire almost immediately on the load a human
+        # just told us is live.
+        self._detector.last_rise_ts = now
+        # `_async_start_session` has already armed the ETA timer and saved, but
+        # it saved before the two lines above — the detector is persisted, so
+        # without this a restart would restore an active session behind an idle
+        # detector, which is the wedge `diagnose` reports as unrecoverable.
+        await self._async_save()
+        self._notify_entities()
+        _LOGGER.debug("Now tracking the running load, by hand (track_load)")
+        return True
 
     async def async_test_post(self) -> None:
         """Debug service: post a sample embed with a working Claim button."""

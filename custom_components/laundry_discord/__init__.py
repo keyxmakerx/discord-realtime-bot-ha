@@ -15,6 +15,7 @@ from .const import (
     SERVICE_DIAGNOSTICS,
     SERVICE_RESET_SESSION,
     SERVICE_TEST_POST,
+    SERVICE_TRACK_LOAD,
 )
 from .coordinator import LaundryCoordinator
 from .reminders import LaundryReminders
@@ -70,6 +71,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 SERVICE_TEST_POST,
                 SERVICE_RESET_SESSION,
                 SERVICE_DIAGNOSTICS,
+                SERVICE_TRACK_LOAD,
             ):
                 if hass.services.has_service(DOMAIN, service):
                     hass.services.async_remove(DOMAIN, service)
@@ -100,6 +102,16 @@ def _async_register_services(hass: HomeAssistant) -> None:
         # construction rather than an error to explain.
         for coordinator in list(hass.data.get(DOMAIN, {}).values()):
             await coordinator.async_reset_session()
+
+    async def _handle_track_load(call: ServiceCall) -> None:
+        # Silent when nothing is loaded, and silent when a session is already
+        # being tracked, for the same reason reset_session is: this is pressed
+        # by somebody who has already decided the bot is wrong about the
+        # washer, and the coordinator's own guard is the honest place for that
+        # judgement. It deliberately does not override an existing session —
+        # reset_session first if the bot is tracking the wrong load.
+        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
+            await coordinator.async_track_current_load()
 
     async def _handle_diagnostics(call: ServiceCall) -> dict:
         """Answer "is it stuck, is it lying" without reading a storage file.
@@ -160,6 +172,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
         hass.services.async_register(
             DOMAIN, SERVICE_RESET_SESSION, _handle_reset_session
         )
+    if not hass.services.has_service(DOMAIN, SERVICE_TRACK_LOAD):
+        hass.services.async_register(DOMAIN, SERVICE_TRACK_LOAD, _handle_track_load)
     if not hass.services.has_service(DOMAIN, SERVICE_DIAGNOSTICS):
         hass.services.async_register(
             DOMAIN,

@@ -1041,23 +1041,27 @@ what is there.
 > *"Entity not available"*, which looks exactly like a broken integration.
 > **Settings → Devices & services → Laundry Discord Bot** lists the real ones.
 >
-> **Upgrading from an early version?** Entities registered before this
-> integration set `has_entity_name = False` carry the device name — and
-> sometimes the area — baked into their id, because Home Assistant fixes an
-> entity id at first registration and never revisits it. On one install they
-> came out as:
+> **Your ids probably have a prefix, and that is normal.** Home Assistant
+> builds an entity id at first registration from the device's area and name
+> plus the entity's own name, so on an install where the device sits in an
+> area you get something like:
 >
 > ```
-> sensor.laundry_discord_bot_laundry_stage
-> sensor.laundry_room_laundry_discord_bot_laundry_connection_health
+> sensor.laundry_room_laundry_discord_bot_laundry_stage
+> sensor.laundry_room_laundry_discord_bot_laundry_health
 > ```
 >
-> Entities added by a *later* version register under the current scheme and
-> get short ids, so leaving the old ones alone means living with both forever.
-> Rename them (entity → ⚙ → **Entity ID**) to `sensor.laundry_stage` and
-> friends, and everything lines up. Renaming does **not** migrate recorder
-> history: the old rows stay filed under the old id and the graphs start
-> fresh. That is the whole cost, and it is a one-time one.
+> Since the names here already begin with "Laundry", the result stutters. It
+> is cosmetic, it is not a sign of anything broken, and it is **not** a sign of
+> an old install — entities created by the newest version come out the same
+> way, on the same machine, which is how an earlier draft of this section
+> (which called them "legacy" and told you to rename) got caught being wrong.
+>
+> You do not need to rename anything. Adjust the ids in the dashboard YAML to
+> match what **Settings → Devices & services → Laundry Discord Bot** lists and
+> you are done. Renaming the entities instead also works, but it costs
+> recorder history — the old rows stay filed under the old id and the graphs
+> start fresh — so it buys tidiness with data.
 
 The entities it is built from, all created automatically:
 
@@ -1068,6 +1072,7 @@ The entities it is built from, all created automatically:
 | `sensor.laundry_claimed_by`, `binary_sensor.laundry_waiting` | Who has it, and whether it still needs emptying. |
 | `sensor.laundry_connection_health` | Cloud drops in the last 24h. |
 | `button.laundry_run_diagnostics` | Re-check now instead of waiting for the 5-minute tick. |
+| `button.laundry_track_load` | Pick up a wash that is running now but that the bot never noticed. Posts a real card. |
 | `button.laundry_test_post`, `button.laundry_reset_session` | The two debug actions, one tap each. |
 | `number.laundry_*` | The timing knobs — flat-meter timeout, confirm delay, offline load jump, handoff backstop, queue expiry, availability grace. |
 | `switch.laundry_*` | The house-wide features — completion ping, 🤖 button, habit learning, reminder DMs, slot trades. |
@@ -1095,10 +1100,24 @@ consent is not a thing to be flipped from a shared wall tablet.
    drying and finished edits.
    - *(Manually set states are temporary and get overwritten by the real device
      on its next update.)*
-3. If a card ever gets stuck — the bot thinks a load is running when it isn't —
-   call `laundry_discord.reset_session`. It force-closes the card and returns to
-   idle without announcing anything or pinging anybody, and the next real load
-   posts a fresh card. Harmless when nothing is being tracked.
+3. Detection can be wrong in either direction, and there is one action for
+   each. They are mirrors and it is worth knowing which is which *before* you
+   need one:
+   - **The bot thinks a load is running and it isn't** — a stuck card, a
+     "load" that never happened. Call `laundry_discord.reset_session`. It
+     force-closes the card and returns to idle without announcing anything or
+     pinging anybody, and the next real load posts a fresh card. Harmless when
+     nothing is being tracked.
+   - **A load *is* running and the bot never noticed** — no card, no Claim
+     button, and nobody gets pinged when it finishes. Call
+     `laundry_discord.track_load` (or press **Track the load running now**).
+     It posts a normal card for the wash in progress. This route reads no
+     sensor at all: you are standing in front of the machine, which is better
+     evidence than anything this washer publishes about itself — see
+     [`docs/field-notes.md`](docs/field-notes.md) for why that is not a joke.
+     It is tracked as a catch-up, so the card reads "in progress" and claims
+     no energy/water total it cannot know. It will not override a session
+     already being tracked; reset first if the bot has hold of the wrong one.
 
 ## 5. Releasing for HACS
 
