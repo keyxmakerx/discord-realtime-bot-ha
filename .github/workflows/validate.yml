@@ -22,8 +22,24 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # These checks only matter for submission to the HACS *default store*,
-          # not for installing via a HACS custom repository:
-          #  - brands: requires registering the domain in home-assistant/brands
-          #  - description/topics: require GitHub repo "About" metadata
+          # Only needed for the HACS default store (see issue #53).
           ignore: brands description topics
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install homeassistant "discord.py==2.7.1"
+      # Each test file is a standalone script.
+      - name: Run tests
+        run: |
+          for test in tests/test_*.py; do
+            echo "::group::$test"
+            python "$test"
+            echo "::endgroup::"
+          done

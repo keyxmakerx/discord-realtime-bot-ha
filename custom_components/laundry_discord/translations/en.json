@@ -24,8 +24,8 @@
           "eta_entity": "Timestamp of the washer's own estimated finish.",
           "machine_state_entity": "Reports run, pause or stop. Used for the paused display and to notice a load stopped on the machine.",
           "energy_entity": "Cumulative energy meter in kWh. Confirms loads and reports usage on the done message. Defaults to sensor.washer_energy.",
-          "water_entity": "Optional. Cumulative water meter, reported on the done message.",
-          "wrinkle_entity": "Optional. Binary sensor that is on during wrinkle-prevent tumbling, so it isn't mistaken for a load.",
+          "water_entity": "Cumulative water meter, reported on the done message. Defaults to sensor.washer_water_consumption.",
+          "wrinkle_entity": "Binary sensor that is on during wrinkle-prevent tumbling, so it isn't mistaken for a load. Defaults to binary_sensor.washer_wrinkle_prevent_active.",
           "eta_interval": "How often the live card's ETA and progress are refreshed.",
           "ping_claimant_on_complete": "Mention whoever claimed the load when it finishes."
         }
