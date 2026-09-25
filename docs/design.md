@@ -18,7 +18,7 @@ instead. Roadmap items and known bugs live in
 | P6 | Confidence-gated silence | thin data means the bot says nothing — never a hedge |
 | P7 | Additive, reversible, subtractive-only | every behaviour sits behind an option; a new switch can silence a message already being sent, never cause a new one |
 | P8 | Speak only when private information is the point | the bot never assumes you have dirty clothes or a free evening |
-| P9 | No stats or names are surfaced to the household | a board that can identify or rank people becomes a scoreboard nobody uses |
+| P9 | Compare people internally; never surface the findings | the bot may combine everyone's data to decide what to say, but no stats, names or rankings reach the household — a board that can identify or rank people becomes a scoreboard nobody uses |
 
 ## Detection
 
