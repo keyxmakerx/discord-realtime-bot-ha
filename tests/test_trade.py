@@ -1,24 +1,10 @@
-"""Tests for the pure trade-broker rules (design doc §9).
+"""Tests for the pure trade-broker rules.
 
-Runnable with plain ``python3 tests/test_trade.py`` — no pytest / Home
-Assistant, mirroring ``tests/test_reminders.py``, ``tests/test_habit.py``,
-``tests/test_plan.py``, ``tests/test_people.py`` and ``tests/test_queue.py``.
-``trade.py`` is loaded by file path so importing it does not pull in the
-package ``__init__`` (which imports Home Assistant).
-
-Two kinds of thing are under test, and they fail in very different ways.
-
-The **guardrails** are the feature: a trade request is the only message in this
-integration that one housemate causes to arrive on another's phone, so every
-rule is asserted to block *on its own*, from a fixture that is otherwise
-allowed. A guardrail that only works because another one happens to be true
-alongside it is a guardrail that disappears the day somebody relaxes the other.
-
-The **anonymity** invariant is the whole point, and it fails silently: a leak
-does not raise, it just quietly tells six people something they were promised
-they'd never learn. So it is tested as a property over every string the module
-can produce before an accept, against a corpus of names and ids, rather than by
-eyeballing the ones that looked risky.
+Runnable with plain python3, no pytest or Home Assistant; loaded by file
+path like the other pure-module tests. Guardrails are each asserted to
+block on their own, from an otherwise-allowed fixture. The anonymity
+invariant is tested as a property over every pre-accept string, against a
+corpus of names and ids, rather than by eyeballing the ones that looked risky.
 """
 
 from __future__ import annotations
@@ -45,9 +31,8 @@ def _load(name: str, filename: str):
     return module
 
 
-# Loaded by file path, so the relative imports inside each module fall back to
-# bare ones — put each module where that fallback will find it, in dependency
-# order (plan, then people/habit, then nudge, then trade, which needs all four).
+# Loaded by file path, so each module's relative imports fall back to bare
+# ones; register them in dependency order (plan, people/habit, nudge, trade).
 _plan = _load("ld_plan", "plan.py")
 sys.modules["plan"] = _plan
 _people = _load("ld_people", "people.py")
@@ -140,8 +125,7 @@ state_of = _trade.state_of
 with_block = _trade.with_block
 withdraw = _trade.withdraw
 
-# A fixed offset rather than a named zone: nothing here reads the clock, so the
-# tests never need a DST transition, and exact arithmetic is what makes the TTL
+# A fixed offset, not a named zone: no DST transitions, so the TTL is
 # assertable to the second.
 TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
@@ -161,7 +145,7 @@ WEEK = _plan.iso_week_key(NOW)
 NEXT_WEEK = _plan.iso_week_key(NOW + datetime.timedelta(days=7))
 LAST_WEEK = _plan.iso_week_key(NOW - datetime.timedelta(days=7))
 
-# Distinctive so a leak of one into a rendered string cannot hide in ordinary
+# Distinctive names so a leak into rendered text cannot hide in ordinary
 # prose. The ids are the other half of the corpus.
 ASKER = "111"
 HOLDER = "222"
@@ -170,11 +154,10 @@ NAMES = ("Zebediah", "Perpetua", "Quillon")
 
 
 def _prefs(*, holder_changes=None, asker_changes=None) -> dict:
-    """A house where the asker and the holder have both opted into DMs.
+    """A house where the asker and holder have both opted into DMs.
 
-    Built through :mod:`people` rather than by hand, so every record is exactly
-    the shape the 🤖 panel writes — including the defaults, which is where the
-    interesting cases are.
+    Built through people rather than by hand, so records match the panel's
+    real shape, defaults included.
     """
     prefs: dict = {}
     for index, uid in enumerate((ASKER, HOLDER, THIRD)):
@@ -191,9 +174,8 @@ def _prefs(*, holder_changes=None, asker_changes=None) -> dict:
 def _budget(moment, *, today=0, this_week=0) -> dict:
     """One person's nudge accounting, built to order.
 
-    ``last_nudge_ts`` is put safely in the past: a stored timestamp *ahead* of
-    the moment is read as a backwards clock and denies everything, which would
-    make several of these tests pass for the wrong reason.
+    last_nudge_ts is kept safely in the past; a timestamp ahead of the moment
+    reads as a backwards clock and denies everything.
     """
     return {
         "last_nudge_ts": _habit.moment_ts(moment) - 600,
@@ -230,8 +212,7 @@ def _request(state=STATE_OPEN, *, moment=NOW, requester=ASKER, holder=HOLDER,
 
 
 def test_the_request_id_is_the_once_a_week_rule_written_down() -> None:
-    # One ask per requester per slot per week IS the identity of a request, so
-    # two rows for one ask cannot be written even by a careless caller.
+    # One ask per requester per slot per week is the identity of a request.
     assert request_id(WEEK, ASKER, WANT) == f"{WEEK}:{ASKER}:{WANT}"
     assert request_id(WEEK, 111, WANT) == request_id(WEEK, "111", WANT)
     assert request_id(WEEK, ASKER, WANT) != request_id(NEXT_WEEK, ASKER, WANT)
@@ -247,16 +228,14 @@ def test_a_request_needs_two_people_two_slots_and_a_real_moment() -> None:
     assert new_request(ASKER, HOLDER, WANT, WANT, WEEK, NOW) is None
     assert new_request(ASKER, ASKER, WANT, OFFER, WEEK, NOW) is None
     assert new_request(ASKER, HOLDER, WANT, None, WEEK, NOW) is None
-    # A naive datetime is refused by habit.moment_ts, which is what stops a
-    # request being written with a timestamp from the wrong timezone.
+    # A naive datetime is refused by habit.moment_ts (wrong-timezone guard).
     naive = datetime.datetime(2026, 8, 6, 21, 0)
     assert new_request(ASKER, HOLDER, WANT, OFFER, WEEK, naive) is None
 
 
 def test_stored_rows_survive_json_with_int_ids() -> None:
-    # The hazard every module here has hit: ids are ints at the button and
-    # strings off disk. A request whose ends were spelled differently would
-    # silently never match anybody.
+    # ids are ints at the button, strings off disk; spelled differently at
+    # either end, a request would silently never match.
     row = new_request(111, 222, WANT, OFFER, WEEK, NOW)
     assert row["from"] == "111" and row["to"] == "222"
     reloaded = json.loads(json.dumps([row]))
@@ -294,8 +273,7 @@ def test_an_open_request_expires_on_its_own_arithmetic() -> None:
 
 
 def test_an_unreadable_moment_reads_as_expired() -> None:
-    # The safe direction: refusing to act on an old request costs a tap, acting
-    # on a week-old plan does not.
+    # Refusing an old request costs a tap; acting on a week-old one does not.
     assert is_expired(_request(), None) is True
     assert is_expired(_request(), datetime.datetime(2026, 8, 6, 21, 0)) is True
 
@@ -314,7 +292,7 @@ def test_an_expired_request_cannot_be_answered() -> None:
     reason, answered, updated = answer(rows, ident, ACTION_ACCEPT, late)
     assert reason == REASON_MOMENT
     assert answered is None
-    assert updated == rows  # nothing recorded
+    assert updated == rows
 
 
 def test_a_request_cannot_be_answered_twice() -> None:
@@ -355,8 +333,8 @@ def test_pruning_drops_weeks_that_have_happened_and_keeps_this_one() -> None:
 
 
 def test_pruning_keeps_a_refusal_so_the_slot_stays_shut_all_week() -> None:
-    # An expired *open* row also stays: dropping it would hand its author a
-    # second go at the same person for the same slot.
+    # An expired open row stays too, or dropping it would grant a second go
+    # at the same slot.
     rows = prune_requests([_request(STATE_DECLINED), _request(want=OTHER)], WEEK)
     assert len(rows) == 2
     assert slot_refused(rows, WANT, WEEK) is True
@@ -377,8 +355,7 @@ def test_the_stored_list_is_capped() -> None:
 
 
 def test_the_fixture_allows_an_ask() -> None:
-    # Everything below asserts that ONE change to this turns it into a refusal.
-    # Without this case they could all be passing for some shared reason.
+    # Baseline: every guardrail test below changes exactly one thing from this.
     assert _ask() == REASON_OK
 
 
@@ -391,8 +368,7 @@ def test_one_ask_per_slot_per_requester_per_week() -> None:
     late = NOW + datetime.timedelta(hours=REQUEST_TTL_HOURS + 1)
     assert state_of(rows[0], late) == STATE_EXPIRED
     assert _ask(requests=rows, moment=late) == REASON_ALREADY_ASKED
-    # A different slot is a different ask (asked of somebody who isn't already
-    # fielding one — that is a separate guardrail, tested separately).
+    # A different slot is a different ask (holder-busy is a separate guardrail).
     assert _ask(requests=rows, want=OTHER, offer=OFFER, holder=THIRD) == REASON_OK
 
 
@@ -426,8 +402,7 @@ def test_never_ask_me_again_is_permanent_and_per_pair() -> None:
     prefs = _prefs(holder_changes={"no_trade_from": [ASKER]})
     assert is_blocked(prefs, ASKER, HOLDER) is True
     assert _ask(prefs=prefs) == REASON_BLOCKED
-    # Only that pair: the third housemate is unaffected, and so is the same
-    # asker approaching anybody else.
+    # Only that pair: the third housemate is unaffected, and so is the asker.
     assert is_blocked(prefs, THIRD, HOLDER) is False
     assert _ask(prefs=prefs, requester=THIRD) == REASON_OK
     assert _ask(prefs=prefs, holder=THIRD) == REASON_OK
@@ -450,8 +425,7 @@ def test_somebody_who_never_opted_in_is_not_reachable() -> None:
     assert reachable({}, HOLDER, NOW) == REASON_NOT_OPTED_IN
     stranger = {k: v for k, v in _prefs().items() if k != HOLDER}
     assert _ask(prefs=stranger) == REASON_NOT_OPTED_IN
-    # A record exists but the panel was never answered — booking a slot creates
-    # one of these, and it is still not consent to be messaged.
+    # A record can exist without the panel ever being answered - still not consent.
     prefs = _people.set_person(_prefs(), HOLDER, onboarded=False)
     assert _ask(prefs=prefs) == REASON_NOT_OPTED_IN
 
@@ -463,9 +437,8 @@ def test_reminders_off_is_not_reachable() -> None:
 
 
 def test_the_channel_preference_is_not_reachable_either() -> None:
-    # A trade ask cannot be posted in the channel — "someone wants your
-    # Thursday" in front of six people is neither anonymous nor quiet — so the
-    # default answer means not reachable, not reachable loudly.
+    # A trade ask can't be posted in the channel - "someone wants your
+    # Thursday" to six people is neither anonymous nor quiet.
     prefs = _people.set_reminders(_prefs(), HOLDER, _people.REMIND_CHANNEL)
     assert reachable(prefs, HOLDER, NOW) == REASON_NOT_DM
     assert _ask(prefs=prefs) == REASON_NOT_DM
@@ -486,37 +459,29 @@ def test_a_paused_person_is_not_reachable_until_the_pause_ends() -> None:
 
 
 def test_guessing_and_monitoring_do_not_gate_a_trade() -> None:
-    # They are consents about the habit model, and a housemate asking about
-    # Thursday is not the model talking.
+    # Those are consents about the habit model; a housemate asking isn't that.
     prefs = _people.set_person(_prefs(), HOLDER, predict=False, monitor=False)
     assert reachable(prefs, HOLDER, NOW) == REASON_OK
     assert _ask(prefs=prefs) == REASON_OK
 
 
 def test_swaps_switched_off_is_a_holder_side_refusal_like_any_other() -> None:
-    # 🔁 is its own switch precisely because a swap ask is a *housemate*
-    # talking, not the habit model: turning the guessing off must not silence
-    # it (the test above), and turning it off must not cost somebody their
-    # reminders. What matters here is that it refuses from behind the same flat
-    # wall as every other holder-side reason — a requester who cannot even name
-    # the holder must not learn from a refusal that this particular housemate
-    # switched swaps off.
+    # The swap switch is separate from guessing/monitoring (tested above) and
+    # must refuse from behind the same flat wall as every other holder-side
+    # reason, so a requester who can't name the holder learns nothing from it.
     prefs = _people.set_person(_prefs(), HOLDER, dm_trades=False)
     assert reachable(prefs, HOLDER, NOW) == REASON_SWAPS_OFF
     assert _ask(prefs=prefs) == REASON_SWAPS_OFF
     assert REASON_SWAPS_OFF in HOLDER_REASONS
     assert refusal_text(REASON_SWAPS_OFF) == refusal_text(REASON_BLOCKED)
-    # The rest of the bot is untouched by it: this is the swap switch, not a
-    # second way of saying 🚫.
+    # Untouched elsewhere: this is the swap switch, not a second block.
     assert _ask(prefs=prefs, holder=THIRD) == REASON_OK
     assert _nudge.eligible(prefs, HOLDER, NOW) == REASON_OK
 
 
 def test_quiet_hours_hold_a_swap_ask_and_share_one_definition_of_quiet() -> None:
-    # An anonymous "someone wants your Thursday" at 3am is the message quiet
-    # hours exist for. The window is read through nudge.in_quiet_hours rather
-    # than restated here, the way is_paused already is: two definitions of
-    # "quiet" is how the panel starts showing a window the broker ignores.
+    # Reads the window through nudge.in_quiet_hours rather than restating it,
+    # so the panel and the broker can never disagree about what "quiet" means.
     prefs = _people.set_person(_prefs(), HOLDER, quiet_start=22, quiet_end=8)
     night = at(2026, 8, 7, 3, 0)
     assert _nudge.in_quiet_hours(_people.get_person(prefs, HOLDER), night) is True
@@ -526,8 +491,7 @@ def test_quiet_hours_hold_a_swap_ask_and_share_one_definition_of_quiet() -> None
     )
     assert REASON_QUIET in HOLDER_REASONS
     assert refusal_text(REASON_QUIET) == refusal_text(REASON_BLOCKED)
-    # It is a window, not an off switch: the same ask an hour after it closes
-    # goes through.
+    # A window, not an off switch: the same ask goes through once it closes.
     morning = at(2026, 8, 7, 9, 0)
     assert reachable(prefs, HOLDER, morning) == REASON_OK
     assert _ask(prefs=prefs, moment=morning, week=_plan.iso_week_key(morning)) == (
@@ -536,42 +500,33 @@ def test_quiet_hours_hold_a_swap_ask_and_share_one_definition_of_quiet() -> None
 
 
 def test_a_swaps_off_refusal_costs_exactly_what_a_real_ask_costs() -> None:
-    # The §11 leak is in the *outcome*, not only in the wording: 🔁 off is a
-    # standing choice, so a cell that refused for free on every probe while its
-    # neighbours went through would identify its holder as one of a fixed set,
-    # and one requester could watch a housemate's week move around the grid.
-    # Both new gates must therefore land in the silent path with the rest.
+    # A cell that refuses for free on every probe while neighbours go through
+    # would identify its holder by elimination; both new gates must land silent.
     for changes in ({"dm_trades": False}, {"quiet_start": 20, "quiet_end": 8}):
         prefs = _prefs(holder_changes=changes)
         reason, request, rows, budgets = claim_request(
             prefs, [], {}, ASKER, [HOLDER], WANT, OFFER, WEEK, NOW, mine=(OFFER,)
         )
         assert reason == REASON_SILENT and request is not None
-        # Inert, exactly like every other silent refusal: never open, so it
-        # blocks nobody's inbox, and never refused, so it does not shut the
-        # cell to the rest of the house on an answer nobody gave.
+        # Inert like every silent refusal: never open (blocks nobody's inbox),
+        # never refused (doesn't shut the cell for the rest of the house).
         assert is_open(rows[0], NOW) is False
         assert slot_refused(rows, WANT, WEEK) is False
         assert _habit.budget_for(budgets, HOLDER)["nudges_today"] == 0
-        # ...and the probe is spent, which is the whole point.
+        # The probe is spent, which is the whole point.
         assert asked_this_week(rows, ASKER, WANT, WEEK) is True
 
 
 def test_the_askers_own_settings_never_block_the_answer_to_their_own_ask() -> None:
-    # The design's line: 🔁 and quiet hours govern messages the bot or a
-    # housemate *starts*, never a reply to something you did. Somebody who
-    # switched swap requests off so nobody can ask *them* is still owed the
-    # answer to the one they sent, and somebody asking at 23:00 chose to be
-    # awake at 23:00. Gating either here would refuse them with
-    # REASON_NO_REPLY_PATH — a sentence telling them to check a setting that is
-    # already correct.
+    # Swaps-off and quiet hours govern messages the bot or a housemate starts,
+    # never a reply to something you sent yourself; gating those here would
+    # refuse the asker over their own already-correct setting.
     prefs = _people.set_person(_prefs(), ASKER, dm_trades=False)
     assert _ask(prefs=prefs) == REASON_OK
     night = at(2026, 8, 6, 23, 0)
     prefs = _people.set_person(_prefs(), ASKER, quiet_start=22, quiet_end=8)
     assert _ask(prefs=prefs, moment=night) == REASON_OK
-    # The gates that are about the *route* still bite, because a DM that cannot
-    # land is a question asked into a void.
+    # Gates about the route still bite: a DM that can't land answers nothing.
     prefs = _people.set_reminders(prefs, ASKER, _people.REMIND_CHANNEL)
     assert _ask(prefs=prefs, moment=night) == REASON_NO_REPLY_PATH
 
@@ -595,27 +550,19 @@ def test_a_requester_can_only_have_so_many_asks_out() -> None:
     assert len(open_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
     assert len(pending_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
     assert _ask(requests=rows, want=WANT) == REASON_TOO_MANY_OPEN
-    # Answered ones don't count against it — the asker was told the answer, so
-    # nothing is being hidden, and holding their slot after a "no" would be a
-    # second punishment for having asked.
+    # Answered ones don't count - the asker already got their answer, and
+    # holding the slot after a "no" would punish them twice.
     answered = [{**row, "state": STATE_DECLINED} for row in rows]
     assert _ask(requests=answered, want=WANT) == REASON_OK
-    # ...and neither do asks old enough to have aged out on their own.
+    # Neither do asks old enough to have aged out on their own.
     later = NOW + datetime.timedelta(hours=REQUEST_TTL_HOURS + 1)
     assert pending_from(rows, ASKER, later) == []
 
 
 def test_the_open_ask_cap_cannot_be_read_as_an_oracle() -> None:
-    # REGRESSION: the cap counted *liveness*, so a holder-side refusal — which
-    # writes an already-lapsed row — refunded the asker's slot while a delivered
-    # ask held it. R taps 🔁 on three cells in a week: if the holders were
-    # reachable the third is refused with the distinctive "you've got 2 asks
-    # waiting already"; if they silently refused, the third sails through and a
-    # DM goes out. Repeat with different cells and the grid partitions by who
-    # refuses — the exact free, repeatable oracle claim_request's own comment
-    # says the lapsed row exists to prevent, and a flat contradiction of
-    # check_request's promise that every reason it returns is a fact about the
-    # asker's own week.
+    # The cap counted liveness, so a silent holder-side refusal (which writes
+    # an already-lapsed row) refunded the asker's slot while a delivered ask
+    # held it - letting repeated probes across cells reveal who refused how.
     prefs = _prefs(holder_changes={"reminders": _people.REMIND_OFF})
     rows: list = []
     for index in range(MAX_OPEN_PER_REQUESTER):
@@ -624,17 +571,14 @@ def test_the_open_ask_cap_cannot_be_read_as_an_oracle() -> None:
             mine=(OFFER,),
         )
         assert reason == REASON_SILENT
-    # Two probes spent, so the third is refused for the asker's own reason —
-    # identically to two delivered asks.
+    # Two probes spent; the third is refused identically to two delivered asks.
     assert len(pending_from(rows, ASKER, NOW)) == MAX_OPEN_PER_REQUESTER
     assert _ask(requests=rows, want=WANT) == REASON_TOO_MANY_OPEN
-    # ...and the row is still inert towards everybody else, which is the half of
-    # the lapsed trick that has to keep working.
+    # Still inert towards everybody else - the other half of the trick.
     assert all(is_open(row, NOW) is False for row in rows)
     assert open_to(rows, HOLDER, NOW) == []
     assert all(slot_refused(rows, row["want"], WEEK) is False for row in rows)
-    # An undeliverable ask is the same fact about the same holder and costs the
-    # same: a withdrawal lapses the row for the holder, never for the asker.
+    # A withdrawal lapses the row for the holder only, never for the asker.
     delivered = [_request(want=OTHER, holder=THIRD), _request()]
     lapsed = withdraw(delivered, delivered[0]["id"], NOW)
     assert len(pending_from(lapsed, ASKER, NOW)) == 2
@@ -643,13 +587,13 @@ def test_the_open_ask_cap_cannot_be_read_as_an_oracle() -> None:
 def test_withdrawing_lapses_an_ask_without_claiming_they_said_no() -> None:
     rows = [_request(want=OTHER, holder=THIRD), _request()]
     lapsed = withdraw(rows, rows[0]["id"], NOW)
-    # Dead to the holder, whose slot and inbox it must not block over a message
-    # nobody ever saw...
+    # Dead to the holder: must not block their slot or inbox over an unseen
+    # message.
     assert [row["id"] for row in open_from(lapsed, ASKER, NOW)] == [rows[1]["id"]]
     assert open_to(lapsed, THIRD, NOW) == []
     assert state_of(lapsed[0], NOW) == STATE_EXPIRED
-    # ...but still this week's ask for that slot, still one of the asker's two
-    # outstanding, and emphatically NOT recorded as a refusal — nobody said no.
+    # But still counts as this week's ask and one of the asker's two open ones
+    # - never recorded as a refusal, since nobody said no.
     assert asked_this_week(lapsed, ASKER, OTHER, WEEK) is True
     assert len(pending_from(lapsed, ASKER, NOW)) == 2
     assert slot_refused(lapsed, OTHER, WEEK) is False
@@ -657,9 +601,8 @@ def test_withdrawing_lapses_an_ask_without_claiming_they_said_no() -> None:
 
 
 def test_you_have_to_be_reachable_yourself_to_ask() -> None:
-    # The answer comes back as a DM, hours later, and it is the only way the
-    # asker ever finds out — so asking without one would spend somebody else's
-    # DM on a question whose answer goes nowhere.
+    # The answer arrives as a DM hours later; asking without a reply path
+    # would spend somebody else's DM on a question that goes nowhere.
     prefs = _people.set_reminders(_prefs(), ASKER, _people.REMIND_CHANNEL)
     assert _ask(prefs=prefs) == REASON_NO_REPLY_PATH
     prefs = _people.mark_dm_failed(_prefs(), ASKER)
@@ -668,12 +611,11 @@ def test_you_have_to_be_reachable_yourself_to_ask() -> None:
         _prefs(), ASKER, paused_until=_habit.moment_ts(NOW) + 3600
     )
     assert _ask(prefs=paused) == REASON_NO_REPLY_PATH
-    # ...and the sentence names both things that can cause it, because being
-    # told to switch on a setting that is already on reads as a broken bot.
+    # Names both causes, or telling someone to fix an already-correct setting
+    # reads as a broken bot.
     assert "DM me" in refusal_text(REASON_NO_REPLY_PATH)
     assert "paused" in refusal_text(REASON_NO_REPLY_PATH)
-    # ...and that refusal IS allowed to be specific: it is a fact about the
-    # asker's own settings, not about anybody they cannot see.
+    # Allowed to be specific: it's a fact about the asker's own settings.
     assert refusal_text(REASON_NO_REPLY_PATH) != refusal_text(REASON_BLOCKED)
 
 
@@ -685,10 +627,8 @@ def test_the_daily_dm_budget_blocks_a_trade() -> None:
 
 
 def test_the_weekly_budget_deliberately_does_not_block_a_trade() -> None:
-    # The documented decision: the weekly cap bounds how often the BOT's own
-    # arithmetic starts a conversation. A trade is a housemate asking, and
-    # charging it would silence the reminders somebody actually opted into. The
-    # daily cap is what keeps the ceiling at one unprompted DM a day.
+    # The weekly cap bounds the bot's own unprompted DMs; charging a trade
+    # against it would silence reminders the person actually opted into.
     spent = {HOLDER: _budget(NOW, today=0, this_week=_habit.MAX_NUDGES_PER_WEEK)}
     assert _habit.check_nudge(spent[HOLDER], NOW) == _habit.BUDGET_WEEK
     assert _habit.check_daily_cap(spent[HOLDER], NOW) == _habit.BUDGET_OK
@@ -702,8 +642,8 @@ def test_a_trade_dm_spends_the_day_and_leaves_the_week_alone() -> None:
     account = _habit.budget_for(budgets, HOLDER)
     assert account["nudges_today"] == 1
     assert account["nudges_this_week"] == 0
-    # The reminder loop's own budget still sees the day as spent, which is the
-    # honest answer: this person's phone has already buzzed today.
+    # The reminder loop's own budget sees the day as spent too - their phone
+    # already buzzed.
     assert _habit.check_nudge(account, NOW) == _habit.BUDGET_DAY
 
 
@@ -711,9 +651,8 @@ def test_you_must_hold_the_slot_you_are_offering() -> None:
     assert _ask(mine=()) == REASON_NOT_YOURS
     assert _ask(offer=OTHER, mine=(OFFER,)) == REASON_NOT_YOURS
     assert _ask(offer=OTHER, mine=(OFFER, OTHER)) == REASON_OK
-    # Nothing offered at all is "you've nothing to put up", not "I couldn't
-    # parse that": it is exactly what somebody with no bookings of their own
-    # has, and the sentence has to send them to the grid, not to a bug report.
+    # Nothing offered reads as "you've nothing to put up", not a parse error -
+    # that's exactly the state of someone with no bookings of their own.
     assert _ask(offer=None, mine=()) == REASON_NOT_YOURS
     assert "offer in return" in refusal_text(REASON_NOT_YOURS)
 
@@ -727,9 +666,8 @@ def test_you_cannot_trade_a_slot_for_itself_or_ask_yourself() -> None:
 
 
 def test_every_reason_this_module_can_return_is_declared() -> None:
-    # A reason that isn't in REASONS is one refusal_text has never been asked
-    # about, and an undeclared reason is how a new gate quietly gets its own
-    # sentence — which is the leak this feature cannot have.
+    # An undeclared reason is how a new gate quietly gets its own sentence -
+    # exactly the leak this feature cannot have.
     seen = {
         _ask(),
         _ask(requests=[_request()]),
@@ -768,9 +706,8 @@ def test_an_unreachable_holder_is_skipped_for_a_reachable_one() -> None:
 
 
 def test_the_requester_is_never_a_candidate_for_their_own_ask() -> None:
-    # Tapping a taken slot books you in alongside its holder (§8), so the
-    # requester is very often one of the holders of the cell they're asking
-    # about. That must not resolve to asking themselves.
+    # Tapping a taken slot books you in alongside its holder, so the requester
+    # is often one of the holders of the cell they're asking about.
     holder, reason = pick_holder(
         _prefs(), [], {}, ASKER, [ASKER], WANT, OFFER, WEEK, NOW, mine=(OFFER,)
     )
@@ -920,12 +857,11 @@ def test_a_junk_request_swaps_nothing() -> None:
 
 
 def _pre_accept_strings() -> list[str]:
-    """Every string this module can produce **before** an accept.
+    """Every string this module can produce before an accept.
 
-    Collected in one place so the invariant is asserted over the module's whole
-    pre-accept surface rather than over the two or three that looked risky. The
-    two post-accept functions are excluded by name, because a reveal is exactly
-    what they are for (§9 step 3).
+    Collected so the anonymity invariant covers the whole surface, not just
+    the strings that looked risky. Post-accept functions are excluded by
+    name; a reveal is exactly what they're for.
     """
     strings = [
         ASK_PROMPT,
@@ -955,8 +891,7 @@ def test_nothing_said_before_an_accept_can_name_anybody() -> None:
 
 
 def test_no_pre_accept_string_takes_an_identity_at_all() -> None:
-    # Structural, not textual: these functions cannot leak a name because there
-    # is no argument to pass one in. The two that can are named for it.
+    # Structural: these functions have no argument to pass a name through.
     import inspect
 
     for func in (
@@ -970,16 +905,15 @@ def test_no_pre_accept_string_takes_an_identity_at_all() -> None:
 
 
 def test_every_holder_side_refusal_reads_identically() -> None:
-    # If "they blocked you" looked different from "their DMs are closed", a
-    # requester who cannot see who holds a cell could still learn something
-    # about the person holding it.
+    # If "blocked" read differently from "DMs closed", a requester who can't
+    # see who holds a cell could still learn something about them.
     rendered = {refusal_text(reason) for reason in HOLDER_REASONS}
     assert len(rendered) == 1
-    # ...and an undeclared reason lands on the same sentence rather than on a
-    # new one, so a gate added later cannot invent its own tell.
+    # An undeclared reason lands on the same sentence, so a new gate can't
+    # invent its own tell.
     assert refusal_text("a brand new gate") in rendered
-    # The request-side refusals are allowed to differ: they are facts about the
-    # asker's own behaviour, not about anybody else.
+    # Request-side refusals may differ - they're facts about the asker's own
+    # behavior.
     assert refusal_text(REASON_ALREADY_ASKED) not in rendered
     assert refusal_text(REASON_TRADES_OFF) not in rendered
 
@@ -1043,27 +977,25 @@ def test_the_request_list_is_not_a_window_onto_the_store() -> None:
 
 
 def test_a_block_still_lands_after_the_ask_it_answers_has_lapsed() -> None:
-    # 🚫 "Don't ask me again" is the only opt-out a pestered housemate has, and
-    # the DMs most likely to still be sitting unread are the *old* ones. If it
-    # needed the request to still be answerable, somebody who opens Discord on
-    # Monday and taps 🚫 on Friday's DM would record nothing at all, and the
-    # same requester could ask again the following week.
+    # "Don't ask me again" is the only opt-out a pestered housemate has, often
+    # used on an old, unread DM; it must still record even if the request
+    # itself has lapsed.
     rows = [_request()]
     late = NOW + datetime.timedelta(hours=REQUEST_TTL_HOURS + 6)
     sent = _habit.moment_ts(NOW)
-    # Not answerable: no accept, no pass, no swap — an ask nobody answered must
-    # not become a decline that shuts the slot to the whole house.
+    # Not answerable (no accept/pass/swap) - an unanswered ask mustn't become
+    # a decline.
     assert match_request(rows, HOLDER, late, sent) is None
     assert answer(rows, rows[0]["id"], ACTION_BLOCK, late)[1] is None
-    # ...but the person it is about is still resolvable, which is what lets the
-    # permanent per-pair block be written.
+    # But the person it's about is still resolvable, so the block can still
+    # be written.
     found = match_any_request(rows, HOLDER, sent)
     assert found is not None and found["from"] == ASKER
     prefs = _people.set_person(
         _prefs(), HOLDER, no_trade_from=with_block(_prefs(), found["from"], HOLDER)
     )
     assert is_blocked(prefs, ASKER, HOLDER) is True
-    # And the request itself is untouched by that: still expired, never refused.
+    # The request itself is untouched: still expired, never refused.
     assert state_of(rows[0], late) == STATE_EXPIRED
     assert slot_refused(rows, WANT, WEEK) is False
     # A stale DM still cannot pin the block on the wrong housemate.
@@ -1074,13 +1006,9 @@ def test_a_block_still_lands_after_the_ask_it_answers_has_lapsed() -> None:
 
 
 def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
-    # The leak this closes is not in the wording, it is in the *outcome*: if a
-    # refusal cost nothing, a requester could tap the same cell every day
-    # forever and read refuse-vs-send as an oracle. Several holder-side reasons
-    # never change (a block is permanent; 🚫/#channel are standing choices), so
-    # a cell that refuses on every probe while its neighbours go through would
-    # identify its holder — and one blocked requester could watch a single
-    # housemate's whole week move around the grid.
+    # If a refusal cost nothing, a requester could probe the same cell daily
+    # and read refuse-vs-send as an oracle; several holder-side reasons never
+    # change, so a free refusal would identify the holder by elimination.
     stable = (
         {"no_trade_from": [ASKER]},                       # 🚫, permanent
         {"reminders": _people.REMIND_OFF},                # no pings
@@ -1095,19 +1023,18 @@ def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
         # Indistinguishable from a delivered ask, on purpose.
         assert reason == REASON_SILENT and request is not None
         assert len(rows) == 1
-        # ...and it is inert: never open, so it holds nobody's slot and blocks
-        # nobody's inbox, and never refused, so it does not shut the cell to the
-        # rest of the house on an answer nobody gave.
+        # Inert: never open (holds nobody's slot, blocks nobody's inbox), never
+        # refused (doesn't shut the cell to the house).
         assert is_open(rows[0], NOW) is False
         assert open_to(rows, HOLDER, NOW) == [] and open_from(rows, ASKER, NOW) == []
-        # ...but it costs its author exactly what a delivered ask costs them,
-        # or the difference is readable — see the oracle test above.
+        # Costs its author exactly what a delivered ask costs - or the
+        # difference is readable.
         assert len(pending_from(rows, ASKER, NOW)) == 1
         assert slot_refused(rows, WANT, WEEK) is False
         # No DM went out, so no DM was charged for.
         assert _habit.budget_for(budgets, HOLDER)["nudges_today"] == 0
-        # The one thing it does: the probe is spent. Tomorrow, and every day
-        # after it this week, the same tap is refused by the asker's own rule.
+        # The probe is spent: the same tap is refused all week by the asker's
+        # own rule.
         assert asked_this_week(rows, ASKER, WANT, WEEK) is True
         tomorrow = NOW + datetime.timedelta(days=1)
         again = claim_request(
@@ -1116,8 +1043,8 @@ def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
         )
         assert again[0] == REASON_ALREADY_ASKED
         assert again[2] == rows
-        # A transient reason costs the same as a permanent one — otherwise the
-        # difference between "charged" and "free" is itself the tell.
+        # A transient reason costs the same as a permanent one, or the
+        # difference is itself the tell.
     busy = [_request(requester=THIRD, want=OTHER)]
     reason, _request_row, rows, _budgets = claim_request(
         _prefs(), busy, {}, ASKER, [HOLDER], WANT, OFFER, WEEK, NOW, mine=(OFFER,)
@@ -1128,8 +1055,8 @@ def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
         OFFER, WEEK, NOW, mine=(OFFER,),
     )
     assert capped[0] == REASON_SILENT and len(capped[2]) == 1
-    # A refusal that is a fact about the *asker* still costs nothing: there is
-    # nothing to hide about your own week, and it would be a booby trap.
+    # A refusal that's a fact about the asker costs nothing - there's nothing
+    # to hide about your own week.
     for kwargs in ({"mine": ()}, {"holders": [ASKER]}, {"prefs": {}}):
         prefs = kwargs.pop("prefs", _prefs())
         reason, request, rows, _budgets = claim_request(
@@ -1141,10 +1068,8 @@ def test_a_holder_side_refusal_costs_exactly_what_a_real_ask_costs() -> None:
 
 
 def test_a_skewed_host_clock_cannot_kill_every_trade_in_the_house() -> None:
-    # The row is stamped by the HA box and the DM by Discord. An RPi with no
-    # RTC that has not re-synced NTP is out by minutes, and comparing those two
-    # clocks directly would make every tap in the house — 🚫 included — say
-    # "that one's lapsed" forever.
+    # The row is timestamped by the HA box, the DM by Discord; an unsynced
+    # RPi clock compared directly would make every tap look permanently lapsed.
     row = _request()
     skew = 47 * 60  # Discord's clock, as far as this box is concerned
     dm = _habit.moment_ts(NOW) + skew
@@ -1155,8 +1080,8 @@ def test_a_skewed_host_clock_cannot_kill_every_trade_in_the_house() -> None:
     sent_ts = dm_sent_ts(thirty_seconds_on, dm, tapped)
     assert match_request([row], HOLDER, thirty_seconds_on, sent_ts)["id"] == row["id"]
     assert match_any_request([row], HOLDER, sent_ts)["id"] == row["id"]
-    # The stale-DM protection is untouched: a genuinely old DM is old on
-    # Discord's clock too, so it still matches nothing.
+    # Stale-DM protection is untouched: a genuinely old DM is old on Discord's
+    # clock too.
     later = NOW + datetime.timedelta(hours=REQUEST_TTL_HOURS + 1)
     fresh = _request(requester=THIRD, want=OTHER, moment=later)
     old_tap = _habit.moment_ts(later) + skew

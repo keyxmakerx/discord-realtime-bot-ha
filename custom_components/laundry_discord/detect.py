@@ -1,31 +1,28 @@
 """Pure, dependency-free detection helpers.
 
-Kept free of Home Assistant / discord imports so the tricky energy-sample math
-can be unit-tested without the HA test harness. The coordinator delegates load
-liveness to :class:`EnergyDetector`; see
-:meth:`coordinator.LaundryCoordinator._feed_detector`.
+No Home Assistant / discord imports, so the energy-sample math is
+unit-tested directly. The coordinator delegates load liveness to
+`EnergyDetector` (see `LaundryCoordinator._feed_detector`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Float-subtraction slack: 11.3 - 11.0 == 0.2999999999999998 in IEEE-754, which
-# would spuriously fail a boundary "rose by exactly the threshold" check. Energy
-# steps are ~0.1 kWh, so this tolerance never blurs two real samples together.
+# Float-subtraction slack: IEEE-754 rounding could fail a boundary "rose by
+# exactly the threshold" check. Energy steps are ~0.1 kWh, well above this.
 _EPS = 1e-9
 
 
 def energy_jumped(
     prev: float | None, cur: float | None, threshold: float
 ) -> bool:
-    """True when energy rose by >= ``threshold`` within a single sample.
+    """True when energy rose by >= `threshold` within a single sample.
 
-    A single-sample jump is the fingerprint of a load whose telemetry was
-    batched after the washer's cloud was offline. Slow per-sample creep
-    (standby / wrinkle-prevent tumbling) never reaches the threshold in one
-    step, and a meter reset shows as a *decrease* — so this stays ``False`` for
-    both, which is what keeps the offline-load backstop from false-firing.
+    A single-sample jump is the fingerprint of a batched-offline load. Slow
+    creep (standby/wrinkle-prevent) never reaches it in one step, and a
+    meter reset reads as a decrease — both stay False, so the offline
+    backstop doesn't false-fire.
     """
     if prev is None or cur is None:
         return False
@@ -42,16 +39,11 @@ def load_is_active(
 ) -> bool:
     """Whether a real load is running, given the settled job phase + meter.
 
-    Pure form of :meth:`coordinator.LaundryCoordinator._load_active`. The phase
-    sets are passed in (rather than imported) so this module stays importable by
-    file path for testing without pulling in the package.
-
-    A fresh cycle begins at an *early* phase (e.g. weight_sensing / wash); the
-    washer only ever freezes on the mid/late phase it ended on, so an early phase
-    is unambiguously a new load and must NOT be gated on the energy meter — the
-    meter lags the phases by 15-45 min and still reads the previous completion
-    value during the first part of every load. Only a mid/late phase needs the
-    energy guard, to tell a real catch-up from a stale frozen phase.
+    An early phase (e.g. weight_sensing/wash) is unambiguously a fresh load
+    and must NOT be gated on the meter — it lags phases by 15-45 min and
+    still reads the last completion value early in a cycle. Only mid/late
+    phases need the energy guard, to tell a real catch-up from a stale
+    frozen phase.
     """
     if phase is None or phase not in real_phases:
         return False
@@ -78,11 +70,9 @@ def offline_completion_due(
 ) -> bool:
     """Whether to complete a load while the washer is offline/unverifiable.
 
-    Fires only when the device has been unavailable for ``offline_after`` AND its
-    last-known completion estimate has passed by ``eta_grace`` (a cushion in case
-    the dry ran long). The caller marks such a completion as unverified. If the
-    device went offline before the ETA passed we can't know it finished, so this
-    stays False (the absolute max-session net is the last resort). Pure → tested.
+    Fires only once offline for `offline_after` AND the last estimate has
+    passed by `eta_grace` (cushion for a long dry). Caller marks it
+    unverified. Otherwise False; the max-session net is the last resort.
     """
     if offline_since is None or last_eta_ts is None:
         return False
@@ -94,9 +84,8 @@ def offline_completion_due(
 def session_too_long(
     session_started_ts: float | None, now: float, max_session: float
 ) -> bool:
-    """Absolute safety net: a tracked load that has run ``max_session`` is forced
-    done so a stuck session (estimate frozen in the future, no 'finish') can
-    never live forever. Pure so it's unit-tested without the HA harness.
+    """Absolute safety net: force done once a tracked load exceeds `max_session`,
+    so a stuck session (frozen estimate, no 'finish') can't live forever.
     """
     return (
         session_started_ts is not None
@@ -105,12 +94,11 @@ def session_too_long(
 
 
 # --------------------------------------------------------------------------- #
-# Energy-primary liveness state machine (the permanent detection core).
+# Energy-primary liveness state machine.
 #
-# One source of truth for "is a load running": the energy meter. job_state is an
-# optional *accelerant* (fast start on an early phase, fast finish on 'finish')
-# and is used for enrichment elsewhere — it can never block or override the meter.
-# This collapses the old job/energy/self-clean guards into a single tested unit.
+# The energy meter is the one source of truth for "is a load running".
+# job_state is an optional accelerant (fast start/finish) — it can enrich
+# but never block or override the meter.
 # --------------------------------------------------------------------------- #
 
 # Liveness phases (the detection layer; distinct from the Discord session stage).
@@ -126,36 +114,21 @@ EV_FINISHED = "finished"
 class EnergyDetector:
     """Decide load start/finish from a stream of meter samples.
 
-    Feed it observations via :meth:`observe`; it returns ``EV_STARTED`` /
-    ``EV_FINISHED`` / ``None``. Pure and deterministic — no clock, no I/O — so
-    it replays against captured traces in tests. The caller owns the wall clock
-    (passes ``ts``) and the Discord session/claim state.
+    Feed samples via `observe`; returns `EV_STARTED`/`EV_FINISHED`/None. Pure
+    and deterministic — no clock, no I/O, so it replays against captured
+    traces — with the caller owning the wall clock (`ts`) and session state.
 
-    Real-world cases it is built to handle (see the tests):
-      * **Back-to-back loads** — after a finish it returns to idle, so the next
-        load re-fires ``EV_STARTED`` (the caller supersedes the lingering done
-        message). This is the case the old completion-energy guard broke.
-      * **Unreliable meter (this washer)** — the energy meter can freeze, reset,
-        or read flat for an entire load, so it cannot time completion on its own.
-        When the washer's own estimate is available (``has_eta``) completion is
-        gated on it: the load finishes only once that estimate has passed
-        (``eta_passed``) AND the meter has settled for ``eta_grace``. This both
-        (a) lets a frozen/flat meter never fire early — it must wait for the
-        estimate — and (b) does not depend on job_state advancing, so a job_state
-        frozen mid-cycle can't block completion. The plain ``idle_timeout`` is
-        used ONLY when there's no usable estimate (``has_eta`` False, a truly
-        offline load).
-      * **Removed early / abandoned (offline)** — with no estimate, energy goes
-        flat and the load finishes after ``idle_timeout``.
-      * **Pause to add a sock, then resume** — a gap shorter than
-        ``idle_timeout`` does not finish the load; the meter resuming just
-        re-arms the timer.
-      * **Offline batch** — a single jump while job_state is dark still starts.
-      * **Wrinkle-prevent / standby creep** — tiny single steps never reach the
-        start jump; with ``wrinkle_active`` wired in, post-cycle tumbling does
-        not keep a finished load "alive".
-      * **Meter reset** — a decrease rebaselines and never spuriously
-        starts/finishes.
+    Cases it handles:
+      * Back-to-back loads — re-fires `EV_STARTED` right after a finish.
+      * Unreliable meter — energy can freeze, reset or stay flat all load.
+        With a washer estimate, finish waits for `eta_passed` AND the
+        meter to settle; without one, `idle_timeout` alone applies.
+      * Abandoned/offline, no estimate — flat energy finishes after
+        `idle_timeout`.
+      * Brief pause — a gap under `idle_timeout` just re-arms the timer.
+      * Offline batch — a single jump while job_state is dark still starts.
+      * Wrinkle-prevent/standby creep — too small to reach the start jump.
+      * Meter reset — a decrease rebaselines rather than starting/finishing.
     """
 
     start_jump: float = 0.3   # kWh rise in one sample => a load (offline/batch)
@@ -181,27 +154,18 @@ class EnergyDetector:
         machine_idle: bool = False,
         meter_reporting: bool = True,
     ) -> str | None:
-        """Process one sample; return an event or ``None``.
+        """Process one sample; return an event or None.
 
-        ``energy`` is ``None`` when the meter is unavailable (held, never a
-        sample). ``job_is_early`` marks a fresh early phase (weight_sensing /
-        wash); ``job_is_real`` marks any real wash phase (for a mid-cycle
-        catch-up); ``job_is_finish`` marks job_state == 'finish'.
-        ``wrinkle_active`` is the optional wrinkle-prevent sensor — when true, a
-        rise is attributed to tumbling, not the load.
+        `energy` is None when the meter is unavailable. `job_is_early` marks
+        a fresh early phase; `job_is_real` any real wash phase (catch-up);
+        `job_is_finish` marks job_state == 'finish'. `wrinkle_active`
+        attributes a rise to tumbling, not the load.
 
-        Completion gating: ``has_eta`` is true when the washer's own completion
-        estimate (for this cycle) is available; ``eta_passed`` is true once that
-        estimate has elapsed. With an estimate, the load finishes only when it
-        has passed AND the meter has been flat for ``eta_grace`` — so a frozen or
-        dead meter can't fire early, and a stalled job_state can't block it.
-        Without an estimate (offline), the plain ``idle_timeout`` flat-energy
-        backstop applies instead. ``machine_idle`` is true when the washer
-        reports stopped/idle; it vetoes an energy-*jump* start (meter catch-up on
-        a reconnect is not a load), but never blocks a wash-phase start.
-        ``meter_reporting`` is false when the meter has produced no reading for
-        the current load; it vetoes the flat-energy backstop, which otherwise
-        reads a dead meter as a finished one.
+        Completion gating: with `has_eta`, finish needs `eta_passed` AND the
+        meter flat for `eta_grace` — neither alone can trigger or block it.
+        Without an estimate, `idle_timeout` is the backstop. `machine_idle`
+        vetoes an energy-jump start only; `meter_reporting` false vetoes
+        the flat-energy backstop.
         """
         rose = False
         jumped = False
@@ -215,21 +179,19 @@ class EnergyDetector:
             self.last_energy = energy  # advance (a decrease rebaselines on reset)
 
         if self.phase != RUN_ACTIVE:
-            # A mid/late phase counts as a catch-up only if the meter has moved
-            # since we went idle — a phase frozen at the completion reading is a
-            # stale leftover, not a running load.
+            # A mid/late phase is a catch-up only if the meter moved since we
+            # went idle; frozen at the completion reading means stale, not
+            # running.
             catchup = (
                 job_is_real
                 and energy is not None
                 and self.idle_energy is not None
                 and energy > self.idle_energy + _EPS
             )
-            # Start on: an energy jump (offline batch), the early-phase accelerant
-            # (online, even while the meter lags), or a corroborated catch-up.
-            # An energy jump is ignored while the washer reports idle/stopped
-            # (``machine_idle``): on a reconnect the meter catches up in one step
-            # while the machine is off — that's not a load. A real load run shows
-            # a wash phase (job_is_early/catchup) or a non-stopped machine.
+            # Starts on: an energy jump (offline batch), the early-phase
+            # accelerant, or a corroborated catch-up. A jump is ignored while
+            # `machine_idle` — a reconnect catch-up in one step with the
+            # machine off isn't a load.
             if (jumped and not machine_idle) or job_is_early or catchup:
                 self.phase = RUN_ACTIVE
                 self.last_rise_ts = ts
@@ -245,29 +207,18 @@ class EnergyDetector:
         if self.last_rise_ts is not None:
             flat_for = ts - self.last_rise_ts
             if has_eta:
-                # The washer's estimate is the gate: finish only once it has
-                # passed and the (unreliable) meter has settled. A frozen/flat
-                # meter can't fire early, and a stalled job_state can't block it.
+                # Estimate-gated finish; full rule is in the docstring above.
                 if eta_passed and flat_for >= self.eta_grace:
                     self.reset()
                     return EV_FINISHED
             elif energy is not None and meter_reporting and flat_for >= self.idle_timeout:
-                # No usable estimate but the meter IS reporting (e.g. an offline
-                # batch load): energy-only flat backstop. When energy is None the
-                # device is unavailable — we have no data, so we do NOT guess a
-                # finish here; the coordinator's offline-aware path handles that.
-                #
-                # ``meter_reporting`` is the other half of that same sentence,
-                # and it cost a false completion to learn. ``energy is not None``
-                # only says the entity *has* a value, not that the value is a
-                # live one, and ``last_rise_ts`` is seeded when the load starts
-                # rather than on a real rise -- so a meter frozen since before
-                # the session began satisfies "flat for an hour" the moment the
-                # timer runs out, having never reported anything at all. On
-                # 2026-09-04 that ended a load 60 minutes in while job_state
-                # still read `drying`, and the drum ran for hours afterwards.
-                # The coordinator decides what counts as reporting, because
-                # only it can see when the entity last changed.
+                # Flat-energy backstop for a load with no usable estimate but
+                # a reporting meter (e.g. offline batch). `energy is not
+                # None` only means the entity has a value, not that it's
+                # live, and `last_rise_ts` is seeded at load start rather
+                # than on a real rise — so `meter_reporting` guards against a
+                # meter frozen since before the session began looking "flat"
+                # the instant the timer runs out.
                 self.reset()
                 return EV_FINISHED
         return None

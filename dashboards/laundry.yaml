@@ -1,20 +1,12 @@
-# Laundry Discord Bot — a dashboard for the whole integration.
+# Laundry Discord Bot dashboard.
 #
-# HOW TO USE
-#   Settings → Dashboards → + Add dashboard → New dashboard from scratch,
-#   open it, then ⋮ (top right) → Edit → ⋮ again → Raw configuration editor,
-#   and paste this file over what is there.
+# Settings → Dashboards → Add dashboard → New dashboard from scratch, open it,
+# then ⋮ → Edit → ⋮ → Raw configuration editor, and paste this file.
 #
-# BEFORE YOU DO: check your entity ids.
-#   These assume the short form -- sensor.laundry_stage, sensor.laundry_health
-#   and so on. Home Assistant composes an entity id at first registration from
-#   the device's area and name, so most installs get a prefix instead, e.g.
-#   sensor.laundry_room_laundry_discord_bot_laundry_stage. That is normal, not
-#   a broken install. Settings → Devices & services → Laundry Discord Bot
-#   lists your real ids; a find-and-replace here is the whole fix, and it
-#   beats renaming the entities (which loses their recorder history).
-#
-# Cards are core-only — nothing here needs a HACS frontend module.
+# Entity ids assume the short form (sensor.laundry_stage, ...). If the device
+# is in an area, or the install predates 0.34.0, yours have a prefix: see
+# Settings → Devices & services → Laundry Discord Bot and find-and-replace here.
+# Core cards only; no HACS frontend modules needed.
 
 views:
   - title: Laundry
@@ -67,9 +59,7 @@ views:
             name: Cloud drops (24h)
 
       # ---- what the washer says about itself -----------------------------
-      # The only external truth there is. When this and the card above
-      # disagree, this one is usually right -- and water is the honest sensor
-      # (see docs/field-notes.md).
+      # When this disagrees with the card above, this is usually right.
       - type: entities
         title: What the washer says
         show_header_toggle: false
@@ -87,11 +77,9 @@ views:
           - entity: sensor.washer_water_consumption
             name: Water (cumulative)
 
-      # ---- the four things worth doing by hand ---------------------------
-      # The last two are mirrors of each other and it is worth knowing which
-      # is which before you need one: Track is for a wash that IS running and
-      # the bot never noticed (it posts a card); Force-close is for a load the
-      # bot thinks is running and isn't (it announces nothing).
+      # ---- manual actions ------------------------------------------------
+      # Track: a wash IS running and the bot missed it (posts a card).
+      # Force-close: the bot thinks a load is running and it isn't (silent).
       - type: entities
         title: Actions
         show_header_toggle: false
@@ -106,8 +94,7 @@ views:
             name: Force-close a stuck session
 
       # ---- tuning --------------------------------------------------------
-      # Changing any of these reloads the integration, which briefly
-      # reconnects the Discord bot. Fine to tune; don't automate against them.
+      # Changing any of these reloads the integration (brief bot reconnect).
       - type: entities
         title: Timing
         show_header_toggle: false
@@ -150,13 +137,8 @@ views:
           - entity: sensor.washer_washer_machine_state
           - entity: binary_sensor.washer_running
 
-      # The two meters at full resolution, over a window short enough that
-      # the recorder still has every sample. This is the card that answers the
-      # question docs/field-notes.md 3 leaves open -- what water does during
-      # and after a self-clean, and whether it moves when the energy meter has
-      # stopped. Nothing in detection reads water, and nothing will until
-      # there is a picture here of a self-clean ending. Until then this is a
-      # measurement, not a signal.
+      # Both meters at full resolution, for the water-vs-energy measurement
+      # in https://github.com/keyxmakerx/discord-realtime-bot-ha/issues/40.
       - type: history-graph
         title: The meters, close up
         hours_to_show: 12
@@ -166,8 +148,7 @@ views:
           - entity: sensor.washer_water_consumption
             name: Water
 
-      # Energy and water on their own graph: they are numbers, and a state
-      # graph of a cumulative meter is unreadable next to categorical states.
+      # Numeric meters get their own graph, apart from the categorical states.
       - type: statistics-graph
         title: Energy and water
         days_to_show: 7

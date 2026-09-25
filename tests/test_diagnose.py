@@ -1,14 +1,10 @@
 """Tests for the pure health checks behind the `diagnostics` action.
 
-Runnable with plain ``python3 tests/test_diagnose.py`` — no pytest, no Home
-Assistant — mirroring the other pure suites. ``diagnose.py`` is loaded by file
-path so importing it does not pull in the package ``__init__``.
+Runnable with plain ``python3 tests/test_diagnose.py``. ``diagnose.py`` is
+loaded by file path so it doesn't import Home Assistant.
 
-The anchor case is a **real incident**: a session captured off the running
-install on 2026-08-28, in which the bot reported a wash while the machine was
-switched off. Every threshold here is asserted against that data rather than
-against invented numbers, because a check that only fires on a hypothetical is
-a check nobody can trust the next time this happens.
+Thresholds are checked against a real captured incident (the FLAPS/STARTED
+data below), not invented numbers.
 """
 
 from __future__ import annotations
@@ -31,7 +27,6 @@ summarise = _d.summarise
 flap_cadence = _d.flap_cadence
 PROBLEM, WARNING, NOTE = _d.PROBLEM, _d.WARNING, _d.NOTE
 
-# The incident, verbatim.
 FLAPS = [
     1787866080.842309, 1787869167.705905, 1787872254.551392, 1787875341.363642,
     1787878474.392588, 1787881561.251164, 1787884648.025608, 1787887735.021497,
@@ -65,8 +60,6 @@ def _codes(findings):
 
 
 def test_the_real_incident_is_diagnosed_without_a_human_doing_arithmetic():
-    # The whole point. Working this out by hand took reading a storage file and
-    # converting epoch timestamps; every conclusion reached that way is below.
     found = check(
         _incident(), STARTED + 7200,
         watched={"running": "off", "machine_state": "stop", "job_state": "none"},
@@ -77,12 +70,8 @@ def test_the_real_incident_is_diagnosed_without_a_human_doing_arithmetic():
     assert "started_on_a_reconnect" in codes  # 34s after a drop
     assert "no_completion_estimate" in codes  # the washer never estimated one
     assert "connection_cadence" in codes      # drops on a timer, not at random
-    # All warnings, none problems — by the module's own severity contract. A
-    # phantom is "wrong now, and a safety net will eventually clear it" (the
-    # flat-energy backstop ends it within the hour); PROBLEM is reserved for
-    # states nothing will clear. The wording carries the action instead: the
-    # meter finding names reset_session, and the machine finding asks for a
-    # second run, which a wedge survives and an end-of-cycle window does not.
+    # All warnings, no problems: PROBLEM is reserved for states nothing clears
+    # on its own; this phantom self-clears via the flat-energy backstop.
     assert all(f["severity"] == WARNING or f["code"] == "connection_cadence"
                for f in found)
     assert "warning" in summarise(found)
@@ -91,9 +80,6 @@ def test_the_real_incident_is_diagnosed_without_a_human_doing_arithmetic():
 
 
 def test_a_healthy_running_load_is_reported_healthy():
-    # The failure mode that would make this useless: crying wolf during a
-    # perfectly ordinary wash. The meter has moved, the estimate exists, and
-    # the machine agrees it is running.
     session = _incident(
         energy_start=11.6, last_eta_ts=STARTED + 3600,
         detector={"phase": "active", "last_energy": 12.4,
@@ -109,8 +95,8 @@ def test_a_healthy_running_load_is_reported_healthy():
 
 
 def test_a_wedge_is_called_a_problem_because_nothing_will_clear_it():
-    # The two halves cannot disagree during a real load, so this is never
-    # transient — and unlike the phantom, no safety net ends it.
+    # The two halves can't disagree during a real load; unlike the phantom,
+    # nothing clears this on its own.
     stale = _incident(detector={"phase": "idle", "last_energy": 11.6,
                                 "last_rise_ts": None, "idle_energy": 11.6})
     found = check(stale, STARTED + 600, watched={})
@@ -125,16 +111,14 @@ def test_a_wedge_is_called_a_problem_because_nothing_will_clear_it():
 
 
 def test_a_tracked_session_with_no_anchor_has_no_way_out():
-    # The drying-resurrect signature: both time nets read session_started_ts,
-    # so without it neither can ever fire.
+    # Both time-based checks read session_started_ts; without it, neither can fire.
     found = check(_incident(session_started_ts=None), STARTED + 60, watched={})
     assert "tracked_without_anchor" in _codes(found)
     assert any(f["severity"] == PROBLEM for f in found)
 
 
 def test_the_meter_check_waits_long_enough_not_to_libel_a_slow_reporter():
-    # This washer's meter is documented as lagging 15-45 minutes, so a check
-    # that fired at 20 would accuse every real load.
+    # The meter lags 15-45 minutes; firing sooner would accuse every real load.
     early = check(_incident(), STARTED + 30 * 60, watched={})
     assert "meter_never_moved" not in _codes(early)
     late = check(_incident(), STARTED + 80 * 60, watched={})
@@ -146,8 +130,6 @@ def test_the_meter_check_waits_long_enough_not_to_libel_a_slow_reporter():
 
 
 def test_a_regular_cadence_is_distinguished_from_a_flaky_link():
-    # The difference decides whether the fix is the network or the integration
-    # doing the polling, and nothing else in the system reports it.
     count, median, regular = flap_cadence(FLAPS)
     assert count == 19
     assert 3080 <= median <= 3095
@@ -167,9 +149,8 @@ def test_a_claim_with_no_id_cannot_be_pinged():
 
 
 def test_the_machine_contradiction_needs_the_machine_to_actually_say_so():
-    # An unconfigured or missing entity must not be read as "idle" — it cannot
-    # contradict anything, and treating silence as evidence would fire this on
-    # every install that leaves machine_state unset.
+    # An unconfigured entity must not be read as "idle"; that would fire on
+    # every install that leaves it unset.
     quiet = check(_incident(), STARTED + 60,
                   watched={"running": None, "machine_state": None})
     assert "machine_says_idle" not in _codes(quiet)
@@ -180,8 +161,6 @@ def test_the_machine_contradiction_needs_the_machine_to_actually_say_so():
 
 
 def test_nothing_here_raises_on_junk():
-    # It is run precisely when something is already wrong, so it must never be
-    # the thing that fails.
     for bad in (None, {}, {"stage": None}, {"detector": "nonsense"},
                 {"flap_times": "no"}, {"session_started_ts": "soon"},
                 {"queue": "some"}, {"detector": {"phase": None}}):
@@ -192,9 +171,8 @@ def test_nothing_here_raises_on_junk():
 
 
 def test_the_impossible_pair_is_reported_as_proof_of_a_race():
-    # No single-threaded path can produce "owned AND up for grabs", so seeing
-    # it is evidence rather than a symptom: a tap landed inside a completion
-    # that was holding the session lock across Discord round trips.
+    # No single-threaded path produces "owned AND up for grabs"; seeing it
+    # means a tap landed during a lock-holding completion (a race).
     racy = _incident(claimed_by="Alex", claimed_by_id=42, waiting=True)
     found = check(racy, STARTED, watched={})
     assert "claimed_and_waiting" in _codes(found)
@@ -209,11 +187,8 @@ def test_the_impossible_pair_is_reported_as_proof_of_a_race():
 
 
 def test_an_outage_is_an_outage_not_a_phantom():
-    # The worst false positive the first release had: a real load whose cloud
-    # drops a few minutes in freezes the meter at its start value, and at 75
-    # minutes the check called it "almost certainly a load that never existed"
-    # and advised reset_session — killing a legitimate wash mid-outage. The
-    # offline fact was sitting unread in the same dict the whole time.
+    # A cloud outage freezes the meter too; it must not be read as a phantom
+    # load and told to reset.
     away = _incident(offline_since=STARTED + 180)
     found = check(
         away, STARTED + 7200,
@@ -229,10 +204,8 @@ def test_an_outage_is_an_outage_not_a_phantom():
 
 
 def test_reconnect_proximity_corroborates_and_never_accuses_alone():
-    # Drops arrive every ~51 min around the clock, so bare proximity would
-    # flag ~8% of perfectly healthy loads. It may only ever second the silent
-    # meter's accusation, so early in a load — meter legitimately unmoved
-    # under its 15-45 min lag, but under the 75-min bar — it stays quiet.
+    # Drops recur every ~51 min, so proximity alone would flag ~8% of healthy
+    # loads; it may only corroborate the meter's own accusation.
     early = check(_incident(), STARTED + 40 * 60, watched={})
     assert "started_on_a_reconnect" not in _codes(early)
     late = check(_incident(), STARTED + 80 * 60, watched={})
@@ -244,17 +217,14 @@ def test_reconnect_proximity_corroborates_and_never_accuses_alone():
 
 
 def test_a_self_clean_is_never_accused_of_missing_an_estimate():
-    # Drum cleans never publish a completion estimate, so its absence carries
-    # no information. (The check's other suppressions still apply to it.)
+    # Drum cleans never publish a completion estimate, so its absence carries no information.
     sc = _incident(stage="self_clean")
     assert "no_completion_estimate" not in _codes(check(sc, STARTED + 3600, watched={}))
 
 
 def test_junk_numerics_are_refused_rather_than_carried():
-    # A literal NaN cannot round-trip HA's store, but the STRING "nan" can —
-    # json and float() both accept it — and one such value in flap_times
-    # walked to int(median // 60) and raised, in the module whose contract is
-    # that it never raises. Infinity is the same trap for the meter check.
+    # "nan"/"inf" strings round-trip through JSON and float(); they must not
+    # raise, which is this module's whole contract.
     poisoned = _incident(flap_times=["nan", 1.0, 2.0])
     assert isinstance(check(poisoned, STARTED, watched={}), list)  # not raises
     rich = _incident(energy_start=float("inf"))
@@ -264,10 +234,8 @@ def test_junk_numerics_are_refused_rather_than_carried():
 
 
 def test_regularity_is_a_fraction_not_a_unanimity_vote():
-    # One drop the recorder missed merges two 3087s gaps into ~6174s. Under
-    # the all-gaps rule that single outlier flipped the incident's own
-    # metronome to "ordinary unreliable link" — pointing the owner at the
-    # wifi while the evidence said timer.
+    # A single missed-drop outlier (merging two gaps into one) must not flip
+    # a real cadence to "irregular".
     missing_one = FLAPS[:7] + FLAPS[8:]
     count, median, regular = flap_cadence(missing_one)
     assert regular is True, (count, median)
@@ -277,9 +245,6 @@ def test_regularity_is_a_fraction_not_a_unanimity_vote():
 
 
 def test_the_multi_entry_summary_counts_entries_not_findings():
-    # The first inline version rendered max-problems-within-one-entry as the
-    # number of entries WITH problems — "2 entries, 4 with problems" from a
-    # two-entry install. Units matter in the one line everybody reads first.
     two = [
         {"findings": [{"severity": "problem"}, {"severity": "problem"},
                       {"severity": "problem"}]},
@@ -290,12 +255,7 @@ def test_the_multi_entry_summary_counts_entries_not_findings():
     assert _d.summarise_entries("junk") == "0 entries, 0 with problems"
 
 
-# --------------------------------------------------------------------------- #
-# The 2026-09-12 incident: the bot sat at "done" while the washer washed, and
-# the health check said "healthy -- nothing to report". Every check in the
-# module asked whether a TRACKED load was real; none asked the opposite. These
-# pin the mirror shut. See docs/field-notes.md 5.
-# --------------------------------------------------------------------------- #
+# --- the mirror case: a real load running while the bot thinks it's idle ----
 
 def _missed(**over):
     """The bot idle/done, energy having climbed since the last completion."""
@@ -323,9 +283,8 @@ _WASHING = {
 
 
 def test_a_load_the_bot_missed_is_reported_as_a_problem():
-    # The complaint that started all of this, and the one thing the health
-    # check could not see. PROBLEM, not WARNING: nothing clears it on its own
-    # — there is no card to time out and no session for a safety net to close.
+    # PROBLEM, not WARNING: nothing clears this on its own (no card to time
+    # out, no session to close).
     found = check(_missed(), STARTED, watched=_WASHING)
     codes = _codes(found)
     assert "untracked_load_running" in codes
@@ -338,10 +297,8 @@ def test_a_load_the_bot_missed_is_reported_as_a_problem():
 
 
 def test_the_same_state_with_a_still_meter_is_only_the_ambiguous_warning():
-    # Identical except the meter has not moved since the last load ended. Now
-    # there are genuinely two readings — a fresh load inside the documented
-    # 15-45 minute meter lag, or a reconnect replaying a stale phase — and
-    # nothing stored separates them. Say so; don't pick one.
+    # Two readings are equally possible here (a fresh load in its meter lag,
+    # or a reconnect replaying a stale phase); say so, don't pick one.
     found = check(
         _missed(detector={
             "phase": "idle", "last_energy": 16.90,
@@ -358,10 +315,8 @@ def test_the_same_state_with_a_still_meter_is_only_the_ambiguous_warning():
 
 
 def test_a_phase_frozen_mid_cycle_while_idle_is_not_accused():
-    # field-notes 1.1: this washer freezes on the mid/late phase it ended on,
-    # and `running`/`machine_state` stay asserted for HOURS afterwards. A check
-    # that fired on those would fire after every single load. The gate is the
-    # EARLY phase precisely because that is not a shape the machine sticks in.
+    # This washer freezes on its ending phase for hours afterwards; gating on
+    # the EARLY phase only avoids firing after every load.
     for phase in ("drying", "rinse", "spin", "finish", "none"):
         found = check(
             _missed(), STARTED,
@@ -374,8 +329,8 @@ def test_a_phase_frozen_mid_cycle_while_idle_is_not_accused():
 
 
 def test_weight_sensing_counts_as_an_early_phase_too():
-    # The other half of a fresh cycle's opening. Missing it would leave the
-    # check blind for the first minutes of every load.
+    # The other half of a fresh cycle's opening; missing it blinds the check
+    # for the first minutes of every load.
     found = check(
         _missed(), STARTED,
         watched=dict(_WASHING, job_state="weight_sensing"),
@@ -384,8 +339,6 @@ def test_weight_sensing_counts_as_an_early_phase_too():
 
 
 def test_a_load_being_tracked_is_never_called_untracked():
-    # The obvious false positive: a healthy wash in progress, which is the
-    # state this check spends most of its life looking at.
     found = check(
         _incident(stage="washing"), STARTED + 600, watched=_WASHING,
     )
@@ -395,9 +348,8 @@ def test_a_load_being_tracked_is_never_called_untracked():
 
 
 def test_the_health_sensor_no_longer_reads_ok_through_the_incident():
-    # The regression in one line. On 2026-09-12 this exact state produced
-    # `sensor.laundry_health == "ok"` and a card that said "Nothing to
-    # report", while the washer ran a full cycle nobody was told about.
+    # This exact state used to read as "ok" with nothing to report, while a
+    # full cycle ran unnoticed.
     assert _d.worst_severity(check(_missed(), STARTED, watched=_WASHING)) != "ok"
 
 

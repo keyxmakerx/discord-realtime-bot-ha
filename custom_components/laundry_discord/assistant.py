@@ -1,49 +1,9 @@
-"""The 🤖 assistant: the private panel, per-person prefs and the DM plumbing.
+"""The assistant: private, ephemeral settings panel, per-person prefs, and DM plumbing.
 
-One button on the card opens an **ephemeral** message — the only personal
-surface in an otherwise shared channel, which is what lets an onboarding
-explainer and per-person settings exist without costing the channel a single
-line. Everything here is additive: with nobody opted in, this module sends
-exactly the messages the bot already sent.
-
-Four Discord facts shape this file (design doc §5.3 / §13):
-
-* **An ephemeral message can only be sent as a response to an interaction.**
-  The bot cannot start one. That single constraint is why reminders are DMs and
-  why this panel only ever appears in reply to a tap.
-* **An interaction token dies after 15 minutes.** Every tap is a *new*
-  interaction with a fresh token, so a panel stays editable while somebody
-  keeps tapping — but a tap on a panel opened an hour ago cannot edit that old
-  message and has to answer with a fresh ephemeral instead. Both paths are
-  implemented in :meth:`LaundryAssistant._async_respond`.
-* **Ephemeral messages aren't durable** (they vanish on client restart), but
-  their components dispatch through the persistent-view registry, so every
-  ``custom_id`` here goes into the view handed to ``add_view``.
-* **A DM to a known user id needs no privileged intent**, but raises
-  ``discord.Forbidden`` (error 50007) when the recipient has DMs from server
-  members turned off — and Discord never tells *them*. That is the one real
-  failure mode (§10.5) and it is handled here: fall back to the channel so the
-  message is never lost, then show them the fix the next time they open the
-  panel.
-
-Prefs live in their own ``Store`` key, separate from the session store, so a
-bug in here cannot corrupt a live load. The same store also holds the habit
-model's history and corrections (design doc §12) — one planner store, not two —
-and this module is the only thing that writes to it. The dependency runs one
-way: the coordinator reaches in for the panel, the ping routing and "a claim
-just happened", and nothing in this module knows anything about the session
-state machine.
-
-Two rules govern every write here, and both are about what a shared house can
-stand:
-
-* **A store write only when something actually changed.** Claim, Unclaim and
-  Reclaim are one load, so the second tap must cost nothing; the panel opening
-  costs nothing; a DM going through when we already knew it would costs
-  nothing.
-* **Silence at log level.** Normal operation adds no lines at all. What debug
-  lines exist mark a decision that was taken — a load recorded, a guess retired
-  — never an evaluation that concluded "no".
+An ephemeral message only exists as a reply to an interaction and expires
+with its 15-minute token. Every `custom_id` must be registered on the
+persistent view. A DM to someone with DMs off raises `discord.Forbidden`
+and falls back to the channel.
 """
 
 from __future__ import annotations
@@ -102,26 +62,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# One colour per panel. All five of these used to be blurple, which meant the
-# stripe down the left of an ephemeral message carried no information at all:
-# grid, ask-to-swap, welcome, settings and guess were indistinguishable at a
-# glance, and these panels *replace each other in place*, so the stripe is the
-# only thing that doesn't move between one and the next. Discord's own brand
-# palette, so they still read as one bot rather than five.
-_COLOR_PANEL = 0x5865F2  # blurple — 🤖 the hub everything comes back to
-_COLOR_WELCOME = 0xFEE75C  # yellow — 👋 the one panel you see exactly once
-_COLOR_GRID = 0x57F287  # green — 📅 the week
-_COLOR_TRADE = 0xEB459E  # fuchsia — 🔁 the only panel that messages a person
-_COLOR_GUESS = 0xC77DFF  # violet — 🔮 the model's opinion, not a fact
-# Amber, and specifically *not* Discord's brand red, which is the one palette
-# entry left. Red already means something in this integration — ``danger`` on a
-# slot button is "somebody else has this" — and on an embed it reads as an
-# error, which a settings panel is not. Amber is what a bell is drawn in.
-_COLOR_NOTIFY = 0xFAA61A  # amber — 🔔 the only panel where every control mutes
+# One colour per panel, so the embed's left stripe identifies which panel it is.
+_COLOR_PANEL = 0x5865F2  # blurple — hub
+_COLOR_WELCOME = 0xFEE75C  # yellow — onboarding, shown once
+_COLOR_GRID = 0x57F287  # green — week grid
+_COLOR_TRADE = 0xEB459E  # fuchsia — swap request
+_COLOR_GUESS = 0xC77DFF  # violet — model's guess
+# Not red: red already means "danger" (someone else has this slot) on a button.
+_COLOR_NOTIFY = 0xFAA61A  # amber — notification settings
 
-# The §10.5 explainer, shown once at the top of the panel after a refused DM.
-# Both settings are listed because either one can be the culprit and neither is
-# discoverable: Discord tells the sender a DM bounced and never the recipient.
+# Shown once after a refused DM; both settings are listed since either could be the cause.
 _DM_NOTICE = (
     "⚠️ **I couldn't DM you**\n"
     "Two settings control this:\n"
@@ -131,30 +81,15 @@ _DM_NOTICE = (
     "Until then I'll ping you in the channel instead.\n\n"
 )
 
-# What each reminder mode actually does, in the panel's own words. "Off" still
-# names you in the channel — it removes the *push*, not the information, the
-# same trade the 🌙 Quiet button already makes on the card.
+# "Off" still names you in the channel; it removes the push, not the mention.
 _MODE_LABELS = {
     people_mod.REMIND_DM: "📬 In a DM — just you, nothing in the channel",
     people_mod.REMIND_CHANNEL: "💬 In the channel, with an @mention",
     people_mod.REMIND_OFF: "🚫 No pushes — you're still named in the channel",
 }
 
-# The four 🔔 switches: ``(emoji, button label, what the message actually is)``.
-# Keyed by :data:`people.KINDS`, which is the one home for those names — see the
-# comment there for why they live in a module that imports nothing. The third
-# element is the panel's own sentence about that kind, kept beside its label so
-# the button and the line explaining it cannot drift into describing two
-# different messages.
-#
-# The check-in is "weekly" here and *not* "Sunday", which is what the design doc
-# and the README both call it: the day is an integration option
-# (``plan_dm_weekday``), read in :mod:`reminders`, and a panel that names a day
-# the house has changed is a settings screen caught lying about something the
-# reader can check in one tap. The heads-up line says "before" and not "an hour
-# before" for exactly the same reason: its lead is ``nudge_lead``, an option
-# running from five minutes to three hours, so the hour belongs to the house
-# rather than to this panel.
+# (emoji, button label, sentence describing that kind), keyed by people.KINDS.
+# Avoids specifics like "Sunday" or "an hour before": the day/lead are options.
 _NOTIFY_KINDS = {
     people_mod.KIND_CHECKIN: (
         "📅",
@@ -178,19 +113,8 @@ _NOTIFY_KINDS = {
     ),
 }
 
-# The quiet-hours presets, as ``(start, end)`` local hours — start inclusive,
-# end exclusive, wrapping midnight — with None for "no quiet hours" first,
-# because the way *out* of a setting must never be harder to find than the way
-# in (P7).
-#
-# Overnight only, and only five of them. That is not a limitation, it is the
-# actual complaint: :data:`plan.SLOT_WINDOWS` opens AM at 06:00 and the heads-up
-# runs ahead of the slot it is about, so the AM one is the earliest thing this
-# integration schedules and the only one that can wake somebody — and *how much*
-# earlier than 06:00 is the house's ``nudge_lead``, which is why no line in this
-# panel names the hour it lands at. A midday window would be a setting nobody
-# picks, and every unused setting is one more line a newcomer reads past to
-# reach the one they came for.
+# (start, end) local hours, wraps midnight. None ("no quiet hours") is first
+# so turning the setting off is never harder to find than turning it on.
 _QUIET_PRESETS = (None, (22, 8), (23, 9), (0, 7), (21, 9))
 
 
@@ -204,10 +128,8 @@ def _quiet_label(window) -> str:
 def _quiet_value(window) -> str:
     """A preset as a select value: ``"none"``, or ``"22-8"``.
 
-    Deliberately the two hours and nothing else. A value carrying an index into
-    :data:`_QUIET_PRESETS` would be read by a tap on a panel that was rendered
-    before an upgrade reordered the list, and would then set a window nobody
-    picked — the select is persistent, so its values outlive the render.
+    Encodes the hours, not a list index — the select is persistent, so a stale
+    panel's value must still mean the same thing after the preset list changes.
     """
     return "none" if window is None else f"{window[0]}-{window[1]}"
 
@@ -215,11 +137,8 @@ def _quiet_value(window) -> str:
 def _parse_quiet(value) -> tuple[int | None, int | None]:
     """A select value back to ``(start, end)`` hours; anything odd clears it.
 
-    Clearing is the only safe direction for something unreadable. The failure
-    mode of guessing is somebody silenced past a morning that never arrives,
-    where the failure mode of clearing is one setting they can put back in a
-    tap. :func:`people.set_quiet_hours` re-checks both hours anyway, so a pair
-    out of range lands in the same place rather than storing a 25th hour.
+    Fails safe to "no quiet hours" rather than guessing — a wrong guess could
+    silence someone past a morning that never arrives.
     """
     parts = str(value).split("-")
     if len(parts) != 2:
@@ -233,11 +152,9 @@ def _parse_quiet(value) -> tuple[int | None, int | None]:
 def _message_key(message_id) -> str | None:
     """A Discord message id in its stored form, or None for anything unusable.
 
-    The same hazard :func:`trade._id` guards: an id arrives as an ``int`` from
-    ``interaction.message.id`` and comes back off HA's JSON ``Store`` as a
-    string, and two spellings of one id would mean a reminder DM that never
-    recognises itself. ``bool`` is excluded explicitly because ``True`` is an
-    ``int`` and ``"True"`` is not a message.
+    Ids arrive as ``int`` but round-trip through JSON storage as ``str``; both
+    must normalise to the same key. ``bool`` is excluded because ``True`` is an
+    ``int``.
     """
     if message_id is None or isinstance(message_id, bool):
         return None
@@ -248,9 +165,7 @@ def _message_key(message_id) -> str | None:
 def _normalise_nudge_cells(raw) -> dict[str, dict]:
     """The stored "which DM was about which cell" map, rebuilt off disk.
 
-    Both halves are required: a row with a cell and no message id would be the
-    per-person note this replaced, and that note answered for whichever DM
-    happened to be tapped.
+    Both cell and message id are required; a row missing either is dropped.
     """
     rows: dict[str, dict] = {}
     if not isinstance(raw, dict):
@@ -267,17 +182,10 @@ def _normalise_nudge_cells(raw) -> dict[str, dict]:
     return rows
 
 
-# How long a swap request DM is allowed to take to leave the building. Same
-# reasoning as :data:`reminders._SEND_TIMEOUT`: ``async_dm_user`` starts with
-# ``wait_until_ready()``, so a send attempted while the gateway is down would
-# otherwise park there until it reconnects and deliver an ask about a slot that
-# has been and gone. A request that could not be sent is withdrawn, not queued.
+# Bounds how long a swap DM can wait on wait_until_ready() before withdrawing.
 _TRADE_SEND_TIMEOUT = 30
 
-# What a tap on a swap DM says when the request behind it is gone — answered
-# already, or lapsed. Deliberately says nothing about who or why: a DM sits in
-# an inbox indefinitely, and the person tapping it a week late must not learn
-# anything from the fact that it no longer works.
+# Says nothing about who or why: a DM tapped weeks later must not leak info.
 _TRADE_STALE = (
     "That one's lapsed — nothing's been changed, and nobody's been told "
     "anything either way."
@@ -285,12 +193,7 @@ _TRADE_STALE = (
 
 
 class _ReminderButton(discord.ui.Button):
-    """One of the three "how should I reach you" choices.
-
-    A single button per mode rather than a select menu: three fixed options fit
-    in one row, and a button shows the current choice by its own style without
-    the extra tap a dropdown costs.
-    """
+    """One of the three "how should I reach you" choices."""
 
     def __init__(
         self,
@@ -325,7 +228,7 @@ class _ReminderButton(discord.ui.Button):
 
 
 class _MonitorButton(discord.ui.Button):
-    """Consent toggle for logging this person's loads (design doc §11)."""
+    """Consent toggle for logging this person's loads."""
 
     def __init__(
         self, assistant: "LaundryAssistant", *, enabled: bool | None
@@ -373,7 +276,7 @@ class _WeekButton(discord.ui.Button):
 
 
 class _GuessButton(discord.ui.Button):
-    """Open the 🔮 "here's what I think" panel (design doc §7.3)."""
+    """Open the "here's what I think" guess panel."""
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
         super().__init__(
@@ -396,17 +299,8 @@ class _GuessButton(discord.ui.Button):
 class _PanelNotifyButton(discord.ui.Button):
     """Open the 🔔 "what I send you" sub-panel.
 
-    A sub-panel rather than four more buttons on the main one, and that is a
-    space decision with a reason behind it: row 1 had two free slots when this
-    arrived, the controls need six, and a settings panel you have to read past
-    to find *how should I reach you* has stopped being the onboarding surface
-    it exists to be. So the one button that fits opens the five that don't.
-
-    Shown to anybody onboarded, including somebody whose **Pings** are set to
-    the channel — where none of these switches currently change anything. That
-    is deliberate: hiding a setting because another setting makes it inert is
-    how somebody concludes the bot cannot be told to stop, and the panel behind
-    this says plainly what is and isn't reaching them.
+    Shown even when Pings is set to the channel, where these switches are
+    inert — hiding it then would look like the bot can't be told to stop.
     """
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
@@ -430,12 +324,8 @@ class _PanelNotifyButton(discord.ui.Button):
 class _GuessRightButton(discord.ui.Button):
     """"That's right" — an acknowledgement, and deliberately nothing more.
 
-    §7.3 is exact that the model learns from **actual claims and explicit
-    corrections only**. A confirmation is neither: the loads that produced the
-    guess are already in history and already counted, so writing a row here
-    would be the guess feeding itself evidence with a human tap laundering it —
-    the precise drift the section exists to prevent. So this button stores
-    nothing, and the panel says so rather than implying a reward.
+    Stores nothing: the loads behind the guess are already counted, so writing
+    a row here would let the guess feed itself its own evidence.
     """
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
@@ -480,10 +370,7 @@ class _GuessWrongButton(discord.ui.Button):
 class _GuessOffButton(discord.ui.Button):
     """"Stop guessing" — the person's ``predict`` preference, both ways.
 
-    §7.3 names only the off direction, but an opt-out with no way back is a
-    setting somebody has to edit a JSON store to undo (P7 — additive *and
-    reversible*). The label follows the state, so the same button is the way
-    out and the way back in.
+    The label follows the state, so the same button turns it off and back on.
     """
 
     def __init__(self, assistant: "LaundryAssistant", *, predicting: bool) -> None:
@@ -507,9 +394,8 @@ class _GuessOffButton(discord.ui.Button):
 class _GuessBackButton(discord.ui.Button):
     """Back to the settings panel.
 
-    Its own ``custom_id`` rather than the grid's, even though it does the same
-    thing: ``add_view`` keys the persistent registry by id, so two views sharing
-    one id means the second registration quietly wins for both.
+    Its own ``custom_id`` rather than the grid's: ``add_view`` keys the
+    registry by id, so two views sharing one id would collide.
     """
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
@@ -531,14 +417,11 @@ class _GuessBackButton(discord.ui.Button):
 
 
 class GuessView(discord.ui.View):
-    """The 🔮 panel's controls: the §7.3 three, plus back.
+    """The 🔮 panel's controls: right/wrong/off, plus back.
 
-    Two rows, at most four components. ``That's right`` and ``Wrong`` are only
-    added when there is a guess on screen to answer — a button that argues with
-    a sentence saying "I don't have a guess for you yet" is worse than no
-    button — but the registration template (built with no arguments) carries
-    every id, because an unregistered ``custom_id`` doesn't error, it silently
-    stops dispatching.
+    ``That's right``/``Wrong`` are added only when there's a guess to answer,
+    but the registration template carries every id — an unregistered
+    custom_id silently stops dispatching after a restart.
     """
 
     def __init__(
@@ -559,16 +442,9 @@ class GuessView(discord.ui.View):
 class _NotifyKindButton(discord.ui.Button):
     """One kind of unprompted message, labelled with the state it is in.
 
-    Labelled and tapped exactly like 👁 Monitoring, and for the same reason: the
-    label *is* the setting, so reading the panel and changing it are one gesture
-    and there is no separate save to forget. ``enabled=None`` is the
-    registration template, which has no person and so no state to report.
-
-    The labels are short — "Heads-up", not "Slot heads-up" — because four of
-    these share one row and Discord truncates a label from the **right**, which
-    is exactly where the ``: on`` lives. A switch that has lost its state is a
-    switch you have to tap to read, and tapping it is what changes it. The full
-    sentence for every kind is in the embed above, where there is room.
+    The label is the setting: reading it and changing it are the same tap.
+    Labels stay short (e.g. "Heads-up") because Discord truncates from the
+    right, which is where the ``: on``/``: off`` suffix lives.
     """
 
     def __init__(
@@ -605,18 +481,9 @@ class _NotifyKindButton(discord.ui.Button):
 class _NotifyQuietSelect(discord.ui.Select):
     """The overnight quiet window, as a short list of presets.
 
-    A select rather than a time picker because Discord has no time input at
-    all, and the alternative is parsing "10ish" out of a modal — a text box that
-    can be wrong in more ways than it can be right, on a setting whose failure
-    mode is silence.
-
-    The stored window is named in the placeholder *as well as* marked ``default``
-    on its own option, which is not belt-and-braces: Discord shows the
-    placeholder only when no option is default, and that is exactly the case
-    where somebody's record holds a window these presets don't contain — a
-    hand-edited store, or a preset a later version dropped. The panel then still
-    says what is actually in force, instead of showing an empty box that reads
-    as "no quiet hours" about somebody who has some.
+    A select, not a time picker — Discord has none. The placeholder always
+    names the stored window (not just the ``default`` option), so a
+    hand-edited or dropped window still shows correctly.
     """
 
     def __init__(
@@ -650,12 +517,7 @@ class _NotifyQuietSelect(discord.ui.Select):
 
 
 class _NotifyBackButton(discord.ui.Button):
-    """Back to the settings panel.
-
-    Its own ``custom_id`` rather than 🔮's or the grid's, though all three do the
-    same thing: ``add_view`` keys the persistent registry by id, so two views
-    sharing one means the second registration quietly wins for both.
-    """
+    """Back to the settings panel (its own ``custom_id``; see :class:`_GuessBackButton`)."""
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
         super().__init__(
@@ -678,23 +540,9 @@ class _NotifyBackButton(discord.ui.Button):
 class NotifyView(discord.ui.View):
     """The 🔔 panel: four kind toggles, the quiet-hours select, and back.
 
-    Three rows, six components. The four toggles share row 0 because they are
-    one question asked four times; the select takes a whole row as Discord
-    requires, and Back sits under both.
-
-    ``person`` is the record being rendered for, used only to label the toggles
-    and pre-select the window. ``None`` is the neutral registration template
-    handed to ``add_view``. Unlike :class:`GuessView` there is nothing
-    conditional to leave out here, so the template differs from a real render
-    only in what the labels say — but it is still the template that must carry
-    every id, because one that was never registered doesn't error, it silently
-    stops dispatching.
-
-    Iterating :data:`people.KINDS` rather than a list of its own is what keeps
-    that honest: a kind added there without a row in :data:`_NOTIFY_KINDS` or an
-    id in :data:`const.NOTIFY_KIND_CUSTOM_IDS` raises ``KeyError`` right here,
-    and "here" is startup — ``on_ready`` builds this template — rather than the
-    first time somebody opens the panel.
+    ``person=None`` is the registration template. A kind missing from
+    :data:`_NOTIFY_KINDS` or :data:`const.NOTIFY_KIND_CUSTOM_IDS` raises
+    ``KeyError`` at startup, not when someone opens the panel.
     """
 
     def __init__(
@@ -728,10 +576,8 @@ class NotifyView(discord.ui.View):
 class _GridDaySelect(discord.ui.Select):
     """Which day the four slot buttons act on.
 
-    A select rather than seven buttons because the grid is 7 x 4 = 28 cells and
-    a message holds at most 25 components — a button per cell is impossible
-    before it is even unreadable (design doc §6.4). So the grid is a *display*
-    and this is how you point at a column of it.
+    A select, not per-cell buttons: 7 days x 4 slots = 28 cells, and a message
+    holds at most 25 components.
     """
 
     def __init__(self, assistant: "LaundryAssistant", day: int) -> None:
@@ -760,29 +606,8 @@ class _GridDaySelect(discord.ui.Select):
             await self.assistant.async_report_error(interaction)
 
 
-# Which button style carries which cell state. The button row sits directly
-# under the grid and until now said far less than it: it was binary — green for
-# yours, grey for *everything else* — so free, taken and guessed were one
-# appearance while the block above distinguished all three. Somebody reading the
-# buttons rather than the grid could not see they were about to book themselves
-# into a slot two other people already wanted.
-#
-# discord.py offers four styles and there are six states, so the mapping is not
-# one to one and the two collisions are chosen rather than accidental:
-#
-# * **danger** — somebody else has this. One style for ▒ and ║ both, because
-#   red already carries the fact that matters at the moment of tapping ("this
-#   is contended"); *how often* they have it is what decides whether to ask for
-#   a swap, and that is a decision you make reading the grid, not the row.
-#   Red is not a veto — the button stays enabled, see below — it is the only
-#   style left that reads as "not free", and this codebase had not used it.
-# * **primary** — the model's guess. Blurple is the "suggested" accent, which
-#   is exactly what a guess is.
-# * **success** — yours. Unchanged.
-# * **secondary** — free. Unchanged.
-#
-# ``*`` running has no style of its own: nothing produces it yet (Phase 4), and
-# it falls back to secondary until something does.
+# Four button styles for six cell states: danger covers both "taken" states
+# (not a veto), primary the model's guess, success yours, secondary free/running.
 _SLOT_BUTTON_STYLES = {
     plan_mod.STATE_MINE: discord.ButtonStyle.success,
     plan_mod.STATE_TAKEN: discord.ButtonStyle.danger,
@@ -794,12 +619,8 @@ _SLOT_BUTTON_STYLES = {
 class _GridSlotButton(discord.ui.Button):
     """Book or free one slot on the selected day.
 
-    Styled to say the same thing the cell above it says (see
-    :data:`_SLOT_BUTTON_STYLES`). It is deliberately **not** disabled when
-    somebody else holds the cell: the plan is information, not permission (§8),
-    so two people can want the same slot and the grid's job is to make that
-    visible rather than to arbitrate it. Red here means "somebody's already down
-    for this", not "you may not".
+    Not disabled when someone else holds the cell — the grid shows contention,
+    it doesn't arbitrate it. Red means "already claimed", not "you may not".
     """
 
     def __init__(
@@ -844,13 +665,10 @@ class _GridBackButton(discord.ui.Button):
 
 
 class _TradeAskButton(discord.ui.Button):
-    """🔁 — offer to ask whoever is down for the slot you just tapped (§9).
+    """🔁 — offer to ask whoever is down for the slot you just tapped.
 
-    Only ever added when the last tap landed on a cell somebody **else** holds,
-    which is the moment §9 describes: *"That one's spoken for. Want me to
-    ask?"*. It does not replace the booking — tapping a taken slot still books
-    you in alongside its holder, because a plan is information, not permission
-    (§8), and that stays true. This is the extra option, not a different one.
+    An extra option, not a replacement: tapping a taken slot still books
+    you in alongside its holder.
     """
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
@@ -872,24 +690,11 @@ class _TradeAskButton(discord.ui.Button):
 
 
 class _GridRecurButton(discord.ui.Button):
-    """♻ — promote the cell you just tapped to *every week*, or demote it.
+    """♻ — promote the cell you just tapped to every week, or demote it.
 
-    The writer ``person["slots"]`` never had. The field has been defaulted,
-    normalised, read and reconciled since the planner shipped; nothing could
-    set it, so a standing slot was a thing the store understood, the grid could
-    draw and no human could create.
-
-    It targets **the cell you last tapped**, the same convention 🔁 next to it
-    uses, because that is the only cell on a seven-by-four grid the panel can
-    know you mean. So the gesture is: tap Thu Eve, then tap ♻. It is added only
-    when there is something to say — you hold the last-tapped cell — so it can
-    never ask "every week?" about somebody else's booking or about nothing at
-    all.
-
-    Labelled by what it will *do* rather than by what is true now. "Every week"
-    on a cell that is already standing reads as a statement and gets tapped by
-    people meaning to confirm it, which would quietly cancel the thing they
-    were agreeing with.
+    Targets the last-tapped cell, like 🔁. Labelled by what tapping it will
+    do, not what's true now — "Every week" on an already-standing cell would
+    read as a statement to confirm, and silently cancel it instead.
     """
 
     def __init__(self, assistant: "LaundryAssistant", *, standing: bool) -> None:
@@ -915,25 +720,9 @@ class _GridRecurButton(discord.ui.Button):
 class GridView(discord.ui.View):
     """The week grid's controls: day select, four slot toggles, back.
 
-    Three rows, six to eight components — well inside the 5-row /
-    25-component ceiling, with the select occupying a whole row of its own as
-    Discord requires.
-
-    ``occupancy`` and ``day`` are used only to label and colour the buttons.
-    Passing neither builds the neutral registration template for ``add_view``,
-    which must carry **every** ``custom_id`` — one that was never registered
-    doesn't error, it silently stops dispatching, and this integration has
-    already been bitten by that. That is why 🔁 and ♻ are both added for the
-    template even though a template has no tapped cell to ask about or promote.
-
-    ``expected`` and ``running`` are passed straight through to
-    :func:`plan.cell_state` so a button and the cell above it can never disagree
-    about what state that cell is in — one question, asked once, answered in the
-    module that owns the precedence rule.
-
-    ``recur`` is None when there is nothing of yours to promote, and otherwise
-    says whether the last-tapped cell is already standing — which decides what
-    ♻ is labelled, not whether it appears.
+    Passing no ``occupancy``/``day`` builds the registration template, which
+    must carry every ``custom_id`` — so 🔁 and ♻ are added to it too.
+    ``recur`` decides ♻'s label, not whether it appears.
     """
 
     def __init__(
@@ -968,10 +757,8 @@ class GridView(discord.ui.View):
 class _TradeOfferSelect(discord.ui.Select):
     """Which of *your own* slots to put up in return.
 
-    Only your own cells for this week are listed, and the one you're asking for
-    is left out — a swap needs two different slots and something real on both
-    sides. Nothing in this list can identify anybody: every option is one of the
-    viewer's own bookings, described by day and slot.
+    Lists only the viewer's own cells for this week, minus the one being asked
+    for. Options are described by day and slot only — never identify anyone.
     """
 
     def __init__(
@@ -980,10 +767,7 @@ class _TradeOfferSelect(discord.ui.Select):
         offers: list[str] | None,
         selected: str | None,
     ) -> None:
-        # A select must carry at least one option, and the registration
-        # template (built with no offers) has none to carry — hence the inert
-        # placeholder. The template is never rendered to anybody; it exists so
-        # ``add_view`` learns this custom_id.
+        # Discord requires at least one option; the template has none, hence the placeholder.
         options = [
             discord.SelectOption(
                 label=trade_mod.describe_cell(cell) or cell,
@@ -1056,9 +840,8 @@ class _TradeBackButton(discord.ui.Button):
 class TradeAskView(discord.ui.View):
     """The "shall I ask?" panel: pick an offer, then ask — or back out.
 
-    Built with no arguments for ``add_view``; that template carries all three
-    ``custom_id``s including the select's, which is why the select falls back to
-    a placeholder option rather than being left out.
+    The registration template carries all three ``custom_id``s, so the
+    select falls back to a placeholder option rather than being left out.
     """
 
     def __init__(
@@ -1075,7 +858,7 @@ class TradeAskView(discord.ui.View):
 
 
 class _TradeAnswerButton(discord.ui.Button):
-    """One of the three answers on an incoming swap DM (§9 step 2)."""
+    """One of the three answers on an incoming swap DM."""
 
     def __init__(
         self,
@@ -1103,11 +886,9 @@ class _TradeAnswerButton(discord.ui.Button):
 class TradeRequestView(discord.ui.View):
     """The anonymous request DM's three answers.
 
-    Nothing per-request lives in these ``custom_id``s — a per-request id cannot
-    be a persistent view, so the buttons would die at the next restart. Which
-    request a tap answers is resolved from the recipient and the DM's own
-    timestamp (:func:`trade.match_request`), which is why only one ask may ever
-    be waiting on one person.
+    ``custom_id``s carry nothing per-request — resolved instead from the
+    recipient and the DM's timestamp (:func:`trade.match_request`), so only
+    one ask can be pending per person.
     """
 
     def __init__(self, assistant: "LaundryAssistant") -> None:
@@ -1147,24 +928,9 @@ class TradeRequestView(discord.ui.View):
 class AssistantView(discord.ui.View):
     """Persistent view for the ephemeral panel.
 
-    One view class serves everybody — the callbacks read
-    ``interaction.user.id``, so there is nothing per-person baked into a
-    ``custom_id`` (which would be unregisterable, and would leak who a message
-    belongs to).
-
-    ``person`` is the record the panel is being rendered for, used only to
-    label and highlight the buttons. ``None`` builds the neutral registration
-    template handed to ``add_view`` on startup: it must contain **every**
-    ``custom_id``, because one that was never registered doesn't error, it
-    silently stops dispatching — a dead button, and a bug class this
-    integration has already been bitten by.
-
-    Seven components at most, in two rows: the three reminder modes on row 0,
-    and 👁 / 📅 / 🔔 / 🔮 on row 1. Discord allows 5 per row and 25 per message,
-    so row 1 has one slot left before anything has to move — which is the whole
-    reason 🔔 opens a sub-panel instead of putting four toggles and a select
-    here, where they would not fit and would bury the one question this panel
-    exists to ask.
+    One view class for everybody — no ``custom_id`` is per-person (that
+    would leak who a message belongs to). ``person=None`` is the
+    registration template, which must carry every ``custom_id``.
     """
 
     def __init__(
@@ -1178,9 +944,7 @@ class AssistantView(discord.ui.View):
         template = person is None
         mode = person["reminders"] if person else None
         onboarded = bool(person and person["onboarded"])
-        # First-timer wording ("Yes, DM me") vs settings wording ("DM me"):
-        # same buttons, same ids, but the first-time panel is a question and
-        # the settings panel is a status.
+        # Same buttons/ids; wording differs (a first-timer is asked, a returning user told).
         self.add_item(
             _ReminderButton(
                 assistant,
@@ -1211,30 +975,17 @@ class AssistantView(discord.ui.View):
                 active=mode == people_mod.REMIND_OFF,
             )
         )
-        # The monitoring toggle is noise on the first-time panel — that panel
-        # asks one question — but the template still needs its id registered.
+        # Hidden on the first-time panel (asks one question), but the template still needs the id.
         if onboarded or template:
             self.add_item(
                 _MonitorButton(
                     assistant, enabled=person["monitor"] if person else None
                 )
             )
-            # Same reasoning for the grid: a first-timer is being asked how to
-            # be reached, not invited to plan their week. Row 1 keeps it clear
-            # of the three reminder-mode buttons on row 0.
             self.add_item(_WeekButton(assistant))
-            # 🔔 hides on the first-time panel for the same reason again, and
-            # more sharply: it is a panel of four ways to hear *less*, shown to
-            # somebody who has not yet agreed to hear anything. It answers a
-            # question they haven't been asked yet, and the answer they'd give
-            # to "how should I reach you" is the one that decides whether any
-            # of it matters.
+            # 🔔 especially: muting notifications means nothing before they've chosen how to be reached.
             self.add_item(_PanelNotifyButton(assistant))
-        # 🔮 only exists while the house has day-learning on: with the option
-        # off there is no history, so the panel behind it could only ever say
-        # "nothing to show", and a button that can't do anything is worse than
-        # no button. The template still registers its id, so switching the
-        # option on doesn't leave a dead button until the next restart.
+        # 🔮 only shows with day-learning on; the template still registers its id either way.
         if template or (learning and onboarded):
             self.add_item(_GuessButton(assistant))
 
@@ -1242,8 +993,7 @@ class AssistantView(discord.ui.View):
 class LaundryAssistant:
     """Per-person preferences, the private panel and the DM plumbing.
 
-    Owns its own ``Store``; holds a reference to the bot purely to send things.
-    Nothing here reaches back into the coordinator.
+    Owns its own ``Store``; never reaches back into the coordinator.
     """
 
     def __init__(
@@ -1254,87 +1004,35 @@ class LaundryAssistant:
     ) -> None:
         self.hass = hass
         self.bot = bot
-        # The config entry, purely to read the one option this module owns.
-        # Deliberately the *entry* and not the coordinator: the dependency has
-        # to keep running one way (§14 rule 5), and options change by reloading
-        # the entry, which rebuilds this object anyway — so reading them once
-        # here can never go stale.
+        # Reads the entry directly, not the coordinator, to keep the dependency one-way.
         self._entry = entry
         self._store: Store = Store(
             hass, PLANNER_STORAGE_VERSION, PLANNER_STORAGE_KEY
         )
         self._people: dict[str, dict] = {}
         # Per-ISO-week booking overrides: {"2026-W32": {"3-eve": [ids]}}.
-        # Recurring slots live on the person; this is "what actually happens
-        # this week", which is the only thing a tap on the grid can mean.
         self._overrides: dict[str, dict[str, list[str]]] = {}
-        # Which day each person's open grid is pointed at. Deliberately memory
-        # only: it's view state, not a preference, and losing it on a restart
-        # just means the grid reopens on today — which is where it should start
-        # anyway. Keyed by the string form of the id, like everything else here.
-        self._grid_day: dict[str, int] = {}
-        # Which cell each person's open grid last tapped that somebody *else*
-        # holds, and what they've picked to offer for it. Memory only, like
-        # ``_grid_day`` and for the same reason: it is view state, not a
-        # preference, and losing it on a restart costs one tap. Nothing here is
-        # a request — a request only exists once ``async_send_trade`` writes
-        # one.
+        self._grid_day: dict[str, int] = {}  # which day each grid shows; memory only
+        # Which of someone else's cells was tapped to ask about, and the offer. Memory only.
         self._ask_cell: dict[str, str] = {}
         self._ask_offer: dict[str, str] = {}
-        # Which cell each person's open grid last tapped, whoever holds it.
-        # ``_ask_cell`` above is *not* this: it holds a cell only when the tap
-        # landed on somebody else's, because 🔁 has nothing to offer otherwise.
-        # ♻ needs the opposite case — a cell of your own — so it needs its own
-        # note. View state, memory only, like the two above.
+        # Last cell tapped, whoever holds it (unlike ``_ask_cell``, someone else's only).
         self._last_cell: dict[str, str] = {}
-        # Which cell each person's last reminder DM was about, **and which
-        # message that was**: ``{"123": {"cell": "3-eve", "message": "140…"}}``.
-        # See :meth:`async_note_nudge_cell`. Persisted, unlike the three view
-        # notes above, because a tap on a DM has to keep meaning what the DM
-        # said across a restart — and one entry per person, overwritten, so it
-        # is bounded by the same thing ``_people`` is.
+        # Which cell (and message id) each person's last reminder DM was about. Persisted.
         self._nudge_cell: dict[str, dict] = {}
-        # The live load's window, pushed by the coordinator (never pulled: the
-        # dependency runs one way, §14 rule 5). Two floats, memory only, and
-        # deliberately *not* the cells themselves — those are worked out on
-        # each render by :meth:`_running_cells`, so ``*`` cannot outlive the
-        # load that justified it. A restart mid-load loses them, and the grid
-        # simply stops claiming the washer is busy, which is the safe way round.
+        # The live load's window, pushed by the coordinator; memory only.
         self._running_from: float | None = None
         self._running_until: float | None = None
-        # The habit model's two stores (design doc §12), both lists of rows
-        # carrying an id and a timestamp and nowhere to put a name. They live
-        # in *this* Store alongside people and overrides — one planner store,
-        # separate from the session, exactly as §12 draws it.
+        # The habit model's two stores: rows with an id and a timestamp, never a name.
         self._history: list[dict] = []
         self._corrections: list[dict] = []
-        # The nudge budget (P2), per person: {"<id>": {"last_nudge_ts", ...}}.
-        # §12 puts ``last_nudge_ts`` / ``nudges_this_week`` on the person; they
-        # live in their own mapping here because they are *accounting*, not a
-        # preference — nothing in the panel reads or writes them, and keeping
-        # them apart means a nudge can never be one merge away from rewriting
-        # somebody's settings. On disk they are in the planner Store like
-        # everything else, which is what makes a restart not refill anybody's
-        # allowance: the counters are loaded, not reset.
-        self._budgets: dict[str, dict] = {}
-        # The trade broker's requests (design doc §9 / §12). In the planner
-        # Store like everything else — a request is a fact about the week, and
-        # a week is what this store is for. Bounded by the rules that write it
-        # and pruned to the current week on load and on every write; expiry is
-        # arithmetic at read time, so nothing has to run on a tick to age one
-        # out and nothing is written to make an old request stop working.
-        self._trades: list[dict] = []
+        self._budgets: dict[str, dict] = {}  # per-person nudge budget, kept apart from prefs
+        self._trades: list[dict] = []  # trade broker requests, pruned to the current week
 
     # ------------------------------------------------------------------ config
     @property
     def trades_enabled(self) -> bool:
-        """Whether one housemate may ask another for a slot at all (§9).
-
-        Off by default (§14 rule 7), and off means **inert**: no 🔁 button is
-        rendered, ``async_open_ask`` refuses, and no request can be written — so
-        a house that never turns it on never produces a byte of trade state or a
-        single DM.
-        """
+        """Whether one housemate may ask another for a slot at all. Off by default."""
         if self._entry is None:
             return DEFAULT_TRADES
         merged = {**self._entry.data, **self._entry.options}
@@ -1344,9 +1042,7 @@ class LaundryAssistant:
     def learn_habits(self) -> bool:
         """Whether the house has day-learning switched on at all.
 
-        The outer of the two gates on every history write and every ``?``; the
-        inner one is the person's own 👁 Monitoring consent. Off by default
-        (§14 rule 7), and off means nothing is written *and* nothing is drawn.
+        Outer gate on every history write and guess; inner gate is Monitoring.
         """
         if self._entry is None:
             return DEFAULT_LEARN_HABITS
@@ -1362,43 +1058,26 @@ class LaundryAssistant:
             _LOGGER.exception("Failed to load assistant prefs; starting empty")
             data = None
         source = data.get("people") if isinstance(data, dict) else None
-        # Normalise once, here, so every later read works on a known shape —
-        # including the string-keyed mapping JSON always hands back.
+        # Normalise once, here, so every later read works on a known shape.
         self._people = people_mod.normalise_people(source)
-        # .get with a default: a store written by v0.17.0 has no overrides at
-        # all, and an upgrade must not be the thing that breaks the panel.
+        # .get with a default: older stores have no overrides key; an upgrade must not break.
         raw = data.get("overrides") if isinstance(data, dict) else None
         self._overrides = plan_mod.prune_overrides(
             plan_mod.normalise_overrides(raw), self._current_week()
         )
-        # History and corrections are normalised and aged **in memory** on the
-        # way in, and not written back: a load that changes nothing must not
-        # cost a store write, and startup is the definition of "nothing
-        # changed". The retention that matters is applied on the write path
-        # (habit.record_load / record_correction both prune), so the file on
-        # disk is bounded by the act of adding to it.
+        # Aged in memory only; retention is enforced on the write path instead.
         now = self._now()
         raw_history = data.get("history") if isinstance(data, dict) else None
         self._history = habit_mod.prune_history(raw_history, now)
         raw_corrections = data.get("corrections") if isinstance(data, dict) else None
         self._corrections = habit_mod.prune_corrections(raw_corrections, now)
-        # Normalised, never cleared: a restart that handed everybody a fresh
-        # allowance would turn "1 DM a day" into "1 DM per restart", and the
-        # windows the counters belong to are stored alongside them so the reset
-        # is a comparison rather than something anybody has to remember to do.
+        # Never cleared: a restart resetting these would turn "1 DM a day" into "1/restart".
         raw_budgets = data.get("budgets") if isinstance(data, dict) else None
         self._budgets = habit_mod.normalise_budgets(raw_budgets)
-        # Pruned in memory on the way in, like history and corrections, and not
-        # written back: startup is the definition of "nothing changed". A
-        # request from a week that has already happened is dead weight — the
-        # once-a-week rules it gates only ever ask about the week that is
-        # running.
+        # Pruned in memory like history/corrections; a past week's request is dead weight.
         raw_trades = data.get("trades") if isinstance(data, dict) else None
         self._trades = trade_mod.prune_requests(raw_trades, self._current_week())
-        # Which DM was about which cell. Rebuilt field by field like everything
-        # else off disk: a row missing either half cannot answer the one
-        # question it exists for, and a half-answer here books a slot nobody
-        # chose on the whole household's grid.
+        # Which DM was about which cell; a row missing either half is dropped.
         raw_nudges = data.get("nudges") if isinstance(data, dict) else None
         self._nudge_cell = _normalise_nudge_cells(raw_nudges)
 
@@ -1423,9 +1102,8 @@ class LaundryAssistant:
     def _now(self):
         """Local time, per HA's configured timezone.
 
-        The grid is the only part of this integration that cares what day it
-        is, and it has to agree with the household's wall clock rather than
-        UTC — a Sunday-evening booking made at 23:00 local is not Monday.
+        Must agree with the household's wall clock, not UTC — a Sunday
+        23:00 local booking is not Monday.
         """
         return dt_util.now()
 
@@ -1441,10 +1119,8 @@ class LaundryAssistant:
     def note_running(self, started_ts, eta_ts) -> None:
         """The coordinator telling us a load's window, or that there isn't one.
 
-        Pushed rather than pulled — the assistant must not reach back into the
-        coordinator (§14 rule 5), so that the planner keeps working if the
-        detection side is having a bad day. Two floats and no store write, so
-        this is free to call on every tick that moves the ETA.
+        Pushed rather than pulled, so the planner keeps working if detection
+        is having a bad day.
         """
         self._running_from = started_ts if isinstance(started_ts, (int, float)) else None
         self._running_until = eta_ts if isinstance(eta_ts, (int, float)) else None
@@ -1452,12 +1128,8 @@ class LaundryAssistant:
     def _running_cells(self) -> list[str]:
         """The cells the washer is mid-load in, worked out fresh right now.
 
-        Derived on every render and stored nowhere. ``*`` is the one glyph that
-        claims something about *this moment*, so anything that could let it
-        outlive its load — a cached list, a value in the Store — would make it a
-        claim nobody can check. Recomputing is cheap and self-correcting: the
-        moment the coordinator clears the window, the next render has no ``*``
-        in it.
+        Never cached or stored: ``*`` claims something about this moment, and
+        caching it would let that claim outlive the load.
         """
         if self._running_from is None:
             return []
@@ -1474,31 +1146,10 @@ class LaundryAssistant:
 
     # ------------------------------------------------------------- the model
     async def async_note_claim(self, user_id) -> None:
-        """One real load happened, and this person claimed it (design doc §7.1).
+        """One real load happened, and this person claimed it.
 
-        The coordinator calls exactly this on a Claim tap and knows nothing
-        else about the model — not what a prediction is, not that history
-        exists. Everything that makes the tap safe to record lives here:
-
-        * **Two consent gates.** The house's ``learn_habits`` option, and then
-          this person's own 👁 Monitoring preference, passed to
-          :func:`habit.record_load` as ``monitor`` so the refusal happens at
-          the write itself. Monitoring off means *no row is written at all*
-          (§11) — not a row that later gets filtered out, because the one
-          mistake here that can't be undone by a later fix is having stored it.
-        * **A store write only when something changed.** ``record_load`` dedupes
-          within the hour, so Claim → Unclaim → Reclaim is one load and the
-          second tap returns the list unchanged; comparing before saving is
-          what keeps that from costing a disk write anyway. The same comparison
-          covers the monitoring-off case, which returns the pruned list and
-          therefore usually writes nothing at all.
-        * **Retention on the write path.** ``record_load`` prunes to 90 days and
-          caps the row count in the same call, so history is bounded by the act
-          of adding to it and never needs a sweeper.
-
-        Never raises. It is called from inside the Claim callback, and a
-        failure to log a load must not turn a successful claim into
-        "interaction failed".
+        Gated by ``learn_habits`` and Monitoring: off means no row is
+        written, not one filtered out later. Never raises.
         """
         try:
             if not self.learn_habits:
@@ -1511,9 +1162,6 @@ class LaundryAssistant:
                 return
             self._history = updated
             await self._async_save()
-            # A decision actually taken (a row exists now that didn't before),
-            # not a per-evaluation trace: the dedupe and consent paths above
-            # return before reaching this.
             _LOGGER.debug("Logged a load for %s", user_id)
         except Exception:  # noqa: BLE001 - never raise into a card callback
             _LOGGER.exception("Failed to log a load for the habit model")
@@ -1521,25 +1169,8 @@ class LaundryAssistant:
     async def async_forget_load(self, user_id, since_ts, until_ts) -> None:
         """That load was stopped on the machine, so it was never a wash.
 
-        The coordinator calls this from the cancel path and, as with
-        :meth:`async_note_claim`, knows nothing else about the model. A claim
-        made *during* the wash has already written its row by then, so "a
-        cancelled load must not feed the habit model" cannot be a rule anybody
-        remembers to apply at read time — it is this call, inside the same
-        transition that ended the load, plus the coordinator refusing to log a
-        claim tapped on a card it has already marked stopped. Between them there
-        is no path by which a stopped cycle becomes evidence.
-
-        ``since_ts``/``until_ts`` bound the retraction to that load's own
-        session (see :func:`habit.forget_load`), so an earlier real wash of
-        theirs cannot be caught by it.
-
-        No consent gate here, deliberately: this only ever *removes*. Running it
-        with day-learning off simply finds nothing, and the comparison below
-        means finding nothing costs no store write.
-
-        Never raises — it runs inside the completion transition, and failing to
-        un-log a load must not leave the card unfinished.
+        Removes the row :meth:`async_note_claim` wrote, bounded to this
+        load's own session by ``since_ts``/``until_ts``. Never raises.
         """
         try:
             updated = habit_mod.forget_load(self._history, user_id, since_ts, until_ts)
@@ -1547,8 +1178,6 @@ class LaundryAssistant:
                 return
             self._history = updated
             await self._async_save()
-            # A decision actually taken (a row that existed is gone), not a
-            # per-evaluation trace: the no-match path returns above.
             _LOGGER.debug("Dropped a stopped load from history for %s", user_id)
         except Exception:  # noqa: BLE001 - never raise into the session machine
             _LOGGER.exception("Failed to drop a stopped load from the habit model")
@@ -1556,12 +1185,8 @@ class LaundryAssistant:
     def _predicts_for(self, user_id) -> bool:
         """Whether this person's guesses may be computed or shown at all.
 
-        Both gates again, plus the person's ``predict`` preference. Monitoring
-        is included on the *read* side deliberately: turning it off stops new
-        rows, but rows already stored would otherwise keep producing ``?`` for
-        somebody who just said stop watching me. Nothing is deleted — a toggle
-        somebody flips to see what it does must not destroy three months of
-        history — it simply stops being read.
+        Monitoring gates reads too, not just writes: turning it off must stop
+        new ``?`` guesses immediately, without deleting stored history.
         """
         if not self.learn_habits:
             return False
@@ -1569,7 +1194,7 @@ class LaundryAssistant:
         return bool(person["predict"] and person["monitor"])
 
     def _prediction(self, user_id) -> dict | None:
-        """This viewer's own top prediction, or None — usually None (P6)."""
+        """This viewer's own top prediction, or None — usually None."""
         if not self._predicts_for(user_id):
             return None
         return habit_mod.predict(
@@ -1577,33 +1202,16 @@ class LaundryAssistant:
         )
 
     def _predicted_cells(self, user_id) -> list[str]:
-        """The cells to draw as ``?`` — **only ever the viewer's own** (§11).
+        """The cells to draw as ``?`` — only ever the viewer's own.
 
-        Every read in :mod:`habit` is scoped to one id, and the only id this is
-        ever called with is ``interaction.user.id``: the person looking at the
-        message. A prediction is a claim about one person's habits, and it is
-        never rendered into anything more than one person can see.
-
-        Deliberately the **top** guess alone, not every cell that clears the
-        gate. :func:`habit.predictions` can return up to three (4/3/3 of ten
-        loads all pass at 30%), but the 🔮 panel names exactly one and ❌ Wrong
-        retires exactly that one. Drawing the other two would put a ``?`` on
-        the grid that the only button for arguing with it cannot even mention,
-        let alone remove — and tapping Wrong about the Monday ``?`` would
-        silently discard the Thursday guess instead. P4 says the guesses are
-        visible *and correctable*; until the panel grows the doc's "📅 Wrong —
-        pick" step (§7.3), what is rendered is held to what can be corrected.
+        Only the top guess: the panel's Wrong button can only retire one,
+        so showing more would put a ``?`` on the grid nothing can address.
         """
         prediction = self._prediction(user_id)
         return [prediction["cell"]] if prediction else []
 
     # ------------------------------------------------ the reminder loop's window
-    # :mod:`reminders` owns *when* somebody is contacted; this store owns
-    # everything it needs to decide and everything a reply changes. The split is
-    # the same one the coordinator already gets: it asks for a delivery or a
-    # record, and never touches the Store itself. Every writer below saves only
-    # when the value actually changed — a trigger that decides "no" must not
-    # cost a disk write, and with nobody opted in that is every trigger.
+    # reminders owns *when*; every writer below saves only when a value changes.
 
     def now(self):
         """The clock the whole planner shares. See :meth:`_now`."""
@@ -1616,71 +1224,46 @@ class LaundryAssistant:
 
     @property
     def budgets(self) -> dict[str, dict]:
-        """The nudge accounting (P2), for the claim. A copy, not the store."""
+        """The nudge accounting, for the claim. A copy, not the store."""
         return dict(self._budgets)
 
     def prediction_for(self, user_id) -> dict | None:
-        """This person's own top guess, or None — the same one 🔮 shows.
-
-        Deliberately :meth:`_prediction`, so the house's ``learn_habits`` option
-        and the person's own 👁 / 🔮 toggles gate the DM exactly as they gate the
-        panel. A reminder can never be sent about a guess the person cannot see.
-        """
+        """This person's own top guess, or None — gated exactly like the 🔮 panel."""
         return self._prediction(user_id)
 
     def load_times(self, user_id) -> list[float]:
-        """When this person's own retained loads happened, as timestamps.
-
-        Only theirs — like every read in :mod:`habit` — and only so the reminder
-        loop can tell that somebody has already done the laundry it is about to
-        suggest. Timestamps rather than rows, because that is the entire
-        question and a row has a slot in it that nothing here needs.
-        """
+        """When this person's own retained loads happened, as timestamps."""
         return [
             row["ts"]
             for row in habit_mod.history_for(self._history, user_id, self._now())
         ]
 
     def typical_gap(self, user_id) -> float | None:
-        """How many days this person usually leaves between loads, or None.
-
-        Gated the same way :meth:`prediction_for` is, and for the same reason:
-        it is arithmetic about somebody's own history, so 👁 Monitoring off must
-        stop it being *read* as well as written. Otherwise turning monitoring
-        off would keep producing timing claims from rows already stored, which
-        is precisely what somebody was switching off.
-        """
+        """How many days this person usually leaves between loads, or None."""
         if not self._predicts_for(user_id):
             return None
         return habit_mod.typical_gap(self._history, user_id, self._now())
 
     def is_due(self, user_id) -> bool:
-        """Whether this person is past **their own** usual gap between washes.
+        """Whether this person is past their own usual gap between washes.
 
-        The gate on the opportunity nudge. False whenever the cadence is not
-        known yet, which is the common early answer and the quiet one.
+        Gates the opportunity nudge. False when the cadence isn't known yet.
         """
         if not self._predicts_for(user_id):
             return False
         return habit_mod.is_due(self._history, user_id, self._now())
 
     def occupancy(self) -> dict:
-        """This week's reconciled occupancy — what the grid draws from.
-
-        The reminder loop needs it to answer "has somebody else booked the slot
-        this person usually uses", which is the fact that makes an opportunity
-        nudge worth sending rather than a guess about their laundry.
-        """
+        """This week's reconciled occupancy — what the grid draws from."""
         return plan_mod.effective_week(
             self._people, self._overrides, self._current_week()
         )
 
     def booked_cells(self, user_id, week=None) -> list[str]:
-        """The cells this person has actually booked in a week (§6.4).
+        """The cells this person has actually booked in a week.
 
-        Defaults to the week that is running, which is what every reader wants;
-        ``week`` exists for the one writer that does not — ⏭ Push to tomorrow
-        on a Sunday, where "tomorrow" is the *next* ISO week.
+        ``week`` defaults to the current one; overridable because Push to
+        tomorrow on a Sunday lands in the next ISO week.
         """
         target = week if isinstance(week, str) and week else self._current_week()
         occupancy = plan_mod.effective_week(self._people, self._overrides, target)
@@ -1693,9 +1276,8 @@ class LaundryAssistant:
     async def async_store_budgets(self, budgets) -> None:
         """Persist the accounting a claim came back with.
 
-        Called **before** the DM goes out, never after: a send that raises
-        ``Forbidden`` has still spent the nudge, and refunding it would mean
-        retrying somebody with closed DMs at every trigger forever.
+        Called before the DM goes out, never after: a Forbidden send has
+        still spent the nudge, and refunding it would retry forever.
         """
         updated = habit_mod.normalise_budgets(budgets)
         if updated == self._budgets:
@@ -1704,13 +1286,7 @@ class LaundryAssistant:
         await self._async_save()
 
     async def async_set_predict(self, user_id, enabled: bool) -> None:
-        """🔕 Stop asking — the permanent opt-out from the reminder DMs.
-
-        The same ``predict`` preference the 🔮 panel's own button flips, on
-        purpose: one switch, one meaning, and the panel is the way back (P7 —
-        additive *and* reversible). Nothing re-prompts somebody who has turned
-        it off, because :func:`nudge.eligible` refuses them outright.
-        """
+        """🔕 Stop asking — flips the same ``predict`` preference the 🔮 panel shows."""
         if people_mod.get_person(self._people, user_id)["predict"] == bool(enabled):
             return
         self._people = people_mod.set_person(
@@ -1727,18 +1303,10 @@ class LaundryAssistant:
         await self._async_save()
 
     async def async_book_cell(self, user_id, cell, week=None) -> bool:
-        """👍 On it — mark the slot taken on the anonymous board (§10.3).
+        """👍 On it — mark the slot taken on the anonymous board.
 
-        Idempotent, unlike :meth:`async_toggle_cell`: a second tap on a nudge
-        must not *un*book the slot the first tap booked. The board still shows
-        only that a cell is taken, never by whom (P5).
-
-        ``week`` defaults to the week that is running. It has to be overridable
-        because a cell key carries a weekday and no date: ⏭ Push to tomorrow on
-        a **Sunday** lands on Monday, and Monday belongs to the *next* ISO week.
-        Booking it under the current one writes the Monday that is six days
-        past — a booking nobody made, on a day nobody can use, which the day-of
-        trigger then never finds.
+        Idempotent, unlike :meth:`async_toggle_cell`. Shows only that a cell
+        is taken, never by whom. ``week`` overridable, see :meth:`booked_cells`.
         """
         key = plan_mod.normalise_cell(cell)
         target = week if isinstance(week, str) and week else self._current_week()
@@ -1755,23 +1323,8 @@ class LaundryAssistant:
     async def async_free_cell(self, user_id, cell, week=None) -> bool:
         """🆓 Free it up — give a booked slot back to the house.
 
-        The mirror of :meth:`async_book_cell` and idempotent in the same way: a
-        second tap must not re-book what the first released. Returns False when
-        there was nothing of theirs to release, so the reply can say so rather
-        than claiming to have freed a slot that was never taken.
-
-        It removes **only this person** from the cell. Two people can hold one
-        slot (§8), and releasing yours has no business evicting somebody else
-        from a booking you never made.
-
-        Whether the standing slot should go too is deliberately *not* asked
-        here. This button answers "not this week"; ♻ on the grid is where "not
-        every week" lives, and conflating them would turn one tap on one
-        Thursday into a permanent change nobody asked for. Because
-        :func:`plan.toggle_booking` writes the reconciled holder list into this
-        week's override, a recurring slot released here is released for this
-        week only and returns next week — which is exactly what a standing
-        booking means.
+        Idempotent. Returns False if there was nothing to release, and
+        removes only this person. Doesn't touch the standing (♻) slot.
         """
         key = plan_mod.normalise_cell(cell)
         target = week if isinstance(week, str) and week else self._current_week()
@@ -1786,37 +1339,12 @@ class LaundryAssistant:
         return True
 
     async def async_note_nudge_cell(self, user_id, cell, message_id) -> None:
-        """Record which cell **this DM** was about, keyed by the message id.
+        """Record which cell this DM was about, keyed by the message id.
 
-        The heads-up arrives *before* its slot opens, which breaks the trick the
-        day-of nudge used to identify itself: at 19:00 both PM (16:00-20:00) is
-        running and Eve starts within the hour, so a cell inferred from the
-        message's own timestamp is genuinely ambiguous, and the wrong answer
-        books a slot nobody chose on the whole household's grid.
-
-        The message id is half the record and not decoration. A per-person note
-        with no message on it answered for *whichever DM was tapped*, so an
-        unanswered heads-up from Monday — still live, because
-        :class:`reminders.NudgeView` is persistent and its buttons never expire
-        — dispatched Tuesday's cell when somebody scrolled back and tapped it.
-        The day cap is one DM per person per day, so heads-ups on consecutive
-        days is the ordinary case: 🆓 Free it up released a booking they still
-        wanted, and ⏭ booked a day nobody chose. Tying the record to the message
-        makes an older DM unrecognisable rather than misidentified, which sends
-        it back through :data:`reminders._STALE_TAP`.
-
-        Persisted, for the same reason and the other half of it: the fallback
-        used to be "read the hour the DM was sent", and after v0.26.0 moved the
-        heads-up ahead of its slot that reading is *systematically* one slot
-        early — 19:00 for a 20:00 booking reads as PM. A restart between the
-        send and the tap therefore did not lose the answer, it silently changed
-        it to the wrong one. One store write per reminder DM, of which there is
-        at most one per person per day.
-
-        Written **after** the send, because there is no message id before it.
-        The window that opens is the tail of one HTTP round trip; a tap inside
-        it finds no record and is answered as stale, which is the safe way to
-        be wrong — the old ordering could not be wrong that way, only the other.
+        Keyed by message, not timestamp: the heads-up fires before its slot
+        opens, so an old unanswered one must stay tied to its own message.
+        Written after the send, so a tap in the brief window before is
+        treated as stale — the safe direction to be wrong.
         """
         key = plan_mod.normalise_cell(cell)
         ident = _message_key(message_id)
@@ -1829,13 +1357,10 @@ class LaundryAssistant:
         await self._async_save()
 
     def nudge_cell(self, user_id, message_id) -> str | None:
-        """The cell this **particular** DM was about, or None if unrecognised.
+        """The cell this particular DM was about, or None if unrecognised.
 
-        None covers three cases that all want the same answer: a DM from before
-        this record existed, an older DM whose note has since been overwritten,
-        and a tap that beat the note being written. In every one of them the
-        honest thing is that we cannot say which slot the message meant, and the
-        caller must not act on the grid.
+        None (a stale or overwritten record) means the caller must not act
+        on the grid.
         """
         row = self._nudge_cell.get(str(user_id))
         ident = _message_key(message_id)
@@ -1844,13 +1369,10 @@ class LaundryAssistant:
         return row.get("cell") if row.get("message") == ident else None
 
     async def async_record_push(self, user_id, cell) -> None:
-        """⏭ Push to tomorrow — a correction that is **not** a wrong guess.
+        """⏭ Push to tomorrow — a correction that is not a wrong guess.
 
-        §7.3 is exact about this: the day was right, the person just isn't doing
-        it tonight. Counting it as a miss would train the model out of every
-        correct guess anybody was ever too busy to act on, so it goes through
-        :func:`habit.mark_nudge_pushed` and nowhere near
-        :func:`habit.mark_prediction_wrong`.
+        The day was right; they're just not doing it tonight. Goes through
+        :func:`habit.mark_nudge_pushed`, not ``mark_prediction_wrong``.
         """
         updated = habit_mod.mark_nudge_pushed(
             self._corrections, user_id, cell, self._now()
@@ -1866,17 +1388,10 @@ class LaundryAssistant:
     ) -> "discord.Message | None":
         """DM one person. Returns the sent message, or None if it didn't go out.
 
-        ``discord.Forbidden`` (50007) means their privacy settings refuse DMs
-        from server members. That is a *user setting*, not a bug, so it logs at
-        debug — the caller falls back to the channel and the panel explains it
-        to the one person who can fix it.
-
-        The message rather than a bare ``True`` because a reminder DM has to be
-        identifiable later: its buttons are persistent and outlive both the slot
-        and the process, so the record of what it was about is keyed by its id
-        (:meth:`async_note_nudge_cell`). Every existing caller only asks whether
-        something was delivered, and a message object answers that question the
-        same way ``True`` did.
+        ``discord.Forbidden`` means DMs from members are off for them — a
+        user setting, not a bug, logged at debug. Returns the message, not
+        ``True``, so a reminder DM stays identifiable by its id later
+        (:meth:`async_note_nudge_cell`).
         """
         if user_id is None:
             return None
@@ -1892,8 +1407,7 @@ class LaundryAssistant:
         except Exception:  # noqa: BLE001 - never raise into HA
             _LOGGER.exception("Failed to DM %s", user_id)
             return None
-        # Only write on a change: the completion ping runs once per load, and a
-        # store write per load for no new information is pure churn.
+        # Only write on a change: a store write per load for no new info is pure churn.
         if people_mod.get_person(self._people, user_id)["dm_ok"] is not True:
             self._people = people_mod.mark_dm_ok(self._people, user_id)
             await self._async_save()
@@ -1904,25 +1418,10 @@ class LaundryAssistant:
     ) -> bool:
         """Deliver one personal message the way this person asked for it.
 
-        The default is the **channel**, so anybody who has never opened the
-        panel gets exactly what they got before this feature existed. Returns
-        True if something was delivered.
-
-        - **dm** — DM them; on any failure fall through to the channel, because
-          a handoff that nobody hears is worse than a line in the channel.
-        - **channel** — today's behaviour: a real @mention, which is the only
-          thing that makes a phone buzz (an embed edit never does).
-        - **off** — post the same line push-silently with mentions suppressed.
-          They are still *named*, so the information isn't lost; only the push
-          is. Same trade the 🌙 Quiet button already makes on the card.
-
-        A ``None`` user id still goes to the channel. ``queue.py`` explicitly
-        contemplates an entry whose id failed to persist (``{"id": None}``),
-        and by the time we're called ``select_handoff`` has already popped that
-        entry off the line — so returning early here would consume a handoff
-        and post nothing at all. An ugly ``<@None>`` line is what the bot did
-        before this module existed, and it at least tells the house the washer
-        is free.
+        Defaults to the channel; returns True if delivered. dm falls back on
+        failure; off suppresses mentions rather than dropping the message.
+        A ``None`` user id still goes to the channel, since ``select_handoff``
+        already popped that entry.
         """
         mode = (
             people_mod.REMIND_CHANNEL
@@ -1947,15 +1446,12 @@ class LaundryAssistant:
     async def async_open_panel(self, interaction: discord.Interaction) -> None:
         """Answer a 🤖 tap with this person's own private panel.
 
-        Deliberately works on any card, live load or not: it is the onboarding
-        surface, and somebody scrolling up through the channel is exactly the
-        person who most needs to know what the buttons do.
+        Works on any card, live load or not — it's the onboarding surface.
         """
         user_id = interaction.user.id
         name = interaction.user.display_name
         notice = people_mod.get_person(self._people, user_id)["dm_notice_pending"]
-        # Refresh the last-seen display name, but only for somebody who already
-        # has a record — merely looking at the panel shouldn't enrol a guest.
+        # Refresh the name only for an existing record — looking shouldn't enrol a guest.
         if people_mod.is_known(self._people, user_id) and (
             people_mod.get_person(self._people, user_id)["name"] != name
         ):
@@ -2001,13 +1497,8 @@ class LaundryAssistant:
     ) -> None:
         """🔔 button: flip one kind of unprompted message, then re-render.
 
-        The current value is read at tap time rather than carried on the button
-        from the render, for the reason :meth:`async_reject_guess` re-reads its
-        cell: a panel opened before a restart is still tapped after one, and
-        *toggle* has to mean the state as it is now rather than the state this
-        process last drew. Getting that wrong on a switch is worse than on a
-        correction — the tap would set the value the button already showed, so
-        nothing would appear to happen, twice.
+        Reads the current value at tap time rather than trusting the
+        button's render, so "toggle" still works after a restart.
         """
         user_id = interaction.user.id
         person = people_mod.get_person(self._people, user_id)
@@ -2026,15 +1517,8 @@ class LaundryAssistant:
     ) -> None:
         """🔔 select: choose — or with "No quiet hours" clear — the window.
 
-        The only control in this file where choosing the value that is already
-        set is an ordinary gesture: Discord renders the current window as the
-        selected option, so re-picking it is one stray tap away, where every
-        button here flips something by definition. So this is also the only one
-        that checks before writing, which is the panel's standing rule (a store
-        write only when something actually changed) applied where it can finally
-        bite. Comparing the rebuilt mapping is exact rather than approximate —
-        every record in it has been through ``normalise_person``, so equal
-        content compares equal and a re-pick costs nothing at all.
+        Checks before writing, unlike the buttons: Discord pre-selects the
+        current value, so re-picking it is an easy accidental tap.
         """
         user_id = interaction.user.id
         start, end = _parse_quiet(value)
@@ -2068,13 +1552,7 @@ class LaundryAssistant:
         await self._async_render_guess(interaction)
 
     async def async_confirm_guess(self, interaction: discord.Interaction) -> None:
-        """"That's right" — acknowledged, and nothing is stored.
-
-        See :class:`_GuessRightButton`: confirming a guess is not one of the two
-        training signals §7.3 allows, and the loads behind it are already
-        counted. So this costs no store write and the panel says as much,
-        rather than implying the model was rewarded.
-        """
+        """"That's right" — acknowledged, and nothing is stored (see :class:`_GuessRightButton`)."""
         await self._async_render_guess(
             interaction,
             note="👍 Good — nothing to change, and nothing stored: the loads "
@@ -2084,11 +1562,8 @@ class LaundryAssistant:
     async def async_reject_guess(self, interaction: discord.Interaction) -> None:
         """"Wrong" — retire the guess for this cell (``mark_prediction_wrong``).
 
-        The cell is re-read at tap time rather than remembered from the render.
-        It is the same answer in every realistic case (nothing can change it
-        but a fresh claim), it survives a restart between opening the panel and
-        tapping, and "wrong" then always means the guess currently on screen
-        rather than one this process happens to still remember.
+        Re-reads the cell at tap time rather than trusting the render, so it
+        survives a restart between opening the panel and tapping.
         """
         user_id = interaction.user.id
         prediction = self._prediction(user_id)
@@ -2142,11 +1617,8 @@ class LaundryAssistant:
     async def async_open_grid(self, interaction: discord.Interaction) -> None:
         """Answer 📅 with this person's own view of the week.
 
-        Always opens on today, because the overwhelmingly common reason to look
-        is "can I wash tonight". Deliberately an assignment rather than a
-        ``setdefault``: remembering the last day somebody happened to be
-        looking at makes 📅 open somewhere different depending on history they
-        can't see, and "it opens on today" is a promise worth keeping.
+        Always opens on today (an assignment, not ``setdefault``): remembering
+        the last day viewed would make 📅 open somewhere unpredictable.
         """
         user_id = interaction.user.id
         self._grid_day[str(user_id)] = self._today()
@@ -2164,12 +1636,7 @@ class LaundryAssistant:
         if not plan_mod.is_weekday(day):
             day = self._today()
         self._grid_day[str(interaction.user.id)] = day
-        # 🔁 **and ♻** always refer to the cell that was last *tapped*, so
-        # changing day must retire both: a swap button pointing at a Thursday
-        # while the buttons underneath say Monday is the one way this could ask
-        # about a slot somebody didn't mean — and ♻, which writes a standing
-        # weekly slot the whole house then sees as ║, is the same hazard with a
-        # permanent result and no confirmation step.
+        # 🔁/♻ target the last-tapped cell, so changing day must retire both.
         self._forget_tapped_cell(interaction.user.id)
         await self._async_render_grid(interaction, edit=True)
 
@@ -2187,20 +1654,11 @@ class LaundryAssistant:
         self._overrides, _booked = plan_mod.toggle_booking(
             self._people, self._overrides, week, cell, user_id
         )
-        # A tap that lands on somebody else's slot books you in alongside them —
-        # unchanged, and §8 requires it — and *also* arms 🔁. That is the whole
-        # of §9 step 1: the booking is the information, the offer to ask is the
-        # extra option, and neither one is a veto over the other.
+        # Booking a slot someone else holds doesn't block them — it also arms 🔁.
         self._note_ask(user_id, cell, week)
         # ♻ targets this, whoever holds it — see ``_last_cell``.
         self._last_cell[str(user_id)] = cell
-        # Booking a slot enrols them. Not because the grid needs it — a
-        # booking stores the raw id in the override, so it renders as theirs
-        # whether or not a prefs record exists — but because deliberately
-        # planning a wash is an unambiguous "I use this bot", which merely
-        # *looking* at the panel is not (see async_open_panel, which pointedly
-        # doesn't enrol a guest). It gives them a record to hold a display name
-        # and, from Phase 4, reminder settings.
+        # Booking enrols them (unlike opening the panel): an unambiguous "I use this bot".
         if not people_mod.is_known(self._people, user_id):
             self._people = people_mod.set_person(
                 self._people, user_id, name=interaction.user.display_name
@@ -2213,16 +1671,8 @@ class LaundryAssistant:
     ) -> None:
         """♻ — make the last-tapped cell a standing weekly slot, or stop it.
 
-        Writes ``person["slots"]`` and nothing else. This week's override is
-        deliberately left alone: you already hold the cell — that is the only
-        reason ♻ was offered — so booking it again would be a no-op, and
-        *freeing* it would make "every week" mean "every week starting next
-        week", which is not what the button says.
-
-        Demoting is the mirror image and the same restraint applies. Dropping
-        the standing slot leaves this week's booking standing on its own, which
-        is exactly right: "I don't do this every week any more" is not "cancel
-        the one I have on Thursday".
+        Writes ``person["slots"]`` only; this week's override is untouched
+        either way, so demoting leaves this week's booking standing on its own.
         """
         user_id = interaction.user.id
         cell = self._last_cell.get(str(user_id))
@@ -2233,11 +1683,7 @@ class LaundryAssistant:
         person = people_mod.get_person(self._people, user_id)
         slots, standing = plan_mod.toggle_recurring(person.get("slots"), cell)
         self._people = people_mod.set_person(self._people, user_id, slots=slots)
-        # Demoting must leave the cell booked for *this* week, and it would not
-        # be if the standing slot was the only thing putting them on it — the
-        # override for this week may simply not mention the cell. Writing the
-        # reconciled holder list back pins what they can already see, so ♻ never
-        # silently cancels a booking the grid was showing them a second ago.
+        # Write the holder list back so ♻ never silently cancels a cell the override doesn't mention.
         if not standing:
             held = plan_mod.holders(
                 plan_mod.effective_week(self._people, self._overrides, week), cell
@@ -2273,32 +1719,16 @@ class LaundryAssistant:
         self._ask_offer.pop(key, None)
 
     def _forget_tapped_cell(self, user_id) -> None:
-        """Retire **both** buttons that point at a cell rather than name one.
+        """Retire both buttons that point at a cell rather than name one.
 
-        🔁 and ♻ share a hazard and now share a reset. Neither carries the cell
-        it acts on in its label — 🔁 says "Ask to swap", ♻ says "Every week" —
-        so the only thing tying them to a slot is the tap that armed them, and
-        the moment the grid moves to another day or is reopened on today, that
-        tap is about something the panel is no longer showing.
-
-        🔁 has always been retired here; ♻ was not, and it is the worse of the
-        two to leave armed. A swap ask is anonymous, refusable and expires in
-        48 hours. ♻ writes ``person["slots"]`` — a standing weekly commitment
-        drawn as ║ on everybody's grid every week from now on — and in the
-        demote direction one tap, with no cell tap before it in this session at
-        all, silently cancels one.
+        Neither carries its cell in the label, so the arming tap is the only
+        link to a slot, and it goes stale once the grid moves on.
         """
         self._clear_ask(user_id)
         self._last_cell.pop(str(user_id), None)
 
     def _note_ask(self, user_id, cell, week) -> None:
-        """Arm 🔁 if this tap landed on a cell somebody else holds.
-
-        Purely view state — nothing is written, nobody is contacted, and with
-        trades switched off it never arms at all. It is the difference between
-        "that one's spoken for" being a fact on the grid and being an offer to
-        do something about it.
-        """
+        """Arm 🔁 if this tap landed on a cell somebody else holds. View state only."""
         self._clear_ask(user_id)
         if not self.trades_enabled or not week:
             return
@@ -2307,12 +1737,7 @@ class LaundryAssistant:
             self._ask_cell[str(user_id)] = cell
 
     def _offer_cells(self, user_id, want, week) -> list[str]:
-        """The viewer's own cells they could put up in return, ordered.
-
-        Their own bookings for this week, minus the one they're asking for. A
-        list of the viewer's own slots leaks nothing: it is the same set the
-        grid already draws back to them as ``█``.
-        """
+        """The viewer's own cells they could put up in return, ordered."""
         return [
             cell
             for cell in sorted(
@@ -2333,8 +1758,7 @@ class LaundryAssistant:
         ask_cell = self._ask_cell.get(str(user_id))
         expected = self._predicted_cells(user_id)
         running = self._running_cells()
-        # ♻ is offered only for a cell of your own — there is nothing to promote
-        # about somebody else's booking, and nothing at all about a free slot.
+        # ♻ is offered only for a cell of your own, never someone else's or a free one.
         last = self._last_cell.get(str(user_id))
         recur = (
             plan_mod.is_recurring_for_me(occupancy, last, user_id)
@@ -2375,26 +1799,9 @@ class LaundryAssistant:
     ) -> discord.Embed:
         """The week as a monospace block, plus this person's own cells.
 
-        The block is fenced so Discord renders it monospace — without that the
-        columns pull apart into nonsense on a proportional font. Everything
-        decorative (the legend, the slot windows) lives *outside* the fence,
-        because an emoji inside a code block breaks the alignment the whole
-        display depends on.
-
-        ``expected`` is this viewer's own predicted cells and nobody else's.
-        The legend and the explainer both key off whether a ``?`` is *actually
-        on the block* rather than off whether a prediction exists, because those
-        differ: a guess whose cells have all been booked by somebody else loses
-        to those bookings and renders nothing. That answer now comes back from
-        :func:`plan.render_week` alongside the grid. It used to be read out of
-        the rendered string — ``CELL_EXPECTED in grid`` — which was fragile in a
-        way that only looked harmless while the glyph was ``░``: the moment the
-        guess became ``?``, any question mark anywhere in the block would have
-        lit up an explainer for a guess nobody had made.
-
-        ``running`` is the live load, and ``today`` is what turns the block from
-        a shape into a calendar — without the marker, "is that free evening
-        tonight or six days off?" needs counting from a header two lines up.
+        Fenced so Discord renders it monospace; the legend stays outside,
+        since an emoji inside would break the alignment. Whether it explains
+        a ``?`` comes from :func:`plan.render_week`, not string-scanning.
         """
         drawn = plan_mod.render_week(
             occupancy,
@@ -2433,8 +1840,7 @@ class LaundryAssistant:
                 inline=False,
             )
         if drawn.standing:
-            # Only when a ║ is actually on the block, same rule as the guess
-            # below: a note explaining a character nobody can see is noise.
+            # Only when a ║ is actually on the block — explaining an absent glyph is noise.
             embed.add_field(
                 name=(
                     f"{plan_mod.CELL_TAKEN_EVERY_WEEK} Somebody's down for that "
@@ -2467,10 +1873,7 @@ class LaundryAssistant:
             inline=False,
         )
         if ask_cell is not None:
-            # No name and no count, exactly like the grid itself: "spoken for"
-            # is the whole of what anybody learns from this. The slot named here
-            # is the one the viewer just tapped, so it tells them nothing they
-            # did not already do.
+            # No name/count, like the grid — the cell named is one the viewer just tapped.
             embed.add_field(
                 name=f"🔁 {trade_mod.describe_cell(ask_cell)}",
                 value=(
@@ -2486,13 +1889,8 @@ class LaundryAssistant:
         return embed
 
     # ------------------------------------------------------- the trade broker
-    # §9. Everything that *decides* lives in :mod:`trade`; this half delivers
-    # and renders. The one rule to hold on to while reading it: **before an
-    # accept, no string produced here may contain a name or an id.** That is
-    # enforced structurally on the other side — the pre-accept text functions in
-    # :mod:`trade` take cells and nothing else — so the job here is simply never
-    # to add one, and the only two places an identity appears at all are the
-    # two reveal messages after ✅ Trade.
+    # Decisions live in :mod:`trade`; before an accept, nothing built here may
+    # contain a name or an id (the two reveal messages after ✅ Trade excepted).
 
     async def async_open_ask(self, interaction: discord.Interaction) -> None:
         """🔁 — open the "shall I ask?" panel for the cell just tapped."""
@@ -2521,27 +1919,13 @@ class LaundryAssistant:
     async def async_send_trade(self, interaction: discord.Interaction) -> None:
         """The one tap that puts a message on another housemate's phone.
 
-        The order here is deliberate and is the same discipline
-        :mod:`reminders` uses:
+        Order matters:
 
-        1. **Decide and claim in one call** (:func:`trade.claim_request`) — the
-           verdict, the chosen holder, the DM budget and the new row all come
-           back together, so there is no gap in which a check could pass and a
-           send happen anyway.
-        2. **Persist before sending.** A DM that bounces has still been
-           attempted; refunding it would retry somebody with closed DMs at every
-           tap forever.
-        3. **Answer the interaction before the network call.** Discord's ack
-           window is 3 seconds and a DM is a round trip — responding first is
-           what stops a successfully-sent ask from showing the asker
-           "interaction failed".
-        4. **Withdraw what could not be delivered — silently.** An open request
-           nobody ever saw would block that slot and that person for the rest of
-           the week (:func:`trade.withdraw` lapses it without recording a
-           refusal, which would be a lie about the holder). The asker is told
-           nothing extra about it: "the DM bounced" is a fact about the
-           holder, and an outcome only *this* holder-side condition produces is
-           a way to identify them.
+        1. Decide and claim atomically (:func:`trade.claim_request`).
+        2. Persist before sending — a bounced DM was still attempted.
+        3. Answer the interaction before the network call (3s ack window).
+        4. Withdraw silently what couldn't be delivered — a failure would
+           itself identify the holder.
         """
         user_id = interaction.user.id
         key = str(user_id)
@@ -2564,10 +1948,7 @@ class LaundryAssistant:
             mine=self.booked_cells(user_id, week),
         )
         if reason == trade_mod.REASON_SILENT and request is not None:
-            # The holder-side rules said no. The ask is still recorded (already
-            # lapsed) and the asker is told exactly what a delivered ask is
-            # told, because "did a DM go out?" is itself a fact about the
-            # holder — see :func:`trade.claim_request`. Nothing is sent.
+            # Holder-side no, recorded as lapsed; asker is told what a delivered ask is told.
             self._trades = requests
             await self._async_save()
             self._clear_ask(user_id)
@@ -2577,9 +1958,7 @@ class LaundryAssistant:
             _LOGGER.debug("Swap request recorded without a send")
             return
         if reason != trade_mod.REASON_OK or request is None:
-            # One sentence per reason, and every holder-side reason shares the
-            # same one — the asker cannot see who holds the cell and must not be
-            # able to work it out from how the bot says no.
+            # Every holder-side reason shares one sentence, so no reason leaks who holds it.
             await self._async_render_ask(
                 interaction, note=trade_mod.refusal_text(reason)
             )
@@ -2592,28 +1971,10 @@ class LaundryAssistant:
             interaction, edit=True, note=trade_mod.sent_text(want)
         )
         if await self._async_deliver_request(request):
-            # A decision taken, and deliberately with no ids in it: the log is
-            # local, but "who asked whom" is the one fact this feature exists to
-            # keep, and there is no reason for it to be recoverable from a debug
-            # line either.
+            # No ids in the log either — "who asked whom" is the one fact to keep.
             _LOGGER.debug("Swap request sent")
             return
-        # It could not be delivered, so it lapses — and the asker is told
-        # **nothing further**. This used to post the holder-refusal sentence as
-        # a second ephemeral on top of :func:`trade.sent_text`, which no other
-        # holder-side outcome produces: swaps off, quiet hours, blocked, paused,
-        # 💬 channel, budget spent and a known-closed inbox all leave the grid
-        # note standing alone. A requester who saw "Asked..." followed a beat
-        # later by "I can't ask about that one right now" had learned, for that
-        # cell, that its holder's DMs are shut — a per-person setting attached
-        # to a cell they can watch across weeks, which is exactly the fact
-        # :data:`trade.HOLDER_REASONS` exists to render identically.
-        #
-        # The silence is not a white lie either: :func:`trade.withdraw` leaves
-        # the ask spent against this person's week (their one ask for this slot,
-        # and one of their two outstanding), so what they were told — the ask
-        # went out and lapses if nobody answers — describes what actually
-        # happens to them. The debug line is where an operator looks.
+        # Lapses silently: saying more would leak that this holder's DMs are closed.
         self._trades = trade_mod.withdraw(
             self._trades, request["id"], self._now()
         )
@@ -2631,22 +1992,17 @@ class LaundryAssistant:
                     request["to"], text, TradeRequestView(self)
                 ) is not None
         except TimeoutError:
-            # Only the timeout. A CancelledError from outside is HA shutting
-            # down and has to keep travelling.
+            # Only the timeout; a CancelledError means HA is shutting down and must propagate.
             _LOGGER.debug("Swap request not delivered in time")
             return False
 
     def _dm_sent_ts(self, interaction: discord.Interaction, now) -> float | None:
-        """When the tapped DM was sent, expressed on **this box's** clock.
+        """When the tapped DM was sent, expressed on this box's clock.
 
-        Discord stamps a message from its own clock (the snowflake) and a
-        request row is stamped from ours, so comparing the two directly makes
-        every trade in the house depend on the HA host's clock being within
-        :data:`trade.MATCH_WINDOW_SECONDS` of Discord's. An RPi with no RTC that
-        has not re-synced NTP would answer nothing, ever, and say "that one's
-        lapsed" — 🚫 included. So the DM's *age* is measured on Discord's clock
-        alone, from the tap's own timestamp, and :func:`trade.dm_sent_ts` puts
-        it back on ours; any constant offset between the two cancels.
+        Comparing Discord's timestamp directly to ours would make every trade
+        depend on the HA host's clock matching Discord's — an unsynced clock
+        would answer "lapsed" to everything. So age is measured on Discord's
+        clock alone and rebased onto ours (:func:`trade.dm_sent_ts`).
         """
         message = getattr(interaction, "message", None)
         try:
@@ -2665,14 +2021,8 @@ class LaundryAssistant:
     ) -> bool:
         """Record 🚫 on a request that can no longer be answered. Did it stick?
 
-        A block is not an answer to the ask — it is a standing decision about a
-        person, and it has to outlive the 48-hour window (§9: *permanent, per
-        requester-pair*). The lapsed request itself is left exactly as it is: an
-        ask nobody answered must not become a decline, which would shut that
-        slot to the whole house on the strength of a tap that said nothing about
-        it. Nothing is sent to the requester either — they were never going to
-        hear about a request that lapsed, and a block is not something they get
-        told about (:func:`trade.block_ack_text`).
+        A block outlives the 48-hour window: a standing decision, not an
+        answer, so it leaves the lapsed request as-is. Requester never told.
         """
         row = trade_mod.match_any_request(self._trades, holder_id, sent_ts)
         if row is None:
@@ -2692,14 +2042,7 @@ class LaundryAssistant:
     async def async_answer_trade(
         self, interaction: discord.Interaction, action: str
     ) -> None:
-        """✅ Trade / ❌ Pass / 🚫 Don't ask me again, from the request DM.
-
-        Which request this is resolved from the recipient plus **the DM's own
-        timestamp**, never from the ``custom_id`` (a per-request id cannot be a
-        persistent view, so the buttons would die at the next restart). A tap on
-        a DM whose request has lapsed answers nothing at all — the state change
-        and the reply both hang off :func:`trade.answer` returning OK.
-        """
+        """✅ Trade / ❌ Pass / 🚫 Don't ask me again, from the request DM (see :class:`TradeRequestView`)."""
         holder_id = interaction.user.id
         now = self._now()
         sent_ts = self._dm_sent_ts(interaction, now)
@@ -2716,8 +2059,7 @@ class LaundryAssistant:
             return
         self._trades = rows
         if action == trade_mod.ACTION_BLOCK:
-            # Permanent, per pair, and stored on the *holder's* own record so it
-            # outlives every request and every week.
+            # Permanent, per pair, stored on the holder's record so it outlives any one week.
             self._people = people_mod.set_person(
                 self._people,
                 holder_id,
@@ -2735,13 +2077,7 @@ class LaundryAssistant:
         note, reply = self._trade_replies(action, answered, holder_id)
         await self._async_close_dm(interaction, note)
         if reply:
-            # Deliberately **not** budgeted. Every other unprompted DM in this
-            # integration is the bot deciding to talk to somebody; this one is
-            # the answer to a question that person asked, and it is the only way
-            # they ever find out. Charging it could silently swallow the reply
-            # to your own ask, which is both useless and unkind. It cannot be
-            # used to pester either: exactly one arrives per ask, and the number
-            # of asks is capped in several directions.
+            # Not budgeted: answers a question asked, not one the bot initiated.
             await self.async_send_dm(answered["from"], reply)
 
     def _trade_replies(
@@ -2749,12 +2085,8 @@ class LaundryAssistant:
     ) -> tuple[str, str | None]:
         """What each side is told: ``(to the holder, to the asker)``.
 
-        The only place in this module where an identity reaches a string, and
-        only down the accept branch — §9 step 3: an accept reveals both names to
-        both parties, because from that moment they have to coordinate and they
-        live together. ❌ Pass and 🚫 tell the asker exactly the same thing as
-        each other, and it contains no name and no reason (§9 step 4), so a
-        block is indistinguishable from an ordinary no.
+        The only place here where an identity reaches a string (only on
+        accept). Pass and Block tell the asker the same sentence.
         """
         want, offer = answered["want"], answered["offer"]
         if action == trade_mod.ACTION_ACCEPT:
@@ -2802,11 +2134,8 @@ class LaundryAssistant:
     ) -> discord.Embed:
         """The panel that shows exactly what would be sent, before it is sent.
 
-        Quoting the DM back verbatim is the point: the whole feature rests on
-        people believing the ask is anonymous, and the way to believe that is to
-        read the words first. Nothing on this panel names anybody, because
-        nothing on this side *knows* anybody — who holds the cell is resolved at
-        send time and never rendered.
+        Quotes the DM verbatim so people can trust it's anonymous. Names
+        nobody — who holds the cell is resolved at send time.
         """
         embed = discord.Embed(
             title="🔁 Ask to swap",
@@ -2846,10 +2175,8 @@ class LaundryAssistant:
     ) -> None:
         """Answer a swap DM by rewriting it and dropping its buttons.
 
-        Taking the buttons away matters more here than anywhere else: a DM sits
-        in an inbox indefinitely, and a second ✅ tapped a week later must not
-        try to swap anything. Never raises — the state change already happened
-        before we got here, so a failed edit is cosmetic.
+        A DM sits in an inbox indefinitely, so a second tap must not act
+        again. Never raises — the state change already happened.
         """
         try:
             await interaction.response.edit_message(content=note, view=None)
@@ -2867,8 +2194,7 @@ class LaundryAssistant:
     async def _async_rerender(self, interaction: discord.Interaction) -> None:
         """Redraw the panel in place after a setting changed."""
         user_id = interaction.user.id
-        # Taps can arrive on a panel opened before a DM was refused, so the
-        # notice is re-checked here rather than only on open.
+        # Re-checked here, not just on open: a tap can arrive on a panel opened before a DM was refused.
         notice = people_mod.get_person(self._people, user_id)["dm_notice_pending"]
         embed, view = self._build_panel(
             user_id, interaction.user.display_name, notice=notice
@@ -2881,14 +2207,8 @@ class LaundryAssistant:
     ) -> None:
         """Retire the "I couldn't DM you" explainer, but only once they saw it.
 
-        The flag is the *only* record that we owe somebody the §10.5 fix, and
-        it can never be re-armed on its own: once ``dm_ok`` is False,
-        :func:`people.delivery` routes them to the channel, so no further DM is
-        attempted and ``mark_dm_failed`` never fires again. Clearing it before
-        the panel is known to have landed would therefore lose the explainer
-        permanently — and the panel genuinely can fail to land (the 3-second
-        ack window elapsing on a busy event loop, or a token dying mid-flight),
-        which is exactly why :meth:`_async_respond` reports whether it did.
+        Never re-armed once cleared, so clearing it before delivery is
+        confirmed would lose it permanently — and a panel send can fail.
         """
         if not (notice and delivered):
             return
@@ -2905,16 +2225,9 @@ class LaundryAssistant:
     ) -> bool:
         """Show the panel: edit in place if we can, otherwise send a fresh one.
 
-        Returns whether the panel actually reached the user. Callers need that
-        to know when it is safe to retire a one-shot notice — see
-        :meth:`_async_clear_notice`.
-
-        The 15-minute rule lives here. Each tap carries a fresh interaction
-        token, so a panel somebody is actively using keeps editing in place —
-        but a tap on a panel opened long ago can't touch that old message, and
-        Discord rejects the edit. That is a normal, expected outcome, not an
-        error, so it falls through to a brand new ephemeral rather than leaving
-        the user staring at "interaction failed".
+        Returns whether it reached the user (see :meth:`_async_clear_notice`).
+        A stale token can't edit its old message — normal, not an error, so
+        it falls through to a fresh ephemeral rather than "interaction failed".
         """
         if edit:
             try:
@@ -2938,8 +2251,7 @@ class LaundryAssistant:
                     embed=embed, view=view, ephemeral=True
                 )
         except Exception:  # noqa: BLE001
-            # Nothing left to try: the interaction itself is gone (its 3-second
-            # ack window elapsed, or the token expired mid-flight).
+            # Nothing left to try: the interaction itself is gone.
             _LOGGER.debug("Could not deliver the assistant panel", exc_info=True)
             return False
         return True
@@ -2947,19 +2259,10 @@ class LaundryAssistant:
     async def async_followup_dm_notice(
         self, interaction: discord.Interaction
     ) -> None:
-        """Tell somebody their DMs bounced, on **any** button they tap (§10.5).
+        """Tell somebody their DMs bounced, on any button they tap.
 
-        Rule 3 of §10.5 is "the next time they tap any button", not "the next
-        time they open 🤖" — and the difference is the whole point. Somebody
-        who already set up DMs has no reason to ever open the panel again, so
-        hanging the explainer off 🤖 alone means the one person who can fix the
-        setting is the one person who never sees it.
-
-        Sent as a ``followup`` because every card button has already answered
-        its interaction by the time we get here; a followup is a legal second
-        message on that same fresh token and leaves the card's own edit alone.
-        The common case is nothing owed, which costs one dict read and no
-        Discord call at all.
+        Not just on 🤖: someone who already fixed their DMs would never
+        reopen the panel to see it.
         """
         user_id = interaction.user.id
         if not people_mod.get_person(self._people, user_id)["dm_notice_pending"]:
@@ -2967,8 +2270,7 @@ class LaundryAssistant:
         try:
             await interaction.followup.send(_DM_NOTICE.strip(), ephemeral=True)
         except Exception:  # noqa: BLE001 - never raise into a card callback
-            # The tap itself already succeeded; the notice keeps waiting for
-            # the next one rather than being lost here.
+            # The tap already succeeded; the notice just waits for the next one.
             _LOGGER.debug("Could not deliver the DM-failure notice", exc_info=True)
             return
         _, self._people = people_mod.take_pending_dm_notice(self._people, user_id)
@@ -3000,13 +2302,7 @@ class LaundryAssistant:
         )
 
     def _welcome_embed(self, name: str, *, notice: bool) -> discord.Embed:
-        """The 👋 first-time panel — the entire onboarding story, in private.
-
-        Written for somebody who has never seen this channel (a new housemate,
-        a guest): it says what the buttons on the card do before it asks them
-        anything, because "want reminders?" is a meaningless question if you
-        don't yet know what the bot is for.
-        """
+        """The 👋 first-time panel: explains the card's buttons before asking anything, in private."""
         embed = discord.Embed(
             title="👋 First time?",
             description=(
@@ -3033,11 +2329,8 @@ class LaundryAssistant:
     def _settings_embed(self, person: dict, *, notice: bool) -> discord.Embed:
         """The 🤖 settings panel — current prefs, and the controls we honour.
 
-        Every line here describes something that is actually true right now: a
-        panel claiming a setting that nothing reads is how a settings screen
-        stops being believed. So Monitoring reads differently depending on
-        whether the house has day-learning on, and the Guessing line only
-        appears when there is guessing to have an opinion about.
+        Every line must describe something actually true right now — e.g.
+        Guessing only appears when there's guessing to have an opinion about.
         """
         learning = self.learn_habits
         embed = discord.Embed(
@@ -3093,14 +2386,7 @@ class LaundryAssistant:
         return embed
 
     def _notify_summary(self, person: dict) -> str:
-        """The 🔔 settings in one line, for the main panel.
-
-        Names what is **off** rather than what is on, which is the shorter list
-        in every case that matters and the only one worth a glance: four kinds
-        all on is the default and needs no reading, whereas somebody who
-        switched the heads-up off a month ago and is wondering why nothing
-        arrives before their slot needs to see it without opening anything.
-        """
+        """The 🔔 settings in one line: names what's off, not what's on."""
         off = [
             f"{_NOTIFY_KINDS[kind][0]} {_NOTIFY_KINDS[kind][1]}"
             for kind in people_mod.KINDS
@@ -3118,29 +2404,11 @@ class LaundryAssistant:
     def _notify_embed(self, person: dict) -> discord.Embed:
         """The 🔔 panel — everything the bot starts, and the switch for each.
 
-        The second paragraph is what stops this reading as a mute button for the
-        whole integration, and it is the design's line rather than a hedge:
-        these switches govern messages the **bot or a housemate** starts, never
-        a reply to something you did. "Your load is done" answers 🧺 Claim and
-        "the washer's yours" answers 🔜, and both are time-critical — a handoff
-        held until 08:00 tells somebody the washer was free eight hours ago,
-        which is worse than not sending it at all. Those stay under **Pings**,
-        where "how do you want to be reached about your own laundry" lives.
-
-        What this deliberately does **not** say is that anything switched on
-        here will definitely arrive: the house's own reminder option gates all
-        three of the bot's messages, and that rule lives in :mod:`reminders`.
-        Restating it here would be a second copy to keep in step, and a settings
-        screen that contradicts another screen is worse than one that is merely
-        modest. So every line is worded as what the switch *allows*, which is
-        true whatever the house has turned on — and the two facts this module
-        does own, a delivery route that isn't a DM and swaps switched off for
-        the channel, are stated outright, because both make a switch below inert
-        and neither is discoverable from anywhere else.
+        Governs only what the bot/a housemate starts, not a reply to
+        something you did (those stay under Pings). Doesn't claim delivery
+        is guaranteed — the house's reminder option gates all three.
         """
-        # Prepended rather than added as a field, like the §10.5 notice: a
-        # caveat that changes what everything under it means has to be read
-        # first, and Discord renders fields *after* the description.
+        # Prepended, not a field: this caveat must be read first, and fields render after it.
         if person["reminders"] != people_mod.REMIND_DM:
             route = (
                 "⚠️ None of these can reach you at the moment — **Pings** is "
@@ -3174,25 +2442,15 @@ class LaundryAssistant:
             emoji, label, what = _NOTIFY_KINDS[kind]
             state = "on" if people_mod.wants_kind(person, kind) else "off"
             line = f"{emoji} **{label}: {state}** — {what}"
-            # The house switch for swaps is the one that can make a line here
-            # untrue on its own, and unlike the reminder option it is read in
-            # this module already — so saying so costs no second copy of
-            # anybody's rule. Somebody who leaves 🔁 on in a house that has
-            # trades off should not conclude the switch did nothing.
+            # The only house-level switch that can make this line untrue —
+            # already read in this module, so no duplicate rule elsewhere.
             if kind == people_mod.KIND_TRADES and not self.trades_enabled:
                 line += "\n(swaps are off for this channel, so nobody can ask)"
             lines.append(line)
         embed.add_field(name="Messages", value="\n".join(lines), inline=False)
         window = people_mod.quiet_hours(person)
-        # The "no window" line names no clock time, though the obvious sentence
-        # to write is "the earliest I'd reach you is 05:00". That one is only
-        # true at the default lead: ``nudge_lead`` goes up to three hours, which
-        # puts the AM heads-up at 03:00, and 💡 rides the washer coming free at
-        # whatever hour that happens. Naming an hour the house has moved would
-        # be this screen caught lying about the very thing the reader opened it
-        # to decide — worse here than anywhere else, because the answer they
-        # take away is "then I don't need a quiet window". What this module does
-        # own is the slot table, and 06:00 is in it.
+        # Names no clock time: nudge_lead is configurable, so a hardcoded
+        # hour here could go stale.
         opens = plan_mod.SLOT_WINDOWS[plan_mod.SLOT_AM][0]
         embed.add_field(
             name="Quiet hours",
@@ -3215,19 +2473,11 @@ class LaundryAssistant:
     def _guess_embed(
         self, user_id, person: dict, prediction: dict | None, *, note: str | None
     ) -> discord.Embed:
-        """The 🔮 panel — what the model thinks, in the §7.3 wording.
+        """The 🔮 panel — what the model thinks, in plain terms.
 
-        The important case is the one with **no guess**, because for the first
-        month or so that is every case (P6). It says so plainly and shows the
-        arithmetic it is short of, rather than hedging its way into a sentence
-        that sounds like a prediction: "I think you *might* wash Thursdays" is
-        exactly the confident nonsense the gate exists to prevent, and somebody
-        who reads it once stops believing the ones that clear the bar.
-
-        The prose is :func:`habit.describe_prediction` and :func:`habit.explain`
-        rather than anything invented here — one place decides how a bucket is
-        said out loud, so the DM this becomes in the next phase can't drift
-        from the panel.
+        The no-guess case (common for the first month) says so plainly.
+        Wording comes from :func:`habit.describe_prediction`/``explain``,
+        so the panel and any future DM can't drift apart.
         """
         embed = discord.Embed(title="🔮 What I think", color=_COLOR_GUESS)
         if prediction is not None:
@@ -3270,13 +2520,8 @@ class LaundryAssistant:
     def _thin_data_text(self, user_id) -> str:
         """Why there is no guess yet, in this person's own numbers.
 
-        Somebody who taps a button called *Fix a guess* and is told "nothing"
-        deserves to know whether that means *broken* or *give it a fortnight*,
-        and the three gates fail for genuinely different reasons (§7.2). Their
-        own two numbers — loads seen, weeks watched — plus the bar, is enough
-        to tell those apart without the panel pretending to a guess it doesn't
-        have. Both numbers are read scoped to this one id, like every read in
-        :mod:`habit`, so there is nothing here about anybody else.
+        Shows their own numbers against the bar, so "nothing yet" reads as
+        "give it time" rather than "broken".
         """
         now = self._now()
         loads = habit_mod.load_count(self._history, user_id, now)

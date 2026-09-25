@@ -1,26 +1,7 @@
-"""Tests for the session state machine's escape hatches (coordinator.py).
-
-Everything in ``tests/test_detect.py``, ``tests/test_cancel.py`` and
-``tests/test_energy_detector.py`` asks whether the *decisions* are right. This
-file asks the question those cannot reach: when a decision is wrong, or arrives
-late, or arrives against a session that has already moved on, can the machine
-still get out of it? Every case here is one where the answer was no — a stage
-that could never be left, a session with no time-based ending, a backstop that a
-restart threw away, and a lock that could be taken and never released.
-
-``coordinator.py`` imports Home Assistant and ``discord`` for real, so this
-imports the integration package the way Home Assistant does (both libraries are
-installed) rather than stubbing them. What *is* replaced is the small set of HA
-helpers that need a live event loop and a real ``hass`` — ``async_call_later``
-and ``async_track_time_interval`` — because what the tests need to know about
-those is only ever "was a timer armed", which a recorder answers exactly.
-
-The coordinator itself is built with ``__new__`` and given just the state each
-method reads. That is deliberate: ``__init__`` opens a ``Store``, a Discord
-client and an assistant, none of which any of these behaviours depend on, and a
-test that needed them would be testing the wiring instead of the rule.
-
-Runnable with plain ``python3 tests/test_coordinator.py``.
+"""Tests for the coordinator's escape hatches: recovering when a decision is
+wrong, late, or against a session that has already moved on. Imports the
+integration normally rather than stubbing it; only the HA timer helpers are
+swapped for a recorder. Runnable with plain python3.
 """
 
 from __future__ import annotations
@@ -28,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import json
 import logging
 import os
 import sys
@@ -74,14 +56,10 @@ class _NoStates:
 
 
 class _FakeTask:
-    """A task object with the manners the coordinator's set needs.
+    """A task object matching real asyncio.Task's interface.
 
-    ``cancelled()`` and ``exception()`` are *methods*, as they are on a real
-    ``asyncio.Task``. They were an attribute and absent respectively until the
-    done-callback started asking a finished task what it raised — at which
-    point a fake that answered differently from the real thing would have let
-    the log-noise regression pass while the integration still logged a stack
-    trace an hour.
+    cancelled() and exception() are methods, not attributes, since the
+    done-callback calls them that way on a finished task.
     """
 
     def __init__(self, coro) -> None:
@@ -157,13 +135,9 @@ class FakeAssistant:
 
 
 class Timers:
-    """Stands in for ``async_call_later`` / ``async_track_time_interval``.
-
-    Both HA helpers reach for ``hass.loop`` and schedule against a live event
-    loop, and every assertion here is only ever "was a timer armed, and for how
-    long" — so they are swapped for a recorder at import time. One instance,
-    cleared per test, because the module-level names are what the coordinator
-    calls and there is nowhere to hand a per-test object.
+    """Stands in for async_call_later / async_track_time_interval, recording
+    arm calls instead of scheduling on a live loop. One shared instance,
+    cleared per test, since the coordinator calls these as module functions.
     """
 
     def __init__(self) -> None:
@@ -223,8 +197,8 @@ def _coordinator(**state):
     c._selfclean_unsub = None
     c._handoff_unsub = None
     c.__dict__.update(state)
-    # The three things every transition ends with, and none of these tests is
-    # about: a Store write, an HA dispatcher send, and a Discord embed.
+    # Stubbed: a Store write, dispatcher send, and Discord embed - not what
+    # these tests check.
     saves: list = []
 
     async def _save():
@@ -239,20 +213,8 @@ def _coordinator(**state):
 
 # --- the drying edit, arriving after the load has already finished ------------
 def test_the_drying_edit_cannot_resurrect_a_finished_session() -> None:
-    # REGRESSION (v0.22-0.27, critical): _async_job_confirmed feeds the detector
-    # *first* — which can emit EV_FINISHED and queue _async_handle_finished —
-    # and only then queues _async_handle_drying on a stage check that is by then
-    # stale. The two run FIFO, so the drying edit lands last and used to be
-    # refused only for STAGE_IDLE, which let it put a done_waiting session back
-    # into drying.
-    #
-    # That state closed every exit at once: the detector had been reset to idle
-    # so it could not finish again, _session_started_ts was None so the 12-hour
-    # max-session net read False, _last_eta_ts was None so the offline
-    # completion read False, and both start paths return early on "drying" so no
-    # later load posted a card either. Somebody was DMed "your laundry's done"
-    # and then watched the card go back to "🌀 Drying", and only
-    # laundry_discord.reset_session got it out.
+    # A finish and a drying edit can be queued from the same tick; the edit
+    # must be refused unless the stage is still washing.
     TIMERS.armed.clear()
     for stage in (
         const.STAGE_DONE_WAITING,
@@ -264,7 +226,7 @@ def test_the_drying_edit_cannot_resurrect_a_finished_session() -> None:
         assert c.stage == stage, stage
         assert c.bot.calls == [], stage
         assert c.saves == [], stage
-    # ...and the one case it is actually for still works.
+    # The live case still works.
     live = _coordinator(stage=const.STAGE_WASHING, message_id=555)
     _run(live._async_handle_drying())
     assert live.stage == const.STAGE_DRYING
@@ -273,18 +235,10 @@ def test_the_drying_edit_cannot_resurrect_a_finished_session() -> None:
 
 # --- a self-clean nobody can end ---------------------------------------------
 def test_a_self_clean_has_the_same_time_nets_a_load_has() -> None:
-    # REGRESSION: _check_time_completion returned early for any stage but
-    # washing/drying, so a self-clean was covered by neither session_too_long()
-    # nor offline_completion_due(). Its only two endings are the energy detector
-    # and _schedule_selfclean_end, and an outage silences both together — the
-    # detector sees energy=None on every feed, and the end timer is armed by
-    # running->"off" or machine_state->"stop", neither of which is
-    # "unavailable". A cloud drop outlasting the cycle held the session open for
-    # ever, and _on_detector_started returns early on self_clean, so every later
-    # load got no card, no claim button and no completion ping.
+    # _check_time_completion used to cover only washing/drying; a self-clean
+    # has no other way to end once an outage silences the energy detector too.
     TIMERS.armed.clear()
-    # Real wall-clock, because the nets read the real clock: these two are the
-    # only decisions in the integration that are not handed a moment.
+    # These two nets read the real clock rather than an injected moment.
     now = time.time()
     over = now - (const.MAX_SESSION_MINUTES + 60) * 60
     c = _coordinator(stage=const.STAGE_SELF_CLEAN,
@@ -297,8 +251,7 @@ def test_a_self_clean_has_the_same_time_nets_a_load_has() -> None:
     assert c.stage == const.STAGE_IDLE
     assert c.message_id is None and c._session_started_ts is None
 
-    # The offline route too: unavailable long enough, with its last known ETA
-    # well past. Same net, same ending.
+    # Same ending via the offline route: long unavailable, stale ETA.
     offline = _coordinator(stage=const.STAGE_SELF_CLEAN,
         message_id=43,
         _session_started_ts=now - 3600,
@@ -310,8 +263,7 @@ def test_a_self_clean_has_the_same_time_nets_a_load_has() -> None:
     _run(offline.hass.drain())
     assert offline.stage == const.STAGE_IDLE
 
-    # A self-clean that is simply running is left alone, which is the point of
-    # the nets being time-based rather than stage-based.
+    # A running self-clean is left alone.
     fine = _coordinator(stage=const.STAGE_SELF_CLEAN,
         _session_started_ts=now - 600,
     )
@@ -321,13 +273,8 @@ def test_a_self_clean_has_the_same_time_nets_a_load_has() -> None:
 
 # --- the backstop a restart used to drop --------------------------------------
 def test_a_restart_re_arms_the_handoff_backstop() -> None:
-    # REGRESSION: _arm_handoff_timer is called from exactly one place, the
-    # completion that put the session in done_waiting. async_on_bot_ready
-    # restored the ETA timer for an active session and nothing at all for a
-    # finished one, so a restart between "done" and the claimant's ✅ dropped the
-    # 25-minute backstop — and with it the only remaining route to
-    # SIGNAL_WASHER_FREE for that load, so reminders never heard either. Bo, at
-    # the head of the 🔜 line, learned nothing until the *next* load completed.
+    # async_on_bot_ready restored the ETA timer for an active session but
+    # nothing for a finished one, dropping this backstop on restart.
     TIMERS.armed.clear()
     c = _coordinator(stage=const.STAGE_DONE_WAITING,
         message_id=7,
@@ -336,14 +283,12 @@ def test_a_restart_re_arms_the_handoff_backstop() -> None:
         queue=[{"id": "222", "name": "Bo", "ts": 1.0}],
     )
     c._cfg = {const.CONF_HANDOFF_FALLBACK: 25}  # minutes
-    # The detector feed is a separate concern with its own tests, and it wants a
-    # full set of live entities; what is under test here is only the timer.
+    # Detector feed is stubbed; only the timer matters here.
     c._feed_detector = lambda *a, **kw: None
     _run(c.async_on_bot_ready())
     assert [delay for delay, _ in TIMERS.armed] == [25 * 60]
 
-    # Not for a load nobody claimed — that one was handed to the queue at the
-    # moment it finished, so there is nothing left to back up...
+    # No claimant means nothing to back up.
     TIMERS.armed.clear()
     unclaimed = _coordinator(stage=const.STAGE_DONE_WAITING, message_id=7)
     unclaimed._cfg = {const.CONF_HANDOFF_FALLBACK: 25}
@@ -351,8 +296,7 @@ def test_a_restart_re_arms_the_handoff_backstop() -> None:
     _run(unclaimed.async_on_bot_ready())
     assert TIMERS.armed == []
 
-    # ...nor once the claimant has confirmed the drum is clear, which is the
-    # one thing the backstop exists to cover for.
+    # Nor once emptied is confirmed - the backstop's job is done.
     done = _coordinator(stage=const.STAGE_DONE_WAITING,
         message_id=7,
         claimed_by="Alex",
@@ -367,28 +311,17 @@ def test_a_restart_re_arms_the_handoff_backstop() -> None:
 
 # --- a send that could wait for ever ------------------------------------------
 class _NeverReadyClient:
-    """A gateway whose ready event nothing will ever set.
-
-    Exactly what discord.py leaves behind when the gateway task dies: ``login()``
-    creates ``Client._ready`` *before* the HTTP call that can fail, so a bad
-    token or no network at boot leaves an unset Event and no task alive to set
-    it. ``async_run_bot`` has already swallowed the exception and returned.
-    """
+    """A gateway whose ready event nothing will ever set - what discord.py
+    leaves behind when login() fails before the gateway task starts."""
 
     async def wait_until_ready(self) -> None:
-        # Built inside the coroutine: an Event binds to whichever loop first
-        # touches it, and each test here runs its own.
+        # Built here: an Event binds to whichever loop touches it first.
         await asyncio.Event().wait()
 
 
 def test_no_send_can_wait_for_the_gateway_for_ever() -> None:
-    # REGRESSION (critical): every send began with a bare wait_until_ready(),
-    # and the coordinator awaits those *inside* the session lock. One wash at
-    # 09:00 after a 03:00 restart with the router down took the lock, set the
-    # stage to washing, parked in that await and never came back: no card, no
-    # completion, sensor.laundry_stage reading "Washing" indefinitely — and
-    # laundry_discord.reset_session, the documented way out, takes the same lock
-    # and so never ran either. Every health tick queued another blocked task.
+    # Every send awaits wait_until_ready() inside the session lock; a gateway
+    # that never becomes ready must not hang that lock forever.
     bot = bot_mod.DiscordBot.__new__(bot_mod.DiscordBot)
     bot._client = _NeverReadyClient()
     bot._messages = {}
@@ -402,8 +335,7 @@ def test_no_send_can_wait_for_the_gateway_for_ever() -> None:
             lambda: bot.async_dm_user(1, "hi"),
             lambda: bot.async_announce_done("hi"),
         ):
-            # The outer wait_for is the test's own patience, not the code's: it
-            # is what turns "this hangs" into a failure instead of a hung suite.
+            # wait_for here is the test's own timeout, not the code's.
             try:
                 await asyncio.wait_for(send(), timeout=2)
             except TimeoutError:
@@ -417,10 +349,8 @@ def test_no_send_can_wait_for_the_gateway_for_ever() -> None:
 
 
 def test_the_ready_wait_is_bounded_in_one_place_only() -> None:
-    # The bound is only worth anything if every send goes through it, and a send
-    # added later is exactly the change that would forget. Read rather than
-    # called, in the style of tests/test_copy.py: wait_until_ready may appear in
-    # _wait_ready and nowhere else.
+    # Guards against a new send bypassing the bound: wait_until_ready may
+    # appear only inside _wait_ready.
     path = os.path.join(
         HERE, "..", "custom_components", "laundry_discord", "discord_bot.py"
     )
@@ -441,14 +371,8 @@ def test_the_ready_wait_is_bounded_in_one_place_only() -> None:
 
 # --- work that outlives the entry ---------------------------------------------
 def test_shutdown_stops_the_work_that_is_already_running() -> None:
-    # REGRESSION: the coordinator scheduled everything with hass.async_create_task,
-    # which ties a task to nothing, and async_shutdown dropped listeners and
-    # timers and closed the client without cancelling any of it. A handoff ping
-    # scheduled by ✅ Emptied it and parked on a reconnecting gateway then became
-    # unkillable *and* unfinishable, because Client.close() clears the ready
-    # event and drops the loop: it never pinged the head of the 🔜 line, never
-    # refreshed the card, held the old session lock for the life of the process
-    # and made hass.async_block_till_done() never return.
+    # async_shutdown dropped listeners/timers and closed the client without
+    # cancelling scheduled tasks, leaving a parked one unkillable.
     TIMERS.armed.clear()
     c = _coordinator()
 
@@ -457,11 +381,9 @@ def test_shutdown_stops_the_work_that_is_already_running() -> None:
 
         async def _parked():
             started.set()
-            await asyncio.Event().wait()  # a wait nothing will ever satisfy
+            await asyncio.Event().wait()  # never satisfied
 
-        # Real tasks here, not the recorder the other tests use: cancellation is
-        # the whole of what is being asserted, and a task that never started
-        # cannot demonstrate being stopped.
+        # Real tasks, not the recorder: cancellation itself is under test.
         c.hass.async_create_task = asyncio.ensure_future
         c._create_task(_parked())
         assert len(c._tasks) == 1
@@ -471,17 +393,16 @@ def test_shutdown_stops_the_work_that_is_already_running() -> None:
         await c.async_shutdown()
         assert task.done() and task.cancelled()
         assert c._tasks == set()
-        # ...and the client is closed *after* the cancelling, never before: a
-        # close first is what made a parked task unwakeable.
+        # Closed after cancelling, never before - a close first is what made
+        # a parked task unwakeable.
         assert c.bot.closed
 
     _run(_scenario())
 
 
 def test_every_scheduled_task_is_one_shutdown_can_reach() -> None:
-    # The set is only complete if nothing bypasses _create_task, and a callback
-    # added later reaching for hass.async_create_task directly is exactly how it
-    # would stop being complete. One permitted use: _create_task's own body.
+    # Guards against a new callback bypassing _create_task: only _create_task
+    # itself may call async_create_task.
     path = os.path.join(
         HERE, "..", "custom_components", "laundry_discord", "coordinator.py"
     )
@@ -501,18 +422,8 @@ def test_every_scheduled_task_is_one_shutdown_can_reach() -> None:
 
 
 def test_a_gateway_outage_does_not_log_a_stack_trace_every_hour() -> None:
-    # Bounding the gateway wait turned "hangs for ever" into "raises
-    # TimeoutError", which is the right trade — but nothing retrieved that
-    # exception, so asyncio logged `Task exception was never retrieved` with a
-    # full traceback at ERROR. On a washer whose cloud drops roughly hourly
-    # that is a stack trace an hour describing the bot handling an outage
-    # exactly as designed, in an integration that otherwise holds itself to
-    # 0 info and 1 warning.
-    #
-    # The expected failure is retrieved and logged at debug. Anything else is
-    # re-raised into HA's own handler rather than swallowed: a gateway that was
-    # not ready is ordinary, a KeyError in the embed builder is not, and eating
-    # the second to silence the first is how a real bug hides for a month.
+    # An unretrieved TimeoutError from the bounded wait logs a full traceback
+    # every outage; _task_done retrieves and debug-logs only that one.
     coord = coord_mod.LaundryCoordinator.__new__(coord_mod.LaundryCoordinator)
     coord._tasks = set()
 
@@ -526,7 +437,7 @@ def test_a_gateway_outage_does_not_log_a_stack_trace_every_hour() -> None:
         def exception(self):
             return self._exc
 
-    # The ordinary outage: retrieved, so asyncio stays quiet, and dropped.
+    # Retrieved and dropped: asyncio stays quiet.
     timed_out = _Task(TimeoutError("gateway not ready"))
     coord._tasks.add(timed_out)
     coord._task_done(timed_out)
@@ -548,7 +459,6 @@ def test_a_gateway_outage_does_not_log_a_stack_trace_every_hour() -> None:
     coord._tasks.add(cancelled)
     coord._task_done(cancelled)
     assert cancelled not in coord._tasks
-    # ...and a clean finish is the common case.
     ok = _Task(None)
     coord._tasks.add(ok)
     coord._task_done(ok)
@@ -570,51 +480,38 @@ class _Ev:
 
 
 def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
-    # REGRESSION (v0.28.0, from a live incident). This washer's cloud drops on
-    # a metronome — 19 drops in 15.5 hours, 3087s apart — and on reconnect it
-    # republishes the phase it last saw. `_on_job_state` filtered values that
-    # were themselves `unavailable` but not values arriving *from* it, while
-    # its own comment claimed the opposite. So a stale `wash` replayed on
-    # reconnect took the fast-start accelerant and minted a load out of
-    # nothing: the session began exactly confirm_delay after the drop, the
-    # energy meter never moved, no ETA was ever published, and an hour later
-    # it closed itself by announcing a wash that never happened.
-    #
-    # The rule already existed and was already trusted — cancel.is_flap guards
-    # both stop routes, and its docstring cites _on_job_state as the prior art.
-    # This was the one place not applying it.
+    # _on_job_state filtered values arriving AS unavailable, not values
+    # arriving FROM it: a replayed phase must not get the fast-start accelerant.
     c = _coordinator()
     c._job_confirm_unsub = None
     c._job_from_flap = False
     c._flap_recovery_ts = None
     c._cfg = {}  # confirm_delay falls back to its default for the time memory
-    # The debounce itself is not under test — only which value it settles on,
-    # and whether that value is allowed to drive the fast paths.
+    # Only the settled value and whether it drives the fast paths matter here.
     c._schedule_job_confirm = lambda: None
     c._flap_times = []
     c._notify_entities = lambda: None
-    # _record_flap schedules a save; close it rather than leaving an
-    # un-awaited coroutine warning in the output.
+    # Closes the coroutine _record_flap schedules, to avoid an un-awaited
+    # coroutine warning.
     c._create_task = lambda coro: coro.close()
     fed = []
     c._feed_detector = lambda *a, **kw: fed.append(kw.get("allow_early"))
     c._job_phase = lambda: "wash"
 
     def _age_past_window():
-        # The recovery time-memory deliberately outlives one event (see the
-        # attribute-churn test). These sub-cases are about the per-value flag
-        # alone, so the stamp is aged past the window between them.
+        # Ages the recovery stamp past its window; these cases test the
+        # per-value flag alone.
         if c._flap_recovery_ts is not None:
             c._flap_recovery_ts -= 10_000
 
-    # The incident: unavailable -> wash, i.e. the cloud coming back.
+    # unavailable -> wash: the cloud reconnecting.
     c._on_job_state(_Ev("unavailable", "wash"))
     assert c._job_from_flap is True
     c._async_job_confirmed()
     assert fed == [False], "a replayed phase must not arm the fast start"
 
-    # A real start, cloud up throughout, is untouched — the accelerant is the
-    # whole reason the card appears before the meter has moved.
+    # Cloud up throughout: untouched, since the accelerant is why the card
+    # appears before the meter moves.
     fed.clear()
     _age_past_window()
     c._on_job_state(_Ev("none", "wash"))
@@ -628,8 +525,7 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
     c._async_job_confirmed()
     assert fed == [False]
 
-    # The flag is per settled value, not sticky: a flap-armed debounce that a
-    # genuine change then re-arms must not stay suppressed.
+    # Not sticky: a later genuine change must re-arm despite an earlier flap.
     fed.clear()
     c._on_job_state(_Ev("unavailable", "wash"))
     c._on_job_state(_Ev("wash", "rinse"))
@@ -650,18 +546,8 @@ def test_a_reconnect_cannot_mint_a_load_out_of_a_replayed_phase() -> None:
 
 
 def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
-    # REGRESSION. v0.28.1 stopped a cloud reconnect minting a phantom load, and
-    # left the identical hole standing on the other entry point: the restore
-    # fed the detector with the job fast-paths ON, asserting "the restored
-    # state is settled". Settled was never the question. `_job_phase()` reads
-    # whatever the washer integration is publishing at that instant, and for a
-    # cloud integration that is routinely the last phase it saw before HA went
-    # down — so a stale `wash` started a whole session, card and completion
-    # ping included, for a load that never ran.
-    #
-    # Every reload counts, not only restarts: an options change calls
-    # async_reload, which builds a fresh coordinator with _restored = False.
-    # Changing a setting must not be able to invent a wash.
+    # _job_phase() reads whatever is published now, often a stale phase from
+    # before HA restarted or reloaded; neither may trust it as a fresh wash.
     for stage in (const.STAGE_IDLE, const.STAGE_DONE_WAITING):
         c = _coordinator(stage=stage)
         c._restored = False
@@ -671,8 +557,8 @@ def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
         _run(c.async_on_bot_ready())
         assert fed == [False], f"{stage}: a restore must not arm the fast start"
 
-    # The guard is not a blanket ban on feeding the detector — a restore still
-    # feeds it, so a load that really is running is picked up by the meter.
+    # Restore still feeds the detector - a load that is really running is
+    # still picked up by the meter.
     assert fed, "the restore must still feed the detector"
 
     # And an active session restores its ETA timer rather than feeding at all.
@@ -686,15 +572,8 @@ def test_a_restart_or_reload_cannot_invent_a_wash_either() -> None:
 
 
 def test_the_diagnostic_snapshot_is_reachable_and_serialisable() -> None:
-    # REGRESSION (v0.29.0, critical). The first snapshot read `self.energy_idle`
-    # — an attribute that does not exist; the property is `energy_idle_timeout`
-    # — so the diagnostics action raised AttributeError on every call, and the
-    # handler's never-raise wrapper converted the flagship feature into
-    # "could not be read" for every entry, every time. 399 tests stayed green
-    # because nothing ever called the REAL method: the pure suite fed check()
-    # hand-built dicts, and the one seam between them was the one that broke.
-    # This test exists to make that seam a tested path: real method, real
-    # properties, and the exact JSON trip the websocket response takes.
+    # diagnostic_snapshot() once read a nonexistent attribute, hidden by a
+    # never-raise wrapper. Exercise the real method and a real JSON round trip.
     import json as _json
 
     c = _coordinator(stage=const.STAGE_WASHING, message_id=1542881883527057553)
@@ -709,23 +588,19 @@ def test_the_diagnostic_snapshot_is_reachable_and_serialisable() -> None:
     assert snap["session"]["stage"] == const.STAGE_WASHING
     assert snap["session"]["detector"]["phase"] is not None
     assert snap["watched"]["running"] is None  # unset entity = None, honestly
-    # ...and the pure checks accept the real shape end to end.
+    # The pure checks accept the real shape too.
     findings = diagnose.check(snap["session"], 10_000.0, watched=snap["watched"])
     assert isinstance(findings, list)
 
 
 def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
-    # REGRESSION (v0.29.1). HA fires state_changed for attribute-only updates,
-    # and _on_job_state used to overwrite _job_from_flap on every one of them:
-    # `unavailable -> wash` set the flag, a `wash -> wash` RSSI update seconds
-    # later stomped it back to False and re-armed the debounce — so the
-    # replayed phase got the accelerant after all, and the incident's phantom
-    # returned through a two-event reconnect.
+    # HA fires state_changed for attribute-only updates too; those must not
+    # overwrite _job_from_flap and re-arm the debounce for a replayed phase.
     c = _coordinator()
     c._job_confirm_unsub = None
     c._job_from_flap = False
     c._flap_recovery_ts = None
-    c._cfg = {}  # confirm_delay falls back to its default for the time memory
+    c._cfg = {}
     c._schedule_job_confirm = lambda: None
     c._flap_times = []
     c._notify_entities = lambda: None
@@ -741,9 +616,8 @@ def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
     c._async_job_confirmed()
     assert fed == [False]
 
-    # The launder chain: unavailable -> none, then none -> wash. The second
-    # hop's old_state is clean, so the per-value flag alone would wave the
-    # replayed phase through; the recovery time-memory is what catches it.
+    # unavailable -> none -> wash: the second hop's old_state is clean, so
+    # only the recovery time-memory (not the per-value flag) catches it.
     fed.clear()
     c._on_job_state(_Ev("unavailable", "none"))
     c._on_job_state(_Ev("none", "wash"))
@@ -751,9 +625,8 @@ def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
     c._async_job_confirmed()
     assert fed == [False], "the time memory must cover what the flag cannot"
 
-    # ...and it expires: a genuine start long after the reconnect keeps its
-    # fast card. (The stamp is aged past the window by hand — the window is
-    # confirm_delay + 90, and nothing else in this test advances the clock.)
+    # Expires: a genuine start well after reconnect still gets the fast card
+    # (window is confirm_delay + 90, aged by hand here).
     fed.clear()
     c._flap_recovery_ts -= 10_000
     c._on_job_state(_Ev("none", "wash"))
@@ -762,12 +635,9 @@ def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
 
 
 def test_restore_trusts_the_meter_not_the_replayed_phase() -> None:
-    # REGRESSION (v0.29.1). The restore fed the detector with the fast paths
-    # fully off, which stopped the restart-phantom but silently regressed the
-    # honest cases with it: a genuinely mid-cycle load at restart waited
-    # 15-60+ minutes for the next job transition. The split restores exactly
-    # the corroborated half: a mid-cycle phase may start a load if and only
-    # if the meter has moved since idle.
+    # Turning the fast paths fully off on restore fixed the phantom but broke
+    # genuinely mid-cycle loads too; one may start only if the meter moved
+    # since idle.
     for stage in (const.STAGE_IDLE, const.STAGE_DONE_WAITING):
         c = _coordinator(stage=stage)
         c._restored = False
@@ -781,11 +651,9 @@ def test_restore_trusts_the_meter_not_the_replayed_phase() -> None:
 
 
 def test_the_accel_split_separates_the_two_bets() -> None:
-    # The semantic the split must hold: an early phase is trusted only with
-    # allow_early (it starts on the cloud's word alone — the phantom risk);
-    # a mid-cycle phase is trusted only through allow_catchup (detect demands
-    # the meter moved since idle — corroborated by construction). `finish`
-    # rides with allow_early because a replayed finish is the mirror phantom.
+    # allow_early trusts an early phase on the cloud's word alone (the
+    # phantom risk); allow_catchup trusts a mid-cycle phase only because the
+    # meter corroborates it. finish rides with allow_early for the same reason.
     c = _coordinator(stage=const.STAGE_IDLE)
     c._cfg = {}  # the entity properties read config even when their reads are stubbed
     c._flap_times = []
@@ -862,12 +730,8 @@ class _FakeInteraction:
 
 # --- a start post that fails must not take the previous load with it ---------
 def test_a_failed_start_post_puts_the_superseded_load_back() -> None:
-    # REGRESSION (critical, observed firing on the live install as a run of
-    # "Failed to post laundry start message"): _async_start_session mutates 20
-    # fields before it posts, and the failure path restored two of them. Every
-    # failed post silently wiped the superseded load's claimant, its queue, its
-    # handoff and its emptied flag, and left a session anchor behind for a
-    # session that does not exist.
+    # _async_start_session mutates ~20 fields before posting; the old failure
+    # path restored only two, wiping the superseded load's state.
     watched = (
         "stage", "waiting", "claimed_by", "claimed_by_id", "quiet", "message_id",
         "queue", "emptied", "handoff_name", "handoff_hedged", "cancelled",
@@ -919,10 +783,8 @@ def test_a_failed_start_post_puts_the_superseded_load_back() -> None:
 
 # --- a tap on a card the bot is no longer tracking ---------------------------
 def test_a_tap_on_an_older_card_cannot_touch_the_live_load() -> None:
-    # Persistent views are registered by custom_id, not per message, so every
-    # card the bot ever posted still dispatches into these callbacks. Without a
-    # message check, 🧺 on a three-week-old card claims *today's* load and then
-    # rewrites that old card with today's embed.
+    # Buttons dispatch by custom_id, not per message; a message check must
+    # stop an old card from claiming today's load.
     c = _coordinator(stage=const.STAGE_WASHING, message_id=999)
     c._cfg = dict(_ENTITY_CFG)
     claimed: list = []
@@ -940,16 +802,16 @@ def test_a_tap_on_an_older_card_cannot_touch_the_live_load() -> None:
 
     stale = _FakeInteraction(message_id=111)
     _run(button.callback(stale))
-    assert claimed == []                       # the live load was never touched
-    assert stale.edits == []                   # and the old card was not rewritten
+    assert claimed == []
+    assert stale.edits == []
     assert stale.replies and stale.replies[0][1] is True   # a private refusal
 
     live = _FakeInteraction(message_id=999)
     _run(button.callback(live))
-    assert claimed == [("Robin", 7)]           # the current card still works
+    assert claimed == [("Robin", 7)]
 
-    # 🤖 is the deliberate exception: it opens a personal panel and touches no
-    # load, so it must keep working from a card somebody scrolled back to.
+    # The assistant button is the exception: it touches no load, so it must
+    # keep working from an old card.
     opened: list = []
 
     async def _open(interaction):
@@ -962,10 +824,8 @@ def test_a_tap_on_an_older_card_cannot_touch_the_live_load() -> None:
 
 # --- the washer can only be handed to one person per load --------------------
 def test_the_washer_is_handed_off_only_once_per_load() -> None:
-    # The backstop timer pings the head of the line, and the claimant then taps
-    # ✅ afterwards. `expect_emptied` catches the opposite order and not this
-    # one, so the queue popped twice and two people were each told the same
-    # washer was theirs.
+    # expect_emptied only catches the opposite ordering; a second ping after
+    # a backstop handoff must not pop the queue again.
     was_send = coord_mod.async_dispatcher_send
     coord_mod.async_dispatcher_send = lambda *a, **kw: None
     try:
@@ -989,10 +849,10 @@ def test_the_washer_is_handed_off_only_once_per_load() -> None:
         c._cfg = dict(_ENTITY_CFG)
         c.assistant.async_route_ping = _route
         _run(c._async_ping_next_locked(hedged=False))
-        assert pings == []                              # nobody pinged twice
-        assert [e["id"] for e in c.queue] == [9]        # Sam keeps his place
-        assert c.handoff_name == "Alex"                 # and Alex keeps the washer
-        assert ("edit", 4242) in c.bot.calls            # the card still refreshes
+        assert pings == []
+        assert [e["id"] for e in c.queue] == [9]
+        assert c.handoff_name == "Alex"
+        assert ("edit", 4242) in c.bot.calls
 
         # The first handoff of a load is unaffected.
         fresh = _coordinator(
@@ -1032,17 +892,13 @@ class _States:
 
 # --- a meter that never reported must not be read as a finished load ---------
 def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
-    # REGRESSION (v0.29.1, observed live 2026-09-04): the flat-energy backstop
-    # guarded on `energy is not None`, which only says the entity *has* a value
-    # -- and `last_rise_ts` is seeded when the load starts rather than on a real
-    # rise. A meter frozen since before the session began therefore satisfied
-    # "flat for an hour" on a schedule, and the bot announced a load done 60
-    # minutes in while job_state still read `drying`. The drum ran for hours.
+    # The flat-energy backstop only checked energy is not None; a meter
+    # frozen since before this load must not count as flat for an hour.
     now = time.time()
     started = now - 7200  # the load began two hours ago
     c = _coordinator(stage=const.STAGE_WASHING, _session_started_ts=started)
     c._cfg = dict(_ENTITY_CFG)
-    frozen = _State("13.9", started - 3600)  # last moved *before* this load
+    frozen = _State("13.9", started - 3600)  # last moved before this load
     c.hass.states = _States({
         const.DEFAULT_ENERGY_ENTITY: frozen,
         const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
@@ -1058,8 +914,8 @@ def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
     assert finished == [], "a dead meter must not complete a load"
     assert c._detector.phase == coord_mod.RUN_ACTIVE
 
-    # The backstop is only vetoed, not removed: once the meter has reported for
-    # *this* load, a genuinely flat hour still ends it.
+    # Only vetoed, not removed: once the meter reports for this load, a flat
+    # hour still ends it.
     c.hass.states = _States({
         const.DEFAULT_ENERGY_ENTITY: _State("13.9", started + 60),
         const.DEFAULT_JOB_STATE_ENTITY: _State("drying", started + 60),
@@ -1068,7 +924,6 @@ def test_a_meter_that_never_reported_cannot_finish_a_load() -> None:
     assert finished == [True], "a reporting meter that went flat still finishes"
 
 
-# --- the shipped dashboard must name entities that actually exist -----------
 # --- picking up a load the bot never noticed ---------------------------------
 def _trackable(**state):
     c = _coordinator(**state)
@@ -1078,37 +933,31 @@ def _trackable(**state):
 
 
 def test_the_missed_load_button_picks_the_wash_up_as_a_catch_up() -> None:
-    # The escape hatch for the 2026-09-12 failure: the washer runs a full cycle
-    # and the bot never opens a session, so there is no card, no Claim button
-    # and no completion ping. reset_session was the only manual route and it
-    # goes the wrong way. See docs/field-notes.md 5.
+    # The escape hatch when the bot never opened a session for a full cycle:
+    # no card, no Claim button, no completion ping, and reset_session doesn't help.
     c = _trackable(stage=const.STAGE_DONE_WAITING, claimed_by="Ginko",
                    claimed_by_id=4188, message_id=4242)
     assert _run(c.async_track_current_load()) is True
     assert c.stage == const.STAGE_WASHING
-    # A catch-up, not a fresh start: we have no idea how long it has been
-    # running, so the card must not claim a start time or a usage baseline.
+    # A catch-up, not a fresh start - no start time or usage baseline is known.
     assert c.catch_up is True
     assert c._energy_start is None and c._water_start is None
-    # ...and the previous load's claim is cleared, as any new load clears it.
+    # The previous claim is cleared too.
     assert c.claimed_by == const.UNCLAIMED and c.claimed_by_id is None
-    # The detector has to move WITH the session. Left idle behind an active
-    # stage it is the wedge `diagnose` calls unrecoverable: neither half can
-    # end a load the other is not in.
+    # The detector must move with the session; left idle behind an active
+    # stage it is the wedge diagnose calls unrecoverable.
     assert c._detector.phase == "active"
     assert c._detector.last_rise_ts is not None
-    # Dated from now, not from whenever the meter last moved -- this machine's
-    # meter can be an hour stale, and a backstop armed from a stale reading
-    # would fire almost immediately on the load a human just vouched for.
+    # Dated from now, not the meter: a stale reading would arm the backstop
+    # to fire almost immediately.
     assert c._detector.last_rise_ts >= c._session_started_ts - 1
     # Saved after the detector moved, or a restart restores the wedge.
     assert c.saves, "the detector change was never persisted"
 
 
 def test_it_will_not_hijack_a_load_that_is_already_being_tracked() -> None:
-    # Not an override. If the bot has hold of the WRONG load the answer is
-    # reset_session first -- silently repointing a live card at a different
-    # wash would strand whoever claimed it.
+    # Not an override; repointing a live card at a different wash would
+    # strand whoever claimed it. reset_session is the fix instead.
     for stage in (const.STAGE_WASHING, const.STAGE_DRYING, const.STAGE_SELF_CLEAN):
         c = _trackable(stage=stage, claimed_by="Robin", claimed_by_id=7,
                        message_id=4242)
@@ -1119,12 +968,8 @@ def test_it_will_not_hijack_a_load_that_is_already_being_tracked() -> None:
 
 
 def test_a_failed_post_leaves_no_wedge_behind() -> None:
-    # The ordering this method is written around. `_async_start_session` can
-    # fail at the Discord post and roll its own stage back, so seeding the
-    # detector BEFORE the call would leave it ACTIVE against an idle session --
-    # which refuses every subsequent real load, permanently, until somebody
-    # runs reset_session. The detector is therefore moved only after the post
-    # is known to have landed.
+    # The detector is armed only after the post lands; arming it first would
+    # leave it ACTIVE against an idle session, refusing every load until reset.
     c = _trackable(stage=const.STAGE_DONE_WAITING, claimed_by="Ginko",
                    claimed_by_id=4188, message_id=4242)
 
@@ -1134,7 +979,7 @@ def test_a_failed_post_leaves_no_wedge_behind() -> None:
     c.bot.async_post = _boom
     logger = logging.getLogger(coord_mod.__name__)
     was = logger.level
-    logger.setLevel(logging.CRITICAL)  # the handler logs the traceback we caused
+    logger.setLevel(logging.CRITICAL)
     try:
         assert _run(c.async_track_current_load()) is False
     finally:
@@ -1145,11 +990,8 @@ def test_a_failed_post_leaves_no_wedge_behind() -> None:
 
 
 def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
-    # The dashboard is a text file full of entity ids, and a wrong one does not
-    # error -- the card just renders "Entity not available", which is
-    # indistinguishable from a broken integration to whoever is reading it.
-    # This derives the ids from the platform definitions rather than repeating
-    # them, so renaming an entity breaks the test rather than the dashboard.
+    # A wrong entity id fails silently in the UI ("Entity not available"), so
+    # ids are derived from the platforms' translation keys instead of hardcoded.
     import yaml
     from homeassistant.util import slugify
 
@@ -1157,15 +999,12 @@ def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
     from custom_components.laundry_discord import switch as switch_mod
 
     pkg = os.path.join(HERE, "..", "custom_components", "laundry_discord")
+    with io.open(os.path.join(pkg, "translations", "en.json"), encoding="utf-8") as fh:
+        names = json.load(fh)["entity"]
 
-    def _names(filename):
-        """Class-level ``_attr_name`` strings, read from the source.
-
-        Read with ``ast`` rather than by importing and using getattr: Home
-        Assistant's entity metaclass rewrites every ``_attr_*`` class attribute
-        into a descriptor, so the value is not a string by the time it is an
-        attribute. The source is the honest place to ask.
-        """
+    def _translation_keys(filename):
+        """Class-level _attr_translation_key strings, read via ast since HA's
+        entity metaclass turns _attr_* attributes into descriptors."""
         tree = ast.parse(io.open(os.path.join(pkg, filename), encoding="utf-8").read())
         found = []
         for node in ast.walk(tree):
@@ -1175,7 +1014,7 @@ def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
                 if (
                     isinstance(stmt, ast.Assign)
                     and any(
-                        isinstance(t, ast.Name) and t.id == "_attr_name"
+                        isinstance(t, ast.Name) and t.id == "_attr_translation_key"
                         for t in stmt.targets
                     )
                     and isinstance(stmt.value, ast.Constant)
@@ -1184,28 +1023,25 @@ def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
                     found.append(stmt.value.value)
         return found
 
-    expected = set()
-    for domain, filename in (
-        ("sensor", "sensor.py"),
-        ("binary_sensor", "binary_sensor.py"),
-        ("button", "button.py"),
-    ):
-        expected.update(f"{domain}.{slugify(name)}" for name in _names(filename))
-    expected.update(f"number.{slugify(row[2])}" for row in number_mod._NUMBERS)
-    expected.update(f"switch.{slugify(row[2])}" for row in switch_mod._SWITCHES)
+    keys = {
+        "sensor": _translation_keys("sensor.py"),
+        "binary_sensor": _translation_keys("binary_sensor.py"),
+        "button": _translation_keys("button.py"),
+        "number": [row[0] for row in number_mod._NUMBERS],
+        "switch": [row[0] for row in switch_mod._SWITCHES],
+    }
+    expected = {
+        domain + "." + slugify(const.DEVICE_NAME + " " + names[domain][key]["name"])
+        for domain, domain_keys in keys.items()
+        for key in domain_keys
+    }
     assert len(expected) >= 15, f"only found {len(expected)} entities: {expected}"
 
     path = os.path.join(HERE, "..", "dashboards", "laundry.yaml")
     doc = yaml.safe_load(io.open(path, encoding="utf-8").read())
 
     def _walk(node):
-        """Every entity id the dashboard names, in either card spelling.
-
-        `entities:` takes a bare string *or* a mapping with an `entity:` key,
-        and cards nest, so this recurses through everything rather than
-        special-casing the two shapes -- the first version of this test only
-        saw the string form and passed while four cards were unchecked.
-        """
+        """Every entity id the dashboard names, as a string or an ``entity:``."""
         if isinstance(node, dict):
             for key, value in node.items():
                 if key == "entity" and isinstance(value, str):
@@ -1221,12 +1057,10 @@ def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
 
     referenced = set(_walk(doc))
     assert referenced, "the dashboard referenced no entities at all"
-    # Only our own entities are checked: the washer's ids belong to whichever
-    # integration supplies them and are documented as needing a find-replace.
+    # Only our own entities; the washer's ids belong to another integration.
     ours = {e for e in referenced if e.split(".", 1)[-1].startswith("laundry")}
     missing = sorted(ours - expected)
     assert not missing, f"dashboard names entities nothing creates: {missing}"
-    # ...and the reverse, so a new control cannot be added without a card.
     unused = sorted(expected - referenced)
     assert not unused, f"entities exist but the dashboard never shows them: {unused}"
 

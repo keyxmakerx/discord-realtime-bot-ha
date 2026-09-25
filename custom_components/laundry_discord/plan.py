@@ -1,52 +1,17 @@
-"""Pure, dependency-free helpers for the week grid.
+"""Pure helpers for the week grid: what a week looks like to one person.
 
-Kept free of Home Assistant / discord imports so the slot maths, the
-recurring-vs-override reconciliation and the exact rendered grid can be
-unit-tested without the HA test harness — the same discipline that made
-:mod:`detect`, :mod:`queue` and :mod:`people` reliable. :mod:`assistant` owns
-the ``Store`` and :mod:`grid` owns every Discord call; this module only decides
-what a week looks like, and what it looks like *to one person*.
-
-Five things here are load-bearing and every one of them is easy to get subtly
-wrong:
-
-* **The caller passes the clock.** Nothing in here calls ``datetime.now()``.
-  The ISO week and the weekday are derived from a moment handed in, exactly as
-  :mod:`detect` takes ``now`` — which is what makes "the week rolled over"
-  testable by passing a date rather than by waiting for Sunday night.
-* **JSON object keys are always strings.** A holder written while the id was
-  ``interaction.user.id`` (an int) comes back off disk as ``"123"``, so every
-  comparison in here is done on the string form. :mod:`people` and :mod:`queue`
-  both hit this; the grid would fail *silently and anonymously*, which is worse
-  — you'd just never see your own cell as yours.
-* **The grid is anonymous** (design doc P5 / §11). Nothing rendered here can
-  identify anybody: not a name, and not a count either, because in a house of
-  seven "3 people want Thursday night" is one conversation away from naming
-  them. A cell is free, taken (this week, or every week), yours, running, or —
-  only ever for the person looking at it — expected. That is the whole
-  vocabulary, and :data:`CELL_STATES` is the whole of it in one place.
-* **Provenance survives reconciliation.** :func:`effective_week` returns, for
-  every held cell, *both* who holds it and which of those hold it as a standing
-  weekly slot. Flattening the two into one list — which is what it used to do —
-  makes a standing Thursday and a one-off tap byte-identical downstream, and
-  ``║`` is then impossible to draw at all.
-* **Nothing is mutated.** Every function returns new data, like the other pure
-  modules, so a rejected store write can't half-apply.
-
-The rendered grid is deliberately **one function's return value** (§6.5), so a
-``render_png`` can be dropped in beside :func:`render_grid` later without the
-data layer noticing. :func:`render_week` bundles that string with the flags a
-caller needs to describe it — which states are *actually on the block* — so
-nobody has to ask the rendered text what is in it.
+No Home Assistant or discord imports, so it is unit-tested directly;
+:mod:`assistant` owns the ``Store`` and the Discord calls, and nothing here
+mutates state. The grid is anonymous: no name, no count. JSON keys always come
+back as strings, so ids are compared as strings throughout.
 """
 
 from __future__ import annotations
 
 from typing import NamedTuple
 
-# --- slots (design doc §6.1) -------------------------------------------------
-# At 4-5 hours a cycle, one slot IS one load: a cell is not a time range you
-# reserve, it's "I'm doing a wash then". Four of them cover the usable day.
+# --- slots ---------------------------------------------------------------------
+# One slot IS one load (a cycle is 4-5 hours), not a time range you reserve.
 SLOT_AM = "am"
 SLOT_MID = "mid"
 SLOT_PM = "pm"
@@ -60,9 +25,8 @@ SLOT_LABELS = {
     SLOT_EVE: "Eve",
 }
 
-# Half-open [start, end) hour windows, local time. 00:00-06:00 belongs to no
-# slot on purpose: nobody runs a wash at 4am in a shared house, and inventing a
-# fifth slot for it would cost a column of grid width for a row of dots.
+# Half-open [start, end) hour windows, local time. 00:00-06:00 is in no slot
+# on purpose: not worth a fifth grid column for a row of dots.
 SLOT_WINDOWS = {
     SLOT_AM: (6, 12),
     SLOT_MID: (12, 16),
@@ -70,8 +34,7 @@ SLOT_WINDOWS = {
     SLOT_EVE: (20, 24),
 }
 
-# Two letters, because "M T W T F S S" is ambiguous and full names don't fit in
-# the 30-character budget below.
+# Two letters: "M T W T F S S" is ambiguous, full names don't fit the grid width.
 DAY_ABBRS = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
 DAY_NAMES = (
     "Monday",
@@ -83,20 +46,8 @@ DAY_NAMES = (
     "Sunday",
 )
 
-# --- the cell alphabet -------------------------------------------------------
-# **Shape encodes KIND. Weight encodes WHOSE.** (live-use design §5.)
-#
-# This started life as ``· ░ ▓ █`` — a dot plus three steps of one shading ramp,
-# faint to solid. A density ramp encodes *magnitude*, and none of these are
-# magnitudes: a guess, somebody else's booking and your own booking are
-# different **kinds** of thing, and "how dark is this square?" answers a
-# question nobody was asking. That mismatch is why the grid could not be read at
-# a glance, and it had nowhere to put a fifth state — the ramp was already at
-# full black.
-#
-# So the ramp is gone. Exactly two block weights survive, and between them they
-# now mean one thing and one thing only — ``▒`` somebody else, ``█`` you. Every
-# other state is a different *shape* rather than a different darkness:
+# --- the cell alphabet -----------------------------------------------------
+# Shape encodes KIND, weight encodes WHOSE: ``▒`` somebody else, ``█`` you.
 #
 #   ·   free
 #   ?   the model's guess — the viewer's own, never on a shared view
@@ -105,40 +56,25 @@ DAY_NAMES = (
 #   █   yours
 #   *   running right now
 #
-# **Width.** All six are single-width. ``▒`` (U+2592) and ``║`` (U+2551) share
-# an East Asian Width class with ``·``/``█``, which already render correctly on
-# the household's clients, so they behave identically; ``?`` and ``*`` are
-# narrow ASCII. None of them collide with the day (``Mo Tu ...``) or slot
-# (``AM Mid PM Eve``) labels.
-#
-# **ASCII and block characters only.** Emoji break monospace alignment inside a
-# Discord code block (§6.3) — they are fine in the legend *outside* it, which is
-# why the legend is a separate function. ANSI colour was considered and rejected:
-# clients that don't support it render the escape sequences as visible garbage,
-# and seven people means mixed devices.
+# All six are single-width and never collide with the day/slot labels. ASCII
+# and block characters only: emoji break monospace alignment inside a Discord
+# code block, and ANSI colour renders as garbage on clients that don't support it.
 CELL_FREE = "·"  # U+00B7
 CELL_TAKEN = "▒"  # U+2592 — somebody else's, this week only
 CELL_TAKEN_EVERY_WEEK = "║"  # U+2551 — somebody else's, every week
 CELL_MINE = "█"  # U+2588
-# The habit model's guess: the days :mod:`habit` thinks *the person looking*
-# usually washes. It is the only cell state that is not a fact — see
-# :func:`cell_state` for the precedence rule that keeps it off every real
-# booking, and :func:`expected_cells` for why it can only ever be the viewer's
-# own. It stays out of :func:`render_legend` unless a guess is actually in play:
-# a legend entry for a state that cannot appear reads as a renderer bug.
+# The habit model's guess for the viewer's own usual day. The only cell state
+# that isn't a fact; see :func:`cell_state` for precedence and
+# :func:`expected_cells` for why it's only ever the viewer's own.
 CELL_EXPECTED = "?"  # ASCII
-# Live occupancy: the machine is running in this slot *right now*. Defined,
-# rendered and tested here, but **nothing produces it yet** — the coordinator
-# wiring is Phase 4. It is deliberately kept out of :func:`render_legend` until
-# then, exactly the discipline ``?`` got when it shipped a phase ahead of the
-# habit model: a legend that promises a character the grid cannot draw is
-# indistinguishable from a renderer that has stopped drawing it.
+# Live occupancy: the machine is running in this slot right now. Defined and
+# tested here, but nothing produces it yet (coordinator wiring is later);
+# kept out of :func:`render_legend` until it does.
 CELL_RUNNING = "*"  # ASCII
 
-# The states a cell can be in, as ids rather than characters, so that anything
-# choosing a *non-character* rendering for a cell — a Discord button style, a
-# future PNG — asks the same question the grid does and gets the same answer.
-# One precedence rule, in :func:`cell_state`, and everything else is a lookup.
+# States as ids rather than characters, so a non-character rendering (a
+# Discord button style, a future PNG) asks the same question and gets the
+# same answer. One precedence rule lives in :func:`cell_state`.
 STATE_FREE = "free"
 STATE_EXPECTED = "expected"
 STATE_RUNNING = "running"
@@ -155,9 +91,8 @@ CELL_STATES = {
     STATE_MINE: CELL_MINE,
 }
 
-# Every rendered line is exactly this wide. The cap that matters is ~30
-# characters, past which the block wraps on a phone and the alignment — the
-# only reason to draw a grid in text at all — is destroyed.
+# Every rendered line is exactly this wide. Past ~30 characters a phone wraps
+# the block and destroys the column alignment the grid depends on.
 GRID_WIDTH = 26
 _LABEL_WIDTH = 5  # "Mid"/"Eve" + the gutter before Monday
 _CELL_WIDTH = 3  # a 2-char day header + one space
@@ -189,12 +124,7 @@ def slot_window_text(slot) -> str:
 
 
 def slot_for_hour(hour) -> str | None:
-    """The slot an hour falls in, or None when no slot covers it.
-
-    The windows are otherwise inert data; this is what gives them a meaning
-    that can be asserted. None for 00:00-06:00 is the honest answer — see
-    :data:`SLOT_WINDOWS`.
-    """
+    """The slot an hour falls in, or None when no slot covers it (00:00-06:00)."""
     try:
         value = int(hour)
     except (TypeError, ValueError):
@@ -207,22 +137,18 @@ def slot_for_hour(hour) -> str | None:
 
 
 def cell_key(weekday, slot) -> str | None:
-    """The stable key for one cell — ``"3-eve"`` for Thursday evening.
-
-    A single string rather than a pair because it is also an object key in the
-    override store (design doc §12), and JSON has no tuples.
-    """
+    """The stable key for one cell — ``"3-eve"`` for Thursday evening. A string, not a
+    pair, since it's also an object key in the override store and JSON has no
+    tuples."""
     if not is_weekday(weekday) or not is_slot(slot):
         return None
     return f"{weekday}-{slot}"
 
 
 def parse_cell(key) -> tuple[int, str] | None:
-    """``"3-eve"`` -> ``(3, "eve")``; None for anything malformed.
-
-    Round-trips with :func:`cell_key`. Never raises: these keys come off disk,
-    and a corrupt one must not take a button callback down with it.
-    """
+    """``"3-eve"`` -> ``(3, "eve")``; None for anything malformed. Round-trips with
+    :func:`cell_key`. Never raises, since a corrupt stored key must not take a
+    button callback down with it."""
     if not isinstance(key, str) or "-" not in key:
         return None
     day_part, _, slot = key.partition("-")
@@ -236,12 +162,8 @@ def parse_cell(key) -> tuple[int, str] | None:
 
 
 def normalise_cell(value) -> str | None:
-    """A cell key from either stored form, or None.
-
-    Accepts the key itself (``"3-eve"``) and the ``[weekday, slot]`` pair the
-    data model uses for recurring slots, so callers never have to care which
-    end of the store a cell came from.
-    """
+    """A cell key from either stored form, or None. Accepts the key itself
+    (``"3-eve"``) or the ``[weekday, slot]`` pair used for recurring slots."""
     if isinstance(value, str):
         return value if parse_cell(value) else None
     if isinstance(value, (list, tuple)) and len(value) == 2:
@@ -273,13 +195,9 @@ def weekday_of(moment) -> int | None:
 
 
 def iso_week_key(moment) -> str | None:
-    """``"2026-W32"`` for a ``date``/``datetime``, or None.
-
-    The ISO year, **not** the calendar year: 2027-01-01 belongs to 2026-W53,
-    and keying it under 2027 would silently move that Friday's plans into a
-    week that hasn't happened. Zero-padded so the keys sort chronologically as
-    plain strings, which is what lets :func:`prune_overrides` be a comparison.
-    """
+    """``"2026-W32"`` for a ``date``/``datetime``, or None. ISO year, not calendar
+    year: 2027-01-01 is still 2026-W53. Zero-padded so keys sort chronologically as
+    plain strings."""
     try:
         calendar = moment.isocalendar()
         year, week = int(calendar[0]), int(calendar[1])
@@ -290,14 +208,9 @@ def iso_week_key(moment) -> str | None:
 
 # --- stored shapes -----------------------------------------------------------
 def normalise_slots(value) -> list[list]:
-    """Recurring slots as the data model stores them: ``[[3, "eve"], ...]``.
-
-    Design doc §12 fixes the stored form as ``[weekday, slot]`` pairs, so that
-    is what comes back — but cell keys are accepted on the way in, because the
-    UI works in cell keys and a value that round-tripped through one of them
-    must not be lost. Deduped and ordered so two equal weeks always serialise
-    identically.
-    """
+    """Recurring slots as the data model stores them: ``[[3, "eve"], ...]``. Accepts
+    cell keys on the way in too, since the UI works in those. Deduped and ordered so
+    two equal weeks always serialise identically."""
     if not isinstance(value, (list, tuple)):
         return []
     keys: list[str] = []
@@ -310,27 +223,17 @@ def normalise_slots(value) -> list[list]:
 
 
 def recurring_cells(person) -> list[str]:
-    """The cell keys somebody has down every week.
-
-    Reads the record's ``slots`` defensively rather than importing
-    :mod:`people`: this module has to stay loadable on its own, and a record
-    that never went through ``normalise_person`` (straight off disk, or from a
-    version that stored something else there) must not raise.
-    """
+    """The cell keys somebody has down every week. Reads ``slots`` defensively rather
+    than importing :mod:`people`, so a record that never went through
+    ``normalise_person`` can't raise."""
     source = person.get("slots") if isinstance(person, dict) else None
     return [f"{weekday}-{slot}" for weekday, slot in normalise_slots(source)]
 
 
 def normalise_holders(value) -> list[str]:
-    """Who holds a cell, as a deduped list of string ids.
-
-    Design doc §12 sketches one holder per overridden cell (``"3-eve": "123"``)
-    and that form still loads, but the stored form here is a **list**. Nothing
-    in this design can refuse a second person a slot — it is information, not
-    permission (§8) — so a shape that can only remember one of them would drop
-    somebody's plan on the floor the moment two people aimed for the same
-    Thursday, which is precisely the case the grid exists to make visible.
-    """
+    """Who holds a cell, as a deduped list of string ids. A single stored holder still
+    loads; the form here is a list since a slot is information, not permission, and
+    can't refuse a second person."""
     if value is None:
         return []
     if isinstance(value, (str, int)) and not isinstance(value, bool):
@@ -348,12 +251,9 @@ def normalise_holders(value) -> list[str]:
 
 
 def normalise_overrides(value) -> dict[str, dict[str, list[str]]]:
-    """The per-ISO-week override store, cleaned up.
-
-    ``{"2026-W32": {"3-eve": ["123"]}}``. Junk weeks and unparseable cells are
-    dropped; an empty holder list is **kept**, because that is how "not this
-    week" is recorded against a recurring slot (see :func:`toggle_booking`).
-    """
+    """The per-ISO-week override store, cleaned up. ``{"2026-W32": {"3-eve":
+    ["123"]}}``. An empty holder list is kept — it's how "not this week" overrides a
+    recurring slot (see :func:`toggle_booking`)."""
     if not isinstance(value, dict):
         return {}
     weeks: dict[str, dict[str, list[str]]] = {}
@@ -377,13 +277,8 @@ def week_overrides(overrides, week) -> dict[str, list[str]]:
 
 
 def prune_overrides(overrides, current_week) -> dict[str, dict[str, list[str]]]:
-    """Drop weeks that have already happened.
-
-    Plans are not history — the habit model (Phase 4) learns from actual claims,
-    never from what somebody wrote down — so a past week is dead weight in a
-    store that is rewritten on every tap. Week keys are zero-padded and
-    ISO-year-first, so "older than now" is a string comparison.
-    """
+    """Drop weeks that have already happened. Week keys are zero-padded and
+    ISO-year-first, so "older than now" is a plain string comparison."""
     weeks = normalise_overrides(overrides)
     if not isinstance(current_week, str) or not current_week:
         return weeks
@@ -391,53 +286,26 @@ def prune_overrides(overrides, current_week) -> dict[str, dict[str, list[str]]]:
 
 
 # --- reconciliation ----------------------------------------------------------
-# The key names inside one cell's entry. Constants rather than bare strings
-# because a typo in a dict lookup is not an error, it is an empty answer — a
-# cell that quietly reports nobody on it. Consumers should reach for
-# :func:`holders` and :func:`recurring_holders` instead of indexing; these exist
-# for the tests and for anybody building the mapping by hand.
+# Key names inside one cell's entry. Constants, not bare strings, so a typo
+# can't silently become an empty answer. Prefer :func:`holders` and
+# :func:`recurring_holders` over indexing directly.
 OCC_HOLDERS = "holders"
 OCC_RECURRING = "recurring"
 
 
 def effective_week(people, overrides, week) -> dict[str, dict[str, list[str]]]:
-    """One week's occupancy, with **provenance**, recurring + overrides.
-
-    ``{cell: {"holders": [ids], "recurring": [ids]}}``, where ``recurring`` is
-    the subset of ``holders`` who hold that cell as a *standing weekly slot*
-    rather than as a one-off for this week alone. Cells nobody holds are left
-    out entirely, so an empty week is an empty dict and the renderer's default
-    is "free".
-
-    Two layers, and the order between them is the whole point:
-
-    1. **Recurring** — everybody's standing slots, the ones the Sunday check-in
-       (§10.2) maintains.
-    2. **The week's overrides** — a one-off, which *replaces* the cell rather
-       than adding to it. Replacing is what lets a cell be emptied: somebody
-       who normally washes Thursday evening but can't this week leaves an empty
-       list behind, and their standing slot survives into next week untouched.
-
-    **Why the shape changed.** It used to return ``{cell: [ids]}``, and because
-    an override replaces the whole list, a standing Thursday and a tap made two
-    minutes ago came out byte-identical. ``║`` — "somebody has this *every*
-    week", which is the single fact that decides whether asking for a trade is
-    worth the message — was not merely unrendered, it was unrecoverable.
-
-    **Why per holder rather than per cell.** "Did this cell come from an
-    override?" is the cheaper question and it is the wrong one. Overrides
-    snapshot the cell's *whole* holder list (see :func:`toggle_booking`), so the
-    moment a second person taps a cell somebody stands on every week, that
-    standing booking is inside an override too. A per-cell source flag would
-    quietly demote it to a one-off and tell the house a slot is easy to move
-    when it is the least movable one on the grid. Asking of each holder "is this
-    cell in *their* standing slots?" is both correct and no more work.
-    """
+    """One week's occupancy, with provenance: recurring slots + this week's overrides.
+    ``{cell: {"holders": [ids], "recurring": [ids]}}`` — ``recurring`` is the subset
+    of ``holders`` with this as a standing weekly slot. Cells nobody holds are left
+    out. An override replaces a cell's whole holder list (rather than adding to it),
+    so a cell can be emptied for just this week while the standing slot survives
+    into next. Provenance is tracked per holder, not per cell, since an override
+    snapshots the whole holder list (:func:`toggle_booking`) and can still contain a
+    standing booking."""
     standing: dict[str, list[str]] = {}
     if isinstance(people, dict):
-        # Sorted so the holder order in a cell is the same on every run — the
-        # output feeds a rendered string that tests assert character for
-        # character.
+        # Sorted so holder order in a cell is stable — output feeds a
+        # rendered string tests assert character for character.
         for stored_key, record in sorted(people.items(), key=lambda kv: str(kv[0])):
             person_id = str(stored_key)
             for cell in recurring_cells(record):
@@ -453,10 +321,7 @@ def effective_week(people, overrides, week) -> dict[str, dict[str, list[str]]]:
     return {
         cell: {
             OCC_HOLDERS: list(held),
-            # Order follows ``held`` rather than ``standing`` so the two lists
-            # read in step, and the membership test is against the *person's*
-            # slots, so an override that happens to contain a standing holder
-            # keeps their cadence.
+            # Order follows `held` so the two lists read in step.
             OCC_RECURRING: [
                 person_id
                 for person_id in held
@@ -469,15 +334,9 @@ def effective_week(people, overrides, week) -> dict[str, dict[str, list[str]]]:
 
 
 def _cell_entry(occupancy, cell) -> tuple[list[str], list[str]]:
-    """``(holders, recurring)`` for one cell, from either occupancy shape.
-
-    The bare ``{cell: [ids]}`` form is still accepted — a week that came
-    straight out of an override store, or a literal in a test — and reports no
-    recurring holders, which is the honest answer for a mapping that never knew
-    anybody's standing slots. :func:`effective_week`'s own output is the shape
-    with provenance in it; everything else degrades to "this week only" rather
-    than raising in a button callback.
-    """
+    """``(holders, recurring)`` for one cell, from either occupancy shape. The bare
+    ``{cell: [ids]}`` form is still accepted and reports no recurring holders,
+    degrading to "this week only" rather than raising."""
     if not isinstance(occupancy, dict):
         return ([], [])
     value = occupancy.get(cell)
@@ -500,11 +359,9 @@ def holders(occupancy, cell) -> list[str]:
 
 
 def recurring_holders(occupancy, cell) -> list[str]:
-    """Which of a cell's holders have it **every week**, as string ids.
-
-    Always a subset of :func:`holders`. Empty for a cell held only this week,
-    and empty for an occupancy mapping that carries no provenance at all.
-    """
+    """Which of a cell's holders have it **every week**, as string ids. Always a subset
+    of :func:`holders`; empty if held only this week or if the mapping carries no
+    provenance."""
     return _cell_entry(occupancy, cell)[1]
 
 
@@ -521,26 +378,16 @@ def is_mine(occupancy, cell, viewer_id) -> bool:
 
 
 def is_recurring_for_me(occupancy, cell, viewer_id) -> bool:
-    """Whether the viewer holds this cell **every week**.
-
-    The viewer's own cadence deliberately gets no glyph of its own — a seventh
-    character would be a third thing to learn for information that is only ever
-    about one person, and ``█`` already says "yours". It goes in the "Yours this
-    week" text instead (:func:`describe_cells`), which is where somebody looks
-    to check what they have actually committed to.
-    """
+    """Whether the viewer holds this cell **every week**. No glyph of its own — ``█``
+    already says "yours" — this goes in the "Yours this week" text instead
+    (:func:`describe_cells`)."""
     if viewer_id is None:
         return False
     return str(viewer_id) in recurring_holders(occupancy, cell)
 
 
 def is_taken_by_other(occupancy, cell, viewer_id) -> bool:
-    """Whether somebody *else* has this cell.
-
-    The question the UI actually asks — "can I still take this, and if not is
-    that because I already did?" — and the one place a wrong id comparison
-    would show up as the grid quietly disowning your own bookings.
-    """
+    """Whether somebody *else* has this cell — can the viewer still take it."""
     held = holders(occupancy, cell)
     if not held:
         return False
@@ -550,15 +397,8 @@ def is_taken_by_other(occupancy, cell, viewer_id) -> bool:
 
 
 def is_recurring_for_other(occupancy, cell, viewer_id) -> bool:
-    """Whether somebody *else* has this cell **every week**.
-
-    What ``║`` draws, and it is shown for other people precisely because it
-    changes what you'd do about it: a standing commitment is much less likely to
-    move than a one-off, so it is the difference between "worth asking for a
-    swap" and "pick another evening". It leaks nothing a booking doesn't
-    already — it is a fact about a *cell*, with no name and no count attached,
-    the same vocabulary as ``▒``.
-    """
+    """Whether somebody *else* has this cell **every week**. What ``║`` draws. A fact
+    about the cell only — no name, no count, same as ``▒``."""
     standing = recurring_holders(occupancy, cell)
     if not standing:
         return False
@@ -568,11 +408,9 @@ def is_recurring_for_other(occupancy, cell, viewer_id) -> bool:
 
 
 def toggle_holder(held, user_id) -> tuple[list[str], bool]:
-    """Add or remove one person from a holder list.
-
-    Returns ``(new_holders, booked)``. The list is rebuilt rather than mutated,
-    so a store write that fails leaves the in-memory week alone.
-    """
+    """Add or remove one person from a holder list. Returns ``(new_holders, booked)``.
+    The list is rebuilt rather than mutated, so a store write that fails leaves the
+    in-memory week alone."""
     person_id = str(user_id)
     current = normalise_holders(held)
     if person_id in current:
@@ -581,28 +419,10 @@ def toggle_holder(held, user_id) -> tuple[list[str], bool]:
 
 
 def toggle_recurring(slots, cell) -> tuple[list[list], bool]:
-    """Promote one cell to a standing weekly slot, or demote it back.
-
-    Returns ``(new_slots, standing)`` in the stored ``[[weekday, slot], ...]``
-    form, never mutating the list it was given — the caller writes the result
-    back onto ``person["slots"]``, so a rejected store write cannot half-apply.
-
-    This is the writer the data model has been missing. ``person["slots"]`` was
-    defaulted, normalised, read by :func:`recurring_cells` and reconciled by
-    :func:`effective_week` since the planner shipped; nothing could ever *set*
-    it, so "every week" was a shape the store understood and no button could
-    produce.
-
-    **It deliberately does not touch this week's overrides.** The two layers
-    answer different questions — a standing slot is "this is my usual", an
-    override is "here is what I am doing in the week of the 3rd" — and
-    :func:`effective_week` already lays the second over the first. Writing both
-    from one tap would make "every week" mean "every week except when somebody
-    happened to edit that week", which is the bug the two-layer model exists to
-    avoid. The caller books the current week separately if it wants to, and the
-    grid does exactly that: promoting a cell you already hold leaves this week
-    alone, because you already hold it.
-    """
+    """Promote one cell to a standing weekly slot, or demote it back. Returns
+    ``(new_slots, standing)``; never mutates the list given. Does not touch this
+    week's overrides — a standing slot is "my usual", an override is "this week
+    specifically" — :func:`effective_week` layers one over the other."""
     key = normalise_cell(cell)
     current = normalise_slots(slots)
     if key is None:
@@ -614,20 +434,10 @@ def toggle_recurring(slots, cell) -> tuple[list[list], bool]:
 
 
 def toggle_booking(people, overrides, week, cell, user_id):
-    """Book or free one cell for one person, for one ISO week.
-
-    Returns ``(new_overrides, booked)``. The write is always an **override**,
-    never a change to a recurring slot: a tap on the grid means "this week",
-    which is the only thing somebody can actually know on a Tuesday. Recurring
-    slots are the habit model's business (§10.2, Phase 4).
-
-    The override records the cell's *whole* holder list, snapshotted at the
-    moment of the tap. That is what makes an empty list meaningful — "nobody
-    this week", including whoever normally recurs here — and it is why touching
-    a cell pins it for that week: a later change to somebody's standing slots
-    won't reach back into a week that has already been edited by hand. Pinning
-    the cell somebody deliberately edited is the right way round.
-    """
+    """Book or free one cell for one person, for one ISO week. Returns
+    ``(new_overrides, booked)``. Always an override, never a recurring slot;
+    snapshots the cell's whole holder list, so it won't be reached by a later change
+    to someone's standing slots."""
     key = normalise_cell(cell)
     updated = normalise_overrides(overrides)
     if key is None or not isinstance(week, str) or not week:
@@ -642,24 +452,10 @@ def toggle_booking(people, overrides, week, cell, user_id):
 
 # --- rendering ---------------------------------------------------------------
 def expected_cells(expected, viewer_id=None) -> list[str]:
-    """The cells that may render as ``?`` for this viewer — normalised, ordered.
-
-    **Empty whenever there is no viewer**, and that is the important line in
-    this module. A prediction is a statement about one person's habits, and
-    §11's whole point is that nothing about one person is ever shown to the
-    house: a booking at least represents something they chose to publish, while
-    a guess is the bot telling six other people what it thinks somebody's week
-    looks like. Leaking it is strictly worse than leaking a booking.
-
-    Making the viewer-less case return ``[]`` here — rather than trusting every
-    call site to pass nothing for the shared board — is what makes that
-    structural. :func:`render_grid` with no ``viewer_id`` cannot produce a ``?``
-    no matter what it is handed, so the anonymous board has no path to one.
-
-    The caller supplies the cells (:func:`habit.predicted_cells` in practice);
-    this module has no history and does no arithmetic. Junk is dropped, dupes
-    collapse and the order is fixed, exactly as :func:`normalise_slots` does.
-    """
+    """The cells that may render as ``?`` for this viewer — normalised, ordered. Empty
+    whenever there is no viewer: a guess is never shown to the shared board, only
+    ever to the one person it's about. This module does no arithmetic; the caller
+    supplies the cells (:func:`habit.predicted_cells`)."""
     if viewer_id is None or not isinstance(expected, (list, tuple, set, frozenset)):
         return []
     keys: list[str] = []
@@ -672,17 +468,10 @@ def expected_cells(expected, viewer_id=None) -> list[str]:
 
 
 def running_cells(running) -> list[str]:
-    """The cells the machine is actually running in — normalised, ordered.
+    """The cells the machine is running in right now, normalised and ordered.
 
-    **No viewer gate**, unlike :func:`expected_cells`, and the asymmetry is the
-    point: "the washer is on" is a fact about the machine that anybody standing
-    in the utility room can see, so it is not somebody's private information and
-    the anonymous board may show it. A guess is the opposite on both counts.
-
-    Nothing produces this yet — live occupancy is Phase 4, derived from
-    coordinator state on each render and never stored, so that it vanishes the
-    moment the load ends. It is accepted here now so the renderer is already the
-    one that will draw it.
+    Derived by the assistant from the live session window. No viewer gate,
+    unlike :func:`expected_cells`: a running washer is not private information.
     """
     if not isinstance(running, (list, tuple, set, frozenset)):
         return []
@@ -695,48 +484,22 @@ def running_cells(running) -> list[str]:
     return keys
 
 
-# The most cells one live load may black out. A wash is one slot; a wash then a
-# dry, started late and crossing midnight, is a plausible three. Past that the
-# input is not a load, it is a stuck session — and the failure mode matters: a
-# wedged tracker would paint ``*`` across days of everybody's grid, which is
-# both wrong and unfalsifiable from the outside, because the one thing ``*``
-# claims is that the machine is busy *right now*. Phase 1 fixed the 12-hour hang
-# that made this likely; the cap is what stops the next such bug reaching the
-# display at all. Clamped rather than dropped: a load that really is running
-# should still show its first few slots.
+# The most cells one live load may black out. Past this the input is a stuck
+# session, not a load — a wedged tracker must not paint ``*`` across days of
+# everybody's grid. Clamped rather than dropped, so a real long load still
+# shows its first few slots.
 MAX_RUNNING_CELLS = 4
 
 
 def cells_between(start, end) -> list[str]:
-    """The cells a load running from ``start`` to ``end`` actually occupies.
-
-    Both are ``datetime``s in local time, and the caller owns the clock as
-    everywhere else in this module. Returns cell keys in chronological order,
-    capped at :data:`MAX_RUNNING_CELLS`.
-
-    Half-open at the end, matching :data:`SLOT_WINDOWS`: a load finishing at
-    exactly 16:00 occupied PM for no time at all and does not light it up.
-    Hours that fall in no slot (00:00-06:00) contribute nothing, so an overnight
-    dry lights Eve and then the next morning's AM with the dead hours simply
-    absent — which is what the machine was actually doing.
-
-    A missing or unparseable end (no ETA yet) yields **just the starting cell**
-    rather than nothing: "the washer is on now" is the fact worth drawing, and
-    guessing how long it will run is exactly the guess this glyph must not make.
-
-    A load that *starts* in the dead hours is the same case as one that passes
-    through them, and is treated the same way: the 05:00 start contributes no
-    cell of its own and the scan carries on into the morning, so a wash put on
-    before dawn still lights AM once 06:00 arrives. Returning early on a
-    slotless start — which is what this used to do — silently dropped ``*`` and
-    the "going right now" field for the whole life of that load, and only for
-    the six hours of the day where the *reason* it is missing is invisible.
-    """
+    """The cells a load running from ``start`` to ``end`` actually occupies. Local
+    ``datetime``s; caller owns the clock. Chronological order, capped at
+    :data:`MAX_RUNNING_CELLS`, half-open at the end. Hours in no slot (00:00-06:00)
+    contribute nothing. A missing/unparseable end yields just the starting cell, not
+    a guessed duration."""
     first = _cell_at(start)
-    # Not `if first is None: return []` — the starting hour may fall in the
-    # 00:00-06:00 gap while the load itself runs well past it. An empty list is
-    # still the right answer for a load that never leaves those hours, and it
-    # falls out of the scan below rather than being asserted up front.
+    # A slotless start (00:00-06:00) doesn't end the scan; it may still run
+    # into a real slot later.
     cells = [first] if first is not None else []
     try:
         span = (end - start).total_seconds()
@@ -744,8 +507,8 @@ def cells_between(start, end) -> list[str]:
         return cells
     if span <= 0:
         return cells
-    # Step by the shortest slot (4h) would skip nothing, but stepping hourly is
-    # simpler to reason about and costs at most ~24 iterations before the cap.
+    # Hourly steps are simpler than stepping by the shortest slot (4h) and
+    # cost at most ~24 iterations before the cap.
     hours = min(int(span // 3600) + 1, 24 * 7)
     for offset in range(1, hours + 1):
         try:
@@ -785,17 +548,8 @@ def _cell_at(moment) -> str | None:
 
 def days_ahead(cell, today, hour=None) -> int:
     """How many days until this cell next comes round. 0 is today, 7 is a week.
-
-    The grid repeats weekly, so every cell is always "coming up" — the only
-    question is how soon. A cell earlier in the week than today is next week's,
-    which is why this is modular rather than a subtraction.
-
-    ``hour`` closes the last gap: today's AM slot at 21:00 has already gone, and
-    calling it "today" would sort a slot nobody can still use above tomorrow's.
-    Given the hour, a slot whose window has already **ended** today is treated as
-    next week's — honest for a weekly repeating plan, and it is what stops
-    "Yours this week" opening with something that already happened.
-    """
+    Modular, since the grid repeats weekly. With ``hour``, a slot whose window has
+    already ended today counts as next week's rather than today's."""
     parsed = parse_cell(cell)
     if parsed is None or not is_weekday(today):
         return 99
@@ -811,11 +565,8 @@ def days_ahead(cell, today, hour=None) -> int:
 
 
 def cells_soonest_first(cells, today, hour=None) -> list[str]:
-    """Cell keys ordered by how soon each comes round, then by time of day.
-
-    With ``today=None`` this is plain Monday-first order, which is what the
-    stored form and every test that predates a clock expect.
-    """
+    """Cell keys ordered by how soon each comes round, then by time of day. With
+    ``today=None``, plain Monday-first order."""
     keys = [key for key in (normalise_cell(c) for c in cells or ()) if key]
     if not is_weekday(today):
         keys.sort(key=_cell_order)
@@ -825,44 +576,13 @@ def cells_soonest_first(cells, today, hour=None) -> list[str]:
 
 
 def cell_state(occupancy, cell, viewer_id=None, expected=None, running=None) -> str:
-    """Which of the six :data:`CELL_STATES` this cell is in, for this viewer.
-
-    The single precedence rule in the module. :func:`cell_char` is a lookup on
-    top of it, and so is the grid's button styling in :mod:`assistant` — one
-    question, one answer, and no second implementation to drift.
-
-    ``viewer_id=None`` is the shared board: no viewer, so no "yours" state and
-    no "expected" state, so the same string for everybody. That is the *only*
-    difference between the private grid and the pinned one, which is what keeps
-    them one renderer.
-
-    **Highest wins, in this order:**
-
-    1. ``█`` **yours.** What you came to check.
-    2. ``║`` **somebody else's, every week.** Above the one-off because it is
-       the more consequential of the two: a standing commitment is the one you
-       probably shouldn't plan around moving.
-    3. ``▒`` **somebody else's, this week.**
-    4. ``*`` **running right now.** Below all three bookings on purpose, and
-       this is the ordering worth arguing. Live occupancy is derived, ephemeral
-       and about the *machine*; a booking is a stated intention about the
-       *week*, it outlives the load, and it is the thing you can act on — you
-       can ask somebody to swap a booked slot, and there is nothing to ask of a
-       drum that is spinning. A cell that is both is better described by the
-       claim than by the noise, so the claim is what it draws.
-    5. ``?`` **the model's guess** — the viewer's own, never anybody else's.
-    6. ``·`` **free.**
-
-    **A real booking always beats a guess**, which follows from 1-3 sitting
-    above 5, and it is not a cosmetic choice. A booking is something a person
-    actually said; a prediction is the bot's arithmetic about somebody's past.
-    If a guess could hide a booking, the grid would answer "is Thursday evening
-    spoken for?" with the bot's opinion instead of the house's plans — and the
-    one job this display has is making real contention visible (§8). Being wrong
-    the other way costs nothing: a predicted cell that somebody then books
-    simply stops being a guess and starts being a fact. Putting ``*`` above
-    ``?`` extends the same rule — a guess never covers anything real.
-    """
+    """Which of the six :data:`CELL_STATES` this cell is in, for this viewer. The
+    single precedence rule in the module; :func:`cell_char` and the grid's button
+    styling look it up rather than re-deriving it. ``viewer_id=None`` is the shared
+    board: no "yours", no "expected" state. Highest wins: ``█`` yours, ``║`` other's
+    every week, ``▒`` other's this week, ``*`` running, ``?`` your own guess, ``·``
+    free. A booking always beats a guess — the grid must show real contention, not a
+    prediction."""
     held = holders(occupancy, cell)
     if held:
         if viewer_id is not None and str(viewer_id) in held:
@@ -878,54 +598,27 @@ def cell_state(occupancy, cell, viewer_id=None, expected=None, running=None) -> 
 
 
 def cell_char(occupancy, cell, viewer_id=None, expected=None, running=None) -> str:
-    """The one character this cell renders as, for this viewer.
-
-    A lookup of :data:`CELL_STATES` on :func:`cell_state`, which owns the
-    precedence rule and the argument for it.
-    """
+    """The one character this cell renders as, for this viewer. A lookup of
+    :data:`CELL_STATES` on :func:`cell_state`, which owns the precedence rule."""
     return CELL_STATES[cell_state(occupancy, cell, viewer_id, expected, running)]
 
 
 def render_grid(
     occupancy, viewer_id=None, expected=None, running=None, today=None
 ) -> str:
-    """The week, as a monospace block. Deterministic for a given input.
-
-    Renders **per viewer** — your cells are ``█``, everybody else's are ``▒`` or
-    ``║``, and that is all anyone learns. No name, and no count: "taken" is
-    taken, whether one person wants Thursday night or four (design doc P5 /
-    §11). Rendering differently for each viewer is exactly why the interactive
-    grid has to be ephemeral — one shared message can only have one rendering.
-
-    ``expected`` is the habit model's guess at **this viewer's own** usual days
-    (design doc §7), drawn as ``?`` on cells that are otherwise free. Passing
-    somebody else's cells here would be a §11 leak, so the guard is in
-    :func:`expected_cells` rather than in a comment: with no ``viewer_id`` there
-    is no prediction, full stop.
-
-    ``running`` is live occupancy, drawn as ``*`` — the cells the machine is
-    actually mid-load in (:func:`cells_between`).
-
-    ``today`` adds a ``▾`` over today's column, and it is the one thing that
-    turns this from a shape into a calendar: without it every column is equally
-    far away, and "is that free evening tonight or six days off?" needs counting
-    on fingers from a header two lines up. It is a *marker* rather than a
-    seventh cell state on purpose — it is a fact about the week, not about any
-    cell, so it must not compete with the alphabet for the reader's attention.
-    A weekday out of range, or None, simply draws no marker row.
-
-    ASCII and block characters only, and every line exactly
-    :data:`GRID_WIDTH` (26) characters, comfortably inside the ~30 a phone
-    shows before it wraps. The legend lives in :func:`render_legend` because it
-    belongs *outside* the code block, where emoji would be legal.
-    """
+    """The week, as a monospace block. Deterministic for a given input. Renders per
+    viewer — your cells are ``█``, everybody else's ``▒``/``║``, no name or count
+    either way. ``expected`` draws ``?`` on the viewer's own guessed cells only;
+    ``running`` draws ``*`` for cells mid-load; ``today`` marks today's column with
+    ``▾``. ASCII and block characters only, every line exactly :data:`GRID_WIDTH`
+    (26) chars so it doesn't wrap on a phone. Legend is separate since emoji are
+    fine outside the code block."""
     predicted = expected_cells(expected, viewer_id)
     live = running_cells(running)
     lines: list[str] = []
     if is_weekday(today):
-        # Over the *second* letter of the abbreviation, which is the column the
-        # cells below line up on — a marker over the first letter points
-        # convincingly at the gap between two days.
+        # Over the second letter of the day abbreviation, the column the
+        # cells below line up on.
         marker = [" "] * GRID_WIDTH
         marker[_LABEL_WIDTH + 1 + 3 * int(today) + 1] = "▾"
         lines.append("".join(marker))
@@ -947,28 +640,11 @@ def render_legend(
     standing: bool = False,
     running: bool = False,
 ) -> str:
-    """The key to the grid, for the line under the block.
-
-    ``personal=False`` drops "yours", because a shared message has no single
-    viewer and can never contain that state — and for the same reason it drops
-    ``? expected`` unconditionally, whatever ``expected`` says. The anonymous
-    board cannot render a prediction (:func:`expected_cells`), so a legend
-    promising one would be describing a state that board can never show. ``║``
-    has no such guard: a standing booking is a fact about a cell, so it can and
-    does appear on the shared board.
-
-    ``expected`` and ``standing`` are the *caller's* answer to "is this
-    character actually on the grid right now", not "does this feature exist":
-    with no confident prediction there is no ``?`` on the block, and a legend
-    entry for a character that isn't there reads as a bug in the renderer.
-    :func:`render_week` works both flags out from the grid it just drew, so no
-    caller has to.
-
-    ``running`` earns its entry the same way and is ungated by ``personal``:
-    the washer being mid-load is a fact about the machine that anybody in the
-    utility room can see, so the anonymous board may say it too. It shipped
-    defined-but-unlegended for exactly one release, while nothing produced it.
-    """
+    """The key to the grid, for the line under the block. ``personal=False`` drops
+    "yours" and "expected": the shared board has no viewer and can't show a
+    prediction. ``expected``/``standing`` mean "is this actually on the grid", not
+    "does the feature exist". ``running`` is ungated by ``personal`` — the washer
+    being on is visible to anyone."""
     parts = [f"{CELL_MINE} yours"] if personal else []
     parts.append(f"{CELL_TAKEN} taken")
     if standing:
@@ -982,16 +658,9 @@ def render_legend(
 
 
 class RenderedWeek(NamedTuple):
-    """A drawn grid plus what is actually on it.
-
-    The flags exist so that nothing has to ask the rendered string what it
-    contains. That used to be done by substring — ``CELL_EXPECTED in grid`` —
-    which reads as clever and is merely fragile: it silently couples the legend
-    and the explainer to the exact character the renderer happens to use this
-    month, and it goes wrong the instant a glyph turns up in a day label, a slot
-    label or a note. ``?`` would have done exactly that. Asking the renderer is
-    strictly better than reading its output back.
-    """
+    """A drawn grid plus what is actually on it. The flags mean nothing has to grep the
+    rendered string for a character (fragile if one ever turns up in a label instead
+    of a cell)."""
 
     grid: str
     legend: str
@@ -1003,12 +672,8 @@ class RenderedWeek(NamedTuple):
 def render_week(
     occupancy, viewer_id=None, expected=None, running=None, today=None
 ):
-    """The grid, its matching legend, and which states are on it.
-
-    One call, so the legend can never describe a different grid from the one
-    beside it. ``running`` is reported and, once something produces it, legended
-    — see :func:`render_legend`.
-    """
+    """The grid, its matching legend, and which states are on it. One call, so the
+    legend can never describe a different grid than the one beside it."""
     predicted = expected_cells(expected, viewer_id)
     live = running_cells(running)
     states = {
@@ -1041,28 +706,10 @@ def render_windows() -> str:
 
 
 def describe_cells(occupancy, viewer_id, today=None, hour=None) -> str | None:
-    """One person's own cells — "Th Eve (every week) · Su AM", or None.
-
-    Only ever called with the viewer's own id, and only ever rendered back to
-    that same person: it names *cells*, never people, so it cannot leak. None
-    when they have nothing down, so the caller can drop the line entirely.
-
-    **This is where the viewer's own cadence lives.** Their standing slots get
-    ``(every week)`` in words rather than a seventh glyph on the grid: ``█``
-    already says "yours", a character that distinguishes your own standing slot
-    from your own one-off would be a third block weight to learn, and the answer
-    matters in a different place — when you are reading back what you have
-    actually committed to, not when you are scanning for a free evening.
-
-    **Ordered soonest first** when given the clock. Monday-first is the right
-    order for a *stored* list and the wrong one for a line somebody reads: on a
-    Friday it opened with Monday — a slot four days gone — and buried tonight's
-    at the end, so the one entry that could still be acted on was the hardest to
-    find. With ``hour`` as well, a slot whose window has already closed today
-    sorts round to next week rather than claiming to be today's news. Without
-    either it stays Monday-first, which is what the stored form and every test
-    that predates a clock expect.
-    """
+    """One person's own cells — "Th Eve (every week) · Su AM", or None. Only ever the
+    viewer's own id: names cells, never people. Standing slots get "(every week)" in
+    words rather than a seventh grid glyph. Ordered soonest first when given the
+    clock; without ``today`` it stays Monday-first."""
     if viewer_id is None:
         return None
     mine = cells_soonest_first(

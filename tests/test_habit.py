@@ -1,9 +1,8 @@
 """Tests for the pure habit model.
 
-Runnable with plain ``python3 tests/test_habit.py`` — no pytest / Home
-Assistant, mirroring ``tests/test_plan.py``, ``tests/test_people.py`` and
-``tests/test_queue.py``. ``habit.py`` is loaded by file path so importing it
-does not pull in the package ``__init__`` (which imports Home Assistant).
+Runnable with plain python3, no pytest or Home Assistant. Loaded by file
+path so importing it does not pull in the package __init__ (which imports
+Home Assistant).
 """
 
 from __future__ import annotations
@@ -32,9 +31,8 @@ def _load(name: str, filename: str):
 
 
 _plan = _load("ld_plan", "plan.py")
-# habit.py imports its sibling for the slot windows and the ISO week. Loaded by
-# file path there is no package to be relative to, so it falls back to a bare
-# ``import plan`` — put the module just loaded where that will find it.
+# habit.py does a bare `import plan` (no package to be relative to when
+# loaded by file path); register it here so that import finds it.
 sys.modules["plan"] = _plan
 _habit = _load("ld_habit", "habit.py")
 
@@ -95,9 +93,8 @@ record_nudge = _habit.record_nudge
 
 THU_EVE = "3-eve"
 
-# A fixed offset rather than a named zone: the module never reads the clock, so
-# the tests never need a DST transition, and exact arithmetic is what makes the
-# 90-day and 4-week boundaries assertable to the second.
+# A fixed offset, not a named zone: no DST transitions, so day/week
+# boundaries are assertable to the second.
 TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 
@@ -114,8 +111,8 @@ def _loads(*moments, user_id="1", history=None) -> list[dict]:
     return rows
 
 
-# 2026-08-03 is a Monday, so these are Thursdays. Five Thursday-evening loads
-# and three scattered ones: the §7.3 example, "5 of your last 8 loads".
+# 2026-08-03 is a Monday, so these are Thursdays: five Thursday-evening loads
+# plus three scattered ones (the "5 of your last 8 loads" example).
 THURSDAYS = (at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23), at(2026, 7, 30),
              at(2026, 8, 6))
 SCATTERED = (at(2026, 7, 11, 9), at(2026, 7, 20, 17), at(2026, 8, 2, 13))
@@ -132,8 +129,7 @@ def _regular() -> list[dict]:
 
 
 def test_a_moment_maps_to_the_grids_own_cell() -> None:
-    # The model and the grid must agree about what Thursday evening is, so this
-    # is plan's slot window and plan's weekday, not a second copy of them.
+    # Uses plan's own slot window and weekday, not a re-implementation of them.
     moment = at(2026, 8, 6, 21)
     assert bucket_for(moment) == THU_EVE
     assert bucket_for(moment) == _plan.cell_key(
@@ -143,8 +139,7 @@ def test_a_moment_maps_to_the_grids_own_cell() -> None:
     assert bucket_for(at(2026, 8, 6, 13)) == "3-mid"
     assert bucket_for(at(2026, 8, 6, 17)) == "3-pm"
     assert bucket_for(at(2026, 8, 9, 21)) == "6-eve"  # Sunday
-    # 00:00-06:00 belongs to no slot; a 3am wash is real but not a habit the
-    # grid can show.
+    # 00:00-06:00 has no slot: real but not something the grid can show.
     assert bucket_for(at(2026, 8, 6, 3)) is None
     # A date has no time of day, so it cannot be a load.
     assert bucket_for(datetime.date(2026, 8, 6)) is None
@@ -163,7 +158,7 @@ def test_a_claim_becomes_one_history_row() -> None:
     assert history == [
         {"ts": at(2026, 8, 6, 21).timestamp(), "user_id": "12345", "cell": THU_EVE}
     ]
-    # The shape has nowhere to put a name — §11 as a property of the data.
+    # The stored shape has nowhere to put a name.
     assert set(history[0]) == {"ts", "user_id", "cell"}
     assert load_record(None, at(2026, 8, 6)) is None
     assert load_record("", at(2026, 8, 6)) is None
@@ -172,13 +167,13 @@ def test_a_claim_becomes_one_history_row() -> None:
 
 
 def test_monitoring_off_writes_nothing_at_all() -> None:
-    # Design doc §11 / §5.2: the bot stops logging that person entirely. This
-    # is the one failure here that cannot be undone by a later fix.
+    # monitor=False means no record exists, not one filtered later - the one
+    # failure here a later fix cannot undo.
     history = _loads(at(2026, 7, 9))
     assert record_load(history, "1", at(2026, 7, 16), monitor=False) == history
     assert record_load([], "1", at(2026, 7, 16), monitor=False) == []
-    # Anything that is not exactly True is not consent: a half-written record
-    # holding "false" is truthy, and reading it as True would log an opt-out.
+    # Only exactly True is consent; a truthy string like "false" must not be
+    # read as opt-in.
     for not_consent in ("false", "yes", 1, None, [], {}):
         assert record_load(history, "1", at(2026, 7, 16), monitor=not_consent) == (
             history
@@ -186,8 +181,7 @@ def test_monitoring_off_writes_nothing_at_all() -> None:
 
 
 def test_the_same_load_claimed_twice_is_one_load() -> None:
-    # Unclaim then reclaim is a real pair of buttons on the live card, and a
-    # cycle is 4-5 hours, so two claims inside an hour are one load.
+    # Two claims within an hour (well under a 4-5h cycle) are one load.
     history = _loads(at(2026, 7, 9, 21, 0))
     assert len(record_load(history, "1", at(2026, 7, 9, 21, 30), monitor=True)) == 1
     assert len(record_load(history, "1", at(2026, 7, 9, 22, 30), monitor=True)) == 2
@@ -211,9 +205,8 @@ def test_history_prunes_at_ninety_days() -> None:
 
 
 def test_a_clock_that_jumps_backwards_does_not_delete_history() -> None:
-    # An unsynced RTC that corrects minutes after boot is the realistic version
-    # of "a row is in the future". Ageing is one-sided so that write cannot
-    # take every real row with it; HISTORY_MAX is what bounds junk instead.
+    # An unsynced RTC boot clock is the realistic "future row". Ageing is
+    # one-sided so one bad write can't take every real row with it.
     history = _regular()
     unsynced = record_load(history, "1", at(1970, 1, 1, 9), monitor=True)
     assert len(unsynced) == len(history) + 1
@@ -242,8 +235,8 @@ def test_history_is_capped_so_it_can_never_grow_without_bound() -> None:
 
 
 def test_an_unreadable_moment_prunes_nothing_by_age() -> None:
-    # Deleting somebody's history because the clock was briefly unreadable is
-    # unrecoverable; keeping it for one more write is not.
+    # Deleting history over a briefly-unreadable clock is unrecoverable;
+    # keeping it one more write is not.
     history = _loads(at(2026, 1, 1), at(2026, 5, 4))
     assert prune_history(history, None) == normalise_history(history)
     assert record_load(history, "1", None, monitor=True) == history
@@ -275,10 +268,8 @@ def test_a_junk_history_normalises_to_nothing() -> None:
 
 
 def test_a_stopped_load_is_removed_from_history() -> None:
-    # A Claim tap is logged the moment it happens, so a load stopped on the
-    # machine an hour later already has its row. A cancel is not a wash, and
-    # leaving it in would drag this person's predicted times toward a load
-    # they never ran.
+    # A cancel isn't a wash; leaving its already-logged row in would drag
+    # predicted times toward a load that never happened.
     claimed = at(2026, 8, 6, 21)
     history = _loads(at(2026, 7, 30), claimed)
     assert load_count(history, "1") == 2
@@ -288,9 +279,7 @@ def test_a_stopped_load_is_removed_from_history() -> None:
 
 
 def test_retracting_a_load_cannot_reach_an_earlier_real_one() -> None:
-    # The window is the whole safety of this: it is the stopped load's own
-    # session, so last Thursday's real wash — and one from earlier the same
-    # evening — are outside it and survive.
+    # The window is the stopped load's own session; real washes outside survive.
     earlier = at(2026, 8, 6, 19)
     claimed = at(2026, 8, 6, 21)
     history = _loads(at(2026, 7, 30), earlier, claimed)
@@ -314,8 +303,7 @@ def test_retracting_a_load_touches_nobody_else() -> None:
 
 
 def test_the_window_is_inclusive_at_both_ends() -> None:
-    # A load claimed the instant the card appears lands on the same second as
-    # the session start.
+    # A claim can land the same second the session starts.
     moment = at(2026, 8, 6, 21)
     history = _loads(moment)
     assert forget_load(history, "1", moment.timestamp(), moment.timestamp()) == []
@@ -325,8 +313,8 @@ def test_the_window_is_inclusive_at_both_ends() -> None:
 
 
 def test_an_unusable_retraction_removes_nothing() -> None:
-    # The dangerous direction is deleting real history because of a bad
-    # argument, so anything unreadable is a no-op — not a guess.
+    # The dangerous direction is deleting real history, so a bad argument is
+    # a no-op, not a guess.
     history = _regular()
     normalised = normalise_history(history)
     now = NOW.timestamp()
@@ -341,16 +329,14 @@ def test_an_unusable_retraction_removes_nothing() -> None:
 
 
 def test_a_retraction_that_matches_nothing_changes_nothing() -> None:
-    # The caller compares before saving, so "no row was in that window" has to
-    # come back equal — otherwise every cancel would cost a Store write.
+    # Must equal the input, or a no-op cancel costs a Store write.
     history = _regular()
     assert forget_load(history, "9", 0, NOW.timestamp()) == history
     assert forget_load(history, "1", NOW.timestamp(), NOW.timestamp() + 3600) == history
 
 
 def test_a_retracted_load_stops_voting_on_the_prediction() -> None:
-    # The point of all of this: the model that drives every nudge must not
-    # learn a time from a cycle somebody cancelled.
+    # The model must not learn a time from a cancelled cycle.
     history = _regular()
     stopped = at(2026, 8, 13, 9)  # a Thursday morning that never actually ran
     history = record_load(history, "1", stopped, monitor=True)
@@ -365,10 +351,8 @@ def test_a_retracted_load_stops_voting_on_the_prediction() -> None:
 
 
 def test_ids_still_match_after_a_json_round_trip() -> None:
-    # HA's Store serialises to JSON, so the id is written as a string and the
-    # next tap arrives as interaction.user.id, an int. A mismatch would split
-    # one human's histogram across two spellings and the model would simply
-    # never get confident — silently, which is the worst kind.
+    # JSON round-trips ids as strings but a Discord interaction's id is an
+    # int; a mismatch would silently split one person's histogram in two.
     history = []
     for moment in sorted(THURSDAYS + SCATTERED):
         history = record_load(history, 12345, moment, monitor=True)
@@ -384,7 +368,7 @@ def test_ids_still_match_after_a_json_round_trip() -> None:
     assert {row["user_id"] for row in grown} == {"12345"}
 
 
-# --- the confidence gate (design doc §7.2) ----------------------------------
+# --- the confidence gate ----------------------------------------------------
 
 
 def test_a_real_habit_is_predicted_and_explains_itself() -> None:
@@ -393,7 +377,6 @@ def test_a_real_habit_is_predicted_and_explains_itself() -> None:
     assert guess["cell"] == THU_EVE
     assert (guess["weekday"], guess["slot"]) == (3, "eve")
     assert (guess["count"], guess["total"]) == (5, 8)
-    # The exact sentence §7.3 shows.
     assert explain(guess) == "5 of your last 8 loads"
     assert describe_prediction(guess) == "Thursday evenings"
     assert predicted_cells(history, "1", NOW) == [THU_EVE]
@@ -405,8 +388,7 @@ def test_a_real_habit_is_predicted_and_explains_itself() -> None:
 
 
 def test_too_few_observations_alone_vetoes_the_prediction() -> None:
-    # Two loads, both Thursday evening, over five weeks: the share and the span
-    # are fine, so only the observation count can be saying no.
+    # Share and span are both fine here; only the observation count can veto.
     history = _loads(at(2026, 7, 2), at(2026, 8, 6))
     stats = bucket_stats(history, "1", THU_EVE, NOW)
     assert stats["count"] == MIN_OBSERVATIONS - 1
@@ -422,26 +404,26 @@ def test_too_few_observations_alone_vetoes_the_prediction() -> None:
 
 
 def test_too_small_a_share_alone_vetoes_the_prediction() -> None:
-    # Three Thursday evenings — enough observations — but eight other loads
-    # spread over four other buckets, so they wash whenever.
+    # Enough Thursday-evening observations, but diluted by loads spread
+    # across other buckets.
     others = (
-        at(2026, 7, 13, 9), at(2026, 7, 20, 9),  # Mon AM
-        at(2026, 7, 14, 13), at(2026, 7, 21, 13),  # Tue Mid
-        at(2026, 7, 11, 17), at(2026, 7, 18, 17),  # Sat PM
-        at(2026, 7, 12), at(2026, 7, 19),  # Sun Eve
+        at(2026, 7, 13, 9), at(2026, 7, 20, 9),
+        at(2026, 7, 14, 13), at(2026, 7, 21, 13),
+        at(2026, 7, 11, 17), at(2026, 7, 18, 17),
+        at(2026, 7, 12), at(2026, 7, 19),
     )
     thursdays = (at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23))
     history = _loads(*sorted(thursdays + others))
     stats = bucket_stats(history, "1", THU_EVE, NOW)
-    assert (stats["count"], stats["total"]) == (3, 11)  # 27%
+    assert (stats["count"], stats["total"]) == (3, 11)
     assert stats["gates"] == {
         GATE_OBSERVATIONS: True,
         GATE_SHARE: False,
         GATE_WEEKS: True,
     }
     assert predict(history, "1", NOW) is None
-    # Exactly at the threshold it is a habit: 3 of 10 is 30%. Integer maths, so
-    # the boundary is not decided by binary rounding.
+    # Exactly at threshold (3/10 = 30%); integer maths avoids float rounding
+    # at the boundary.
     ten = _loads(*sorted(thursdays + others[:-1]))
     stats = bucket_stats(ten, "1", THU_EVE, NOW)
     assert stats["count"] * 100 == stats["total"] * MIN_SHARE_PERCENT
@@ -449,8 +431,7 @@ def test_too_small_a_share_alone_vetoes_the_prediction() -> None:
 
 
 def test_too_little_history_alone_vetoes_the_prediction() -> None:
-    # Four loads, all Thursday evening, so the count and the share are as
-    # strong as they can be. Only the span is short.
+    # Count and share are maxed out; only the four-week span is short.
     history = _loads(*THURSDAYS[:4])
     one_minute_short = at(2026, 8, 6, 20, 59)
     stats = bucket_stats(history, "1", THU_EVE, one_minute_short)
@@ -485,8 +466,8 @@ def test_silence_is_the_default_for_a_stranger() -> None:
 
 
 def test_a_load_in_no_slot_still_counts_toward_the_total() -> None:
-    # A 3am wash votes for no weekday but they still did it, so it stays in the
-    # denominator. Being wrong in the direction of silence is the right way.
+    # A load in no slot still counts in the denominator - wrong toward
+    # silence is the safe direction.
     history = _loads(at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23),
                      at(2026, 7, 26, 3))
     assert bucket_counts(history, "1") == {THU_EVE: 3}
@@ -495,12 +476,11 @@ def test_a_load_in_no_slot_still_counts_toward_the_total() -> None:
 
 
 def test_at_most_three_buckets_can_ever_be_confident() -> None:
-    # 30% each leaves no room for a fourth, which is what stops a "prediction"
-    # being a shrug that covers the whole week.
+    # 30% each leaves no room for a fourth bucket to also clear the gate.
     history = _loads(*sorted((
-        at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23),  # Thu Eve
-        at(2026, 7, 12, 9), at(2026, 7, 19, 9), at(2026, 7, 26, 9),  # Sun AM
-        at(2026, 7, 13, 9), at(2026, 7, 20, 9), at(2026, 7, 27, 9),  # Mon AM
+        at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23),
+        at(2026, 7, 12, 9), at(2026, 7, 19, 9), at(2026, 7, 26, 9),
+        at(2026, 7, 13, 9), at(2026, 7, 20, 9), at(2026, 7, 27, 9),
     )))
     found = predicted_cells(history, "1", NOW)
     assert found == ["0-am", THU_EVE, "6-am"]  # tied counts, day-then-slot order
@@ -509,12 +489,11 @@ def test_at_most_three_buckets_can_ever_be_confident() -> None:
     assert predicted_cells(history, "1", NOW) == found
 
 
-# --- explanation (design doc §7.3 / P4) -------------------------------------
+# --- explanation -------------------------------------------------------------
 
 
 def test_the_numbers_are_available_even_when_there_is_no_guess() -> None:
-    # P4: the guesses are visible and correctable, which means the UI has to be
-    # able to say why there is *no* guess as well as why there is one.
+    # The UI must be able to say why there is no guess, not just why there is one.
     history = _loads(at(2026, 7, 2), at(2026, 8, 6))
     stats = bucket_stats(history, "1", THU_EVE, NOW)
     assert stats["confident"] is False
@@ -543,7 +522,7 @@ def test_a_bucket_describes_itself_in_prose() -> None:
     assert describe_prediction({}) is None
 
 
-# --- corrections (design doc §7.3) ------------------------------------------
+# --- corrections --------------------------------------------------------------
 
 
 def test_saying_the_guess_is_wrong_retires_it() -> None:
@@ -561,9 +540,9 @@ def test_saying_the_guess_is_wrong_retires_it() -> None:
 
 
 def test_only_real_washing_brings_a_retired_guess_back() -> None:
-    # Being told "no" and then arguing from the same data would be the model
-    # learning from itself with extra steps, so the correction resets the
-    # evidence clock and the loads it vetoed never vote again.
+    # Re-predicting from the same data the correction vetoed would be the
+    # model arguing with itself; the clock resets and those loads never vote
+    # again.
     history = _regular()
     corrections = mark_prediction_wrong([], "1", THU_EVE, NOW)
     history = _loads(at(2026, 8, 13), at(2026, 8, 20), at(2026, 8, 27),
@@ -577,9 +556,8 @@ def test_only_real_washing_brings_a_retired_guess_back() -> None:
 
 
 def test_a_pushed_nudge_is_not_the_model_being_wrong() -> None:
-    # §7.3 is exact about this: the day was right, they just aren't doing it
-    # tonight. Counting it as a miss would train the model out of every correct
-    # guess anyone was ever too busy to act on.
+    # The day was right; they just didn't act tonight. Counting that as a miss
+    # would train out every correct guess anyone was ever too busy for.
     history = _regular()
     before = predict(history, "1", NOW)
     corrections = mark_nudge_pushed([], "1", THU_EVE, NOW)
@@ -613,12 +591,11 @@ def test_a_junk_correction_store_normalises_to_nothing() -> None:
     )
 
 
-# --- the model never learns from itself (design doc §7.3) -------------------
+# --- the model never learns from itself ---------------------------------------
 
 
 def test_predicting_and_nudging_can_never_add_to_history() -> None:
-    # Structural, not documented: record_load is the only writer, and nothing
-    # in the guess/nudge/push cycle can reach it.
+    # record_load is the only writer; the guess/nudge/push cycle can't reach it.
     history = _regular()
     snapshot = json.dumps(history, sort_keys=True)
     corrections: list = []
@@ -632,8 +609,7 @@ def test_predicting_and_nudging_can_never_add_to_history() -> None:
     assert json.dumps(history, sort_keys=True) == snapshot
     assert predict(history, "1", NOW, corrections) == guess
     assert load_count(history, "1") == 8
-    # The nudge accounting's whole vocabulary is timestamps and counters: there
-    # is nowhere in it for an observation to hide.
+    # Only timestamps and counters here - nowhere for an observation to hide.
     assert set(record_nudge({}, NOW)) == {
         "last_nudge_ts",
         "nudge_day",
@@ -646,7 +622,7 @@ def test_predicting_and_nudging_can_never_add_to_history() -> None:
                       "1") == 9
 
 
-# --- the nudge budget (design doc P2) ---------------------------------------
+# --- the nudge budget -----------------------------------------------------
 
 
 def test_one_nudge_a_day() -> None:
@@ -676,7 +652,7 @@ def test_two_nudges_a_week() -> None:
     allowed, after = claim_nudge(budget, at(2026, 8, 5, 18))
     assert (allowed, after) == (False, budget)
     # Still denied on the last day of the week...
-    assert check_nudge(budget, at(2026, 8, 9, 18)) == BUDGET_WEEK  # Sunday
+    assert check_nudge(budget, at(2026, 8, 9, 18)) == BUDGET_WEEK
     # ...and the following Monday starts over with one, not three.
     allowed, rolled = claim_nudge(budget, at(2026, 8, 10, 18))
     assert allowed is True
@@ -685,21 +661,19 @@ def test_two_nudges_a_week() -> None:
 
 
 def test_the_week_rolls_on_the_iso_week_not_the_calendar_year() -> None:
-    # The boundary that bites: 2027-01-01 is a Friday of ISO week 2026-W53. A
-    # week counter keyed on the calendar year would hand everybody a fresh
-    # allowance on New Year's Day, which is exactly the week nobody wants two
-    # extra DMs.
+    # 2027-01-01 is a Friday still in ISO week 2026-W53; keying the counter on
+    # the calendar year would reset everyone's budget on New Year's Day.
     budget: dict = {}
-    allowed, budget = claim_nudge(budget, at(2026, 12, 31, 18))  # Thu, W53
+    allowed, budget = claim_nudge(budget, at(2026, 12, 31, 18))
     assert allowed is True
-    allowed, budget = claim_nudge(budget, at(2027, 1, 1, 18))  # Fri, still W53
+    allowed, budget = claim_nudge(budget, at(2027, 1, 1, 18))
     assert allowed is True
     assert budget["nudge_week"] == "2026-W53"
     assert budget["nudges_this_week"] == 2
-    assert check_nudge(budget, at(2027, 1, 2, 18)) == BUDGET_WEEK  # Sat, W53
+    assert check_nudge(budget, at(2027, 1, 2, 18)) == BUDGET_WEEK
     allowed, after = claim_nudge(budget, at(2027, 1, 2, 18))
     assert (allowed, after) == (False, budget)
-    assert nudges_this_week(budget, at(2027, 1, 3, 18)) == 2  # Sun, still W53
+    assert nudges_this_week(budget, at(2027, 1, 3, 18)) == 2
     # Monday 2027-01-04 is 2027-W01: now it resets.
     allowed, rolled = claim_nudge(budget, at(2027, 1, 4, 18))
     assert allowed is True
@@ -709,16 +683,14 @@ def test_the_week_rolls_on_the_iso_week_not_the_calendar_year() -> None:
 def test_the_day_window_is_the_calendar_day_not_a_rolling_24_hours() -> None:
     _allowed, budget = claim_nudge({}, at(2026, 8, 3, 23, 30))
     assert nudges_today(budget, at(2026, 8, 3, 23, 59)) == 1
-    # Half an hour later it is a different day, and the day cap has reset even
-    # though far less than 24 hours have passed. "One a day" is what a person
-    # experiences, not a sliding window they cannot see.
+    # A new calendar day resets the cap even under 24h - "daily" means the
+    # calendar, not a rolling window.
     assert nudges_today(budget, at(2026, 8, 4, 0, 1)) == 0
     assert check_nudge(budget, at(2026, 8, 4, 0, 1)) == BUDGET_OK
 
 
 def test_an_unreadable_moment_denies_rather_than_sends() -> None:
-    # If we cannot count it we cannot cap it, and the safe direction for a
-    # message budget is always "don't send".
+    # Can't count it, can't cap it - the safe default is always "don't send".
     assert check_nudge({}, None) == BUDGET_UNREADABLE
     assert check_nudge({}, "Tuesday") == BUDGET_UNREADABLE
     allowed, after = claim_nudge({}, None)
@@ -737,8 +709,8 @@ def test_the_budget_survives_a_json_round_trip_and_a_junk_store() -> None:
     assert normalise_budget({"nudges_this_week": -3})["nudges_this_week"] == 0
     assert normalise_budget({"nudge_week": 32})["nudge_week"] is None
     assert normalise_budget({"last_nudge_ts": "x"})["last_nudge_ts"] is None
-    # §12's older shape has no week key, so it reads as a fresh week: one extra
-    # permitted nudge at upgrade time and no lost messages.
+    # An older stored shape with no week key reads as a fresh week: one extra
+    # nudge at upgrade, never a lost message.
     legacy = {"last_nudge_ts": 1754000000, "nudges_this_week": 1}
     assert nudges_this_week(legacy, at(2026, 8, 3, 18)) == 0
     assert check_nudge(legacy, at(2026, 8, 3, 18)) == BUDGET_OK
@@ -761,7 +733,7 @@ def test_the_budget_mapping_collapses_int_and_string_keys() -> None:
     assert budget_for({}, 1) == normalise_budget(None)
 
 
-# --- privacy (design doc §11 / P5) ------------------------------------------
+# --- privacy ------------------------------------------------------------------
 
 
 def test_no_output_can_name_or_count_another_person() -> None:
@@ -790,17 +762,16 @@ def test_no_output_can_name_or_count_another_person() -> None:
     blob = json.dumps(outputs)
     assert theirs not in blob
     assert "name" not in blob
-    # Their correction cannot retire this person's guess, and their four loads
-    # cannot dilute this person's share.
+    # Their correction can't retire this person's guess, nor their loads
+    # dilute this person's share.
     assert predict(history, mine, NOW, corrections)["cell"] == THU_EVE
     assert stats["total"] == 8  # theirs, not the household's 12
     assert len(normalise_history(history)) == 12
 
 
 def test_every_read_of_history_is_scoped_to_one_person() -> None:
-    # There is no household aggregate to accidentally render: the only two
-    # functions that take a history without a user_id are shape operations that
-    # return rows, never counts.
+    # No function may aggregate across the household; the only two that take a
+    # history without a user_id are shape ops that return rows, never counts.
     shape_only = {"normalise_history", "prune_history"}
     for name, function in sorted(vars(_habit).items()):
         if name.startswith("_") or not inspect.isfunction(function):
@@ -825,8 +796,7 @@ def test_forgetting_a_person_removes_only_them() -> None:
 
 
 def test_nothing_mutates_the_data_it_is_given() -> None:
-    # The caller assigns the result and then saves; a rejected write must not
-    # have already changed the in-memory model.
+    # The caller assigns and saves; nothing here may mutate its input first.
     history = _regular()
     corrections = mark_prediction_wrong([], "1", "0-am", NOW)
     budgets = {"1": normalise_budget(None)}
@@ -860,9 +830,8 @@ def test_a_read_is_never_a_window_onto_the_store() -> None:
 
 
 def test_a_dormant_household_is_not_predicted_at_from_expired_history() -> None:
-    # Pruning only happens on a write, so a house that stops claiming for a
-    # season never rewrites its store. The read side has to apply the same
-    # 90-day window or the model keeps being confident about a year-old habit.
+    # Pruning only happens on write, so a dormant house never rewrites its
+    # store; reads must apply the same 90-day window or stay confident forever.
     history = _loads(at(2025, 7, 3), at(2025, 7, 10), at(2025, 7, 17),
                      at(2025, 7, 24), at(2025, 7, 31))
     later = at(2026, 7, 30, 12)
@@ -886,9 +855,8 @@ def test_a_stale_row_cannot_unlock_the_four_week_gate() -> None:
     history = _loads(at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23))
     now = at(2026, 7, 24, 12)
     assert predict(history, "1", now) is None
-    # One unsynced-RTC write later, the store holds a 1970 row (kept on
-    # purpose — ageing is one-sided). It must not stretch "how long have I been
-    # watching you" past four weeks and turn two weeks of data into a habit.
+    # A 1970 row from an unsynced clock is kept (ageing is one-sided), but must
+    # not stretch the four-week span and turn two real weeks into a habit.
     unsynced = record_load(history, "1", at(1970, 1, 1, 9), monitor=True)
     assert load_count(unsynced, "1") == 4  # retained in the store...
     assert history_weeks(unsynced, "1", now) < MIN_WEEKS  # ...but not counted
@@ -900,9 +868,9 @@ def test_a_stale_row_cannot_unlock_the_four_week_gate() -> None:
 
 
 def test_a_future_dated_row_does_not_disable_the_dedupe() -> None:
-    # A row dated ahead of now never ages out, and it sorts last. Dedupe that
-    # only looked at the newest row would compare against it forever, so
-    # Unclaim -> Reclaim would count twice for the rest of that person's life.
+    # A future-dated row sorts last and never ages out; dedupe that only
+    # checks the newest row would compare against it forever and
+    # double-count reclaims.
     junk = [{"ts": at(2027, 1, 1).timestamp(), "user_id": "1", "cell": THU_EVE}]
     history = record_load(junk, "1", at(2026, 7, 30, 21), monitor=True)
     history = record_load(history, "1", at(2026, 7, 30, 21, 10), monitor=True)
@@ -915,11 +883,9 @@ def test_a_future_dated_row_does_not_disable_the_dedupe() -> None:
 
 
 def test_a_naive_moment_is_refused_rather_than_guessed_at() -> None:
-    # utcnow() instead of dt_util.now() is the realistic slip, and it is the
-    # one bad input that does not look bad: the timestamp would be read in the
-    # process timezone while the bucket is read off the bare wall clock, so a
-    # 01:00 Friday wash in UTC+2 becomes a plausible Thursday-evening
-    # observation. Three of those clear the gate for a habit nobody has.
+    # A naive datetime (e.g. from utcnow()) reads its timestamp and its
+    # wall-clock bucket in different timezones, so it can manufacture a
+    # plausible but false habit. Refused outright rather than risking that.
     naive = datetime.datetime(2026, 8, 6, 21)
     assert moment_ts(naive) is None
     assert bucket_for(naive) is None
@@ -935,10 +901,9 @@ def test_a_naive_moment_is_refused_rather_than_guessed_at() -> None:
 
 
 def test_a_backwards_clock_cannot_refill_the_nudge_budget() -> None:
-    # An unsynced RTC after a restart reads a moment in the past. Comparing
-    # window keys for *inequality* would call that a different week and hand
-    # out a fresh allowance — the P2 cap failing open, which is the direction
-    # that ends with the bot muted.
+    # An unsynced RTC after restart can read a moment in the past; comparing
+    # week keys for inequality (not order) would wrongly hand out a fresh
+    # allowance.
     budget: dict = {}
     for day in (3, 4):
         allowed, budget = claim_nudge(budget, at(2026, 8, day, 18))
@@ -951,8 +916,7 @@ def test_a_backwards_clock_cannot_refill_the_nudge_budget() -> None:
     assert (allowed, after) == (False, budget)
     assert nudges_today(budget, stale) == 1
     assert nudges_this_week(budget, stale) == 2
-    # NTP corrects it minutes later and the scheduler fires again the same real
-    # evening: still the same spent week, so still no DM.
+    # NTP correcting minutes later doesn't change the spent week either.
     assert check_nudge(after, at(2026, 8, 5, 18, 35)) == BUDGET_WEEK
     assert claim_nudge(after, at(2026, 8, 6, 18, 30))[0] is False
     # The real Monday still resets, so a backwards excursion costs no messages.
@@ -961,20 +925,14 @@ def test_a_backwards_clock_cannot_refill_the_nudge_budget() -> None:
 
 
 # --- the wiring the assistant actually performs -----------------------------
-# habit.py is imported by exactly one module, and these assert the contract at
-# that seam: assistant.async_note_claim reads the person's monitor consent,
-# calls record_load with the local moment, and saves ONLY when the returned
-# list differs from the one it held. Everything below is that loop, so a change
-# to either side that broke it would fail here rather than in a store somebody
-# reads three months later.
+# habit.py has one caller: assistant.async_note_claim, which reads consent,
+# calls record_load, and saves only if the result changed. Tested here.
 
 
 class _FakeStore:
     """The assistant's write path, minus Home Assistant.
 
-    Holds history the way the real one does (normalised in memory, written back
-    only on a change) and counts the writes, because "no new per-tick Store
-    writes" is a property of the wiring rather than of habit.py.
+    Normalises in memory, writes back only on a change, and counts writes.
     """
 
     def __init__(self, history=None) -> None:
@@ -994,10 +952,8 @@ def test_the_wiring_writes_one_row_per_load_and_only_on_a_change() -> None:
     store = _FakeStore()
     store.note_claim(1, at(2026, 7, 9, 21))
     assert (len(store.history), store.writes) == (1, 1)
-    # Claim -> Unclaim -> Reclaim: one load, and crucially not a second store
-    # write either. Unclaim never reaches this path at all — only a claim is a
-    # data point (§7.1) — so the reclaim 30 minutes later is the tap that would
-    # otherwise double-count.
+    # Claim -> Unclaim -> Reclaim is one load and one write; the reclaim is
+    # the tap that would otherwise double-count.
     store.note_claim(1, at(2026, 7, 9, 21, 30))
     assert (len(store.history), store.writes) == (1, 1)
     # A second person's claim during the same load is a separate row.
@@ -1009,13 +965,11 @@ def test_the_wiring_writes_one_row_per_load_and_only_on_a_change() -> None:
 
 
 def test_the_wiring_never_writes_a_row_for_somebody_who_opted_out() -> None:
-    # §11: monitoring off means no record exists, not a record that is later
-    # filtered out. Nothing is written and nothing is saved.
+    # monitor=False means no record exists at all, not one filtered out later.
     store = _FakeStore()
     store.note_claim(1, at(2026, 7, 9, 21), monitor=False)
     assert (store.history, store.writes) == ([], 0)
-    # And with somebody else's history already present, the opt-out costs no
-    # write at all — the pruned list it gets back is the one it already had.
+    # With other history already present, the opt-out still costs no write.
     store.note_claim(2, at(2026, 7, 9, 21))
     before = store.writes
     store.note_claim(1, at(2026, 7, 10, 21), monitor=False)
@@ -1023,9 +977,8 @@ def test_the_wiring_never_writes_a_row_for_somebody_who_opted_out() -> None:
 
 
 def test_the_wiring_applies_the_ninety_day_cap_on_the_write_path() -> None:
-    # The retention has to be enforced where rows are added, or a store that is
-    # only ever appended to grows forever. record_load prunes in the same call,
-    # so the write that pushes a row past the window is the write that drops it.
+    # Retention must be enforced where rows are added, or an append-only store
+    # grows forever; record_load prunes in the same call that adds a row.
     old = at(2026, 1, 1, 21)
     store = _FakeStore([{"ts": old.timestamp(), "user_id": "1", "cell": THU_EVE}])
     assert len(store.history) == 1
@@ -1043,13 +996,9 @@ def test_the_wiring_applies_the_ninety_day_cap_on_the_write_path() -> None:
 
 
 def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> None:
-    # predictions() asks about every candidate cell, and the three inputs (this
-    # person's rows, their histogram, their span) are the same for all of them.
-    # Reading them per cell meant normalise_history rebuilding and re-sorting
-    # the WHOLE HOUSE's history ~84 times for one grid tap — a tenth of a
-    # second on x86, close to a second on a Pi, spent on HA's event loop inside
-    # a Discord interaction callback. This asserts the shape of the work, not a
-    # wall-clock time, because a timing assertion is a flaky test on a Pi.
+    # predictions() shares one read across every candidate cell; reading per
+    # cell meant re-normalising the whole house's history ~84 times per grid
+    # tap. Asserts the shape of the work, not wall-clock time (flaky on a Pi).
     history = []
     for user_id in ("1", "2", "3", "4", "5", "6"):
         for day in range(1, 80):
@@ -1069,9 +1018,8 @@ def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> Non
         reads = len(calls)
     finally:
         _habit.normalise_history = original
-    # One pass over the store, whatever the person's buckets look like. A
-    # generous ceiling rather than an exact 1, so a future refactor that reads
-    # it twice is fine and one that reads it per cell (there are 28) is not.
+    # A generous ceiling, not an exact 1: reading twice is fine, reading once
+    # per cell (28 of them) is not.
     assert reads <= 3, reads
     # ...and it is still the same answer bucket_stats gives one cell at a time.
     for stats in found:
@@ -1081,20 +1029,16 @@ def test_a_prediction_reads_the_stored_history_once_not_once_per_bucket() -> Non
 
 
 def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
-    """P4: a ? nobody can argue with is not a correctable guess.
+    """A drawn guess must be one the panel can name and Wrong can retire.
 
-    ``predictions`` can return up to three cells — at 30% a piece there is room
-    for exactly that — but the 🔮 panel renders ``predict`` (the top one) and
-    ❌ Wrong retires ``predict``. Drawing all three would put ? on cells the
-    panel cannot mention, and tapping Wrong about one of them would silently
-    discard a different guess. This is ``assistant._predicted_cells``.
+    predictions() can return up to three cells, but the panel renders and
+    retires only the top one (predict()). Tests assistant._predicted_cells.
     """
     mon_am = "0-am"
     sat_pm = "5-pm"
     history = _loads(
-        # 4 Thursday evenings, 3 Monday mornings, 3 Saturday early evenings:
-        # 4/10, 3/10 and 3/10, all clearing MIN_OBSERVATIONS and landing on or
-        # above the 30% share exactly, over five weeks.
+        # 4 Thu evenings, 3 Mon mornings, 3 Sat evenings - each clears the
+        # gate at or above 30% share.
         at(2026, 7, 2), at(2026, 7, 9), at(2026, 7, 16), at(2026, 7, 23),
         at(2026, 7, 6, 9), at(2026, 7, 13, 9), at(2026, 7, 20, 9),
         at(2026, 7, 4, 18), at(2026, 7, 11, 18), at(2026, 7, 18, 18),
@@ -1109,15 +1053,15 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
         return [guess["cell"]] if guess else []
 
     def panel(corrections):
-        """What the 🔮 panel says out loud — assistant._guess_embed."""
+        """What the panel names out loud - assistant._guess_embed."""
         guess = predict(history, "1", now, corrections)
         return guess["cell"] if guess else None
 
-    # Every cell drawn is one the panel names, so ❌ Wrong always acts on the
-    # the ? the person is actually looking at.
+    # Every drawn cell is one the panel names, so Wrong always acts on what's
+    # shown.
     assert rendered([]) == [panel([])] == [THU_EVE]
-    # ...and it keeps holding as guesses are retired one at a time: the next
-    # one down becomes both the drawn cell and the named one, together.
+    # Holds as guesses are retired one at a time: the next cell down is drawn
+    # and named together.
     corrections = mark_prediction_wrong([], "1", panel([]), now)
     assert rendered(corrections) == [panel(corrections)] == [mon_am]
     corrections = mark_prediction_wrong(corrections, "1", panel(corrections), now)
@@ -1126,7 +1070,7 @@ def test_the_grid_only_draws_a_guess_the_panel_can_name_and_retire() -> None:
     assert (rendered(corrections), panel(corrections)) == ([], None)
 
 
-# --- how often somebody washes (live-use design §3) --------------------------
+# --- how often somebody washes -----------------------------------------------
 def _at(days: float) -> datetime.datetime:
     """A moment ``days`` after a fixed Saturday, for cadence arithmetic."""
     return at(2026, 8, 1, 10) + datetime.timedelta(days=days)
@@ -1134,9 +1078,8 @@ def _at(days: float) -> datetime.datetime:
 
 
 def test_the_usual_gap_is_a_median_so_one_holiday_cannot_silence_a_month():
-    # A mean is the obvious choice and the wrong one. One fortnight away drags
-    # it past ten days, and the opportunity nudge then goes quiet for a week
-    # and a half for somebody who washes every Sunday.
+    # A mean is the obvious-but-wrong choice: one three-week gap drags it past
+    # ten days and silences the nudge for a week and a half.
     history = []
     for day in (0, 7, 14, 35, 42, 49):  # weekly, with one 21-day holiday
         history = _habit.record_load(history, "1", _at(day), monitor=True)
@@ -1153,8 +1096,8 @@ def test_the_usual_gap_is_a_median_so_one_holiday_cannot_silence_a_month():
 
 
 def test_a_cadence_guessed_from_too_little_is_no_cadence_at_all() -> None:
-    # Two gaps means three loads, the same evidence bar the day prediction
-    # uses. Below it the honest answer is None, and None sends nothing (P6).
+    # Two gaps (three loads) is the evidence bar; below it the honest answer
+    # is None, which sends nothing.
     now = _at(30)
     assert _habit.typical_gap([], "1", now) is None
     one = _habit.record_load([], "1", _at(0), monitor=True)
@@ -1167,23 +1110,23 @@ def test_a_cadence_guessed_from_too_little_is_no_cadence_at_all() -> None:
 
 
 def test_a_wash_and_its_dry_are_one_trip_not_two() -> None:
-    # At 4-5 hours a cycle, a wash claimed at 17:00 and its dry at 22:00 is one
-    # evening's laundry. Counting that five-hour gap as an interval would drag
-    # the median toward a few hours and leave everybody permanently "due".
+    # A wash and its dry, hours apart, are one evening's laundry; counting
+    # that gap as an interval would drag the median down and leave everyone
+    # "due".
     history = []
     for hours in (0, 5, 24 * 7, 24 * 7 + 5, 24 * 14):
         history = _habit.record_load(
             history, "1", _at(hours / 24), monitor=True
         )
-    assert len(history) == 5  # all five rows are kept; only the *gaps* filter
+    assert len(history) == 5  # all five rows are kept; only the gaps filter
     gaps = _habit.gaps_for(history, "1", _at(20))
-    # Only the two genuine week-long intervals survive; the two five-hour ones
-    # are gone, so the answer is "about a week" rather than "about five hours".
+    # Only the two week-long intervals survive, giving "about a week" not
+    # "about five hours".
     assert len(gaps) == 2
     assert all(gap >= _habit.MIN_GAP_DAYS for gap in gaps), gaps
     assert 6.5 < _habit.typical_gap(history, "1", _at(20)) < 7.0
-    # The one-hour dedupe is a different rule about a different thing: it drops
-    # a *duplicate row* from unclaim-then-reclaim, before any of this is asked.
+    # The one-hour dedupe is separate: it drops a duplicate row before gaps
+    # are even computed.
     twice = _habit.record_load(
         _habit.record_load([], "1", _at(0), monitor=True),
         "1", _at(0.02), monitor=True,
@@ -1192,9 +1135,8 @@ def test_a_wash_and_its_dry_are_one_trip_not_two() -> None:
 
 
 def test_being_due_is_measured_against_your_own_gap_and_nobody_elses() -> None:
-    # The whole point: the twice-a-week washer and the fortnightly one are both
-    # left alone until *they* are overdue, and a fixed threshold would be wrong
-    # for at least one of them.
+    # Each person is measured against their own gap; a fixed threshold would
+    # be wrong for at least one of a weekly and a fortnightly washer.
     weekly, fortnightly = [], []
     for day in (0, 7, 14, 21):
         weekly = _habit.record_load(weekly, "1", _at(day), monitor=True)

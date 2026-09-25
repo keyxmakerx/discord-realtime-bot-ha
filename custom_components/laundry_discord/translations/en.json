@@ -2,23 +2,32 @@
   "config": {
     "step": {
       "user": {
-        "title": "Laundry Discord Bot",
-        "description": "Connect a self-hosted Discord bot that watches your washer and posts a single, self-updating message per load. See the README for how to create the bot token and find the channel ID.",
+        "description": "Connect a Discord bot that watches your washer and posts one self-updating message per load. The README explains how to create the bot and find the channel ID.",
         "data": {
           "bot_token": "Discord bot token",
-          "channel_id": "Channel ID (numeric)",
-          "running_entity": "Washer running sensor (debounced on/off)",
-          "job_state_entity": "Washer job-state sensor",
-          "eta_entity": "Completion-time sensor (ISO timestamp)",
-          "machine_state_entity": "Machine-state sensor (run/pause/stop — for pause display + start consensus)",
-          "energy_entity": "Energy sensor (optional — shows kWh used on the done message)",
-          "water_entity": "Water-usage sensor (optional — shows usage on the done message)",
-          "wrinkle_entity": "Wrinkle-prevent 'active' sensor (optional — stops post-cycle tumbling from delaying 'done')",
+          "channel_id": "Channel ID",
+          "running_entity": "Washer running sensor",
+          "job_state_entity": "Job state sensor",
+          "eta_entity": "Completion time sensor",
+          "machine_state_entity": "Machine state sensor",
+          "energy_entity": "Energy sensor",
+          "water_entity": "Water sensor",
+          "wrinkle_entity": "Wrinkle-prevent sensor",
           "eta_interval": "ETA update interval",
-          "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
-          "energy_idle": "Energy-idle backstop — flat kWh for this long = done, used ONLY when the washer's own completion estimate is unavailable (an offline load) (minutes)",
-          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
-          "availability_grace": "Hold last ETA through a connection blip (minutes)"
+          "ping_claimant_on_complete": "Ping the claimant when done"
+        },
+        "data_description": {
+          "bot_token": "From the Bot tab of your application in the Discord Developer Portal.",
+          "channel_id": "Numeric ID of the channel to post in. With Developer Mode on, right-click the channel and choose Copy ID.",
+          "running_entity": "Binary sensor that is on while the washer runs.",
+          "job_state_entity": "Reports the wash phase (wash, rinse, spin, drying, finish).",
+          "eta_entity": "Timestamp of the washer's own estimated finish.",
+          "machine_state_entity": "Reports run, pause or stop. Used for the paused display and to notice a load stopped on the machine.",
+          "energy_entity": "Cumulative energy meter in kWh. Confirms loads and reports usage on the done message. Defaults to sensor.washer_energy.",
+          "water_entity": "Cumulative water meter, reported on the done message. Defaults to sensor.washer_water_consumption.",
+          "wrinkle_entity": "Binary sensor that is on during wrinkle-prevent tumbling, so it isn't mistaken for a load. Defaults to binary_sensor.washer_wrinkle_prevent_active.",
+          "eta_interval": "How often the live card's ETA and progress are refreshed.",
+          "ping_claimant_on_complete": "Mention whoever claimed the load when it finishes."
         }
       }
     },
@@ -32,39 +41,137 @@
   "options": {
     "step": {
       "init": {
-        "title": "Laundry Discord Bot options",
+        "description": "Detection timings and house-wide features. Saving reloads the integration, which briefly reconnects the bot.",
         "data": {
           "eta_interval": "ETA update interval",
-          "confirm_delay": "Confirm delay — how long a state must hold before acting (seconds)",
-          "energy_idle": "Energy-idle backstop — flat kWh for this long = done, used ONLY when the washer's own completion estimate is unavailable (an offline load) (minutes)",
-          "energy_load_jump": "Offline-load detection — energy jump this big (with no wash phase) = a load ran while offline (kWh)",
-          "ping_claimant_on_complete": "@mention whoever claimed the load when it's done",
-          "availability_grace": "Hold last ETA through a connection blip (minutes)",
-          "handoff_fallback": "Handoff backstop — ping whoever's next this long after a load finishes when the claimant never tapped \"Emptied it\" (minutes, 0 disables)",
-          "queue_expiry": "\"I'm next\" expiry — drop somebody from the line this long after they tapped it, so a stale line never strands a handoff (hours)",
-          "show_assistant": "Show the 🤖 assistant button on the card — opens a private panel with the first-time explainer and each person's ping settings (DM / channel / off). Off hides the button; anything already chosen in it keeps working.",
-          "learn_habits": "Learn the days each person washes — note the day and time of each 🧺 Claim, and mark the slots somebody usually uses with ? on their own week grid. Off by default. Nothing is ever shown to the channel and nobody sees anyone else's guesses; each person can also switch themselves off with 👁 Monitoring in the 🤖 panel.",
-          "remind_dms": "Send reminder DMs — the only setting that lets the bot decide, on its own, to message somebody who didn't tap anything first (the other one that can DM people is Swap requests below, and there a housemate is doing the asking). Off by default. It needs day-learning on as well, and it only ever DMs a person who chose 📬 DM in the 🤖 panel, left 🔮 guessing on, and has a confident prediction: max 1 DM per person per day, 2 per week, dropped rather than queued when over. The Sunday check-in carries a 🔕 Stop asking button; the day-of nudge carries 🚫 Skip this week, and 🤖 → 🔮 Stop guessing turns the lot off for good.",
-          "plan_dm_weekday": "Weekly plan DM — which day to ask people whether next week's guess looks right (nothing is sent to anyone the model isn't confident about)",
-          "plan_dm_time": "Weekly plan DM — what time of day to send it",
-          "trades": "Swap requests — let people ask each other for a slot. Tap a slot on 📅 your week that somebody else is down for and 🔁 asks them, anonymously, whether they'd trade it for one of yours. Off by default. The DM never says who is asking and never says whose slot it is; only ✅ accepting reveals the two names, and only to each other. Every guardrail is on: one ask per slot per person per week, a slot somebody was refused is shut to everyone until next week, 🚫 Don't ask me again is permanent for that pair, one ask in flight per person in each direction, you must hold a slot of your own to offer, unanswered asks lapse after 48h, and the recipient must have chosen 📬 DM in the 🤖 panel — all inside their 1-DM-a-day budget.",
-          "nudge_lead": "Slot heads-up lead — how long before the START of a slot somebody booked to ask whether they still want it. The message carries “Free it up”, so a slot that is about to lapse unused goes back to the house instead of blocking it. Only one message is ever sent per person per day, whichever trigger gets there first (minutes)"
+          "confirm_delay": "Confirm delay",
+          "energy_idle": "Flat-meter timeout",
+          "energy_load_jump": "Offline load threshold",
+          "ping_claimant_on_complete": "Ping the claimant when done",
+          "availability_grace": "ETA hold time",
+          "handoff_fallback": "Handoff backstop",
+          "queue_expiry": "Queue expiry",
+          "show_assistant": "Show the 🤖 assistant button",
+          "learn_habits": "Learn the days each person washes",
+          "remind_dms": "Send reminder DMs",
+          "plan_dm_weekday": "Weekly check-in day",
+          "plan_dm_time": "Weekly check-in time",
+          "nudge_lead": "Slot heads-up lead time",
+          "trades": "Swap requests"
+        },
+        "data_description": {
+          "eta_interval": "How often the live card's ETA and progress are refreshed.",
+          "confirm_delay": "How long a washer state change must hold before the bot acts on it. Filters out cloud flaps.",
+          "energy_idle": "Offline backstop: end a load once the energy meter has been flat this long. Only used when the washer's own finish estimate is unavailable.",
+          "energy_load_jump": "A single energy jump this large, with no wash phase reported, counts as a load that ran while the washer was offline.",
+          "ping_claimant_on_complete": "Mention whoever claimed the load when it finishes.",
+          "availability_grace": "Keep showing the last ETA for this long while the completion sensor is unavailable.",
+          "handoff_fallback": "Ping whoever is next this long after a claimed load finishes if nobody taps ✅ Emptied it. 0 disables the backstop.",
+          "queue_expiry": "Drop someone from the 🔜 line this long after they joined it.",
+          "show_assistant": "Adds a button to the card that opens a private panel with the explainer and each person's settings.",
+          "learn_habits": "Logs each Claim tap and marks a person's usual slots with ? on their own week grid. Nobody sees anyone else's guesses, and each person can opt out in the panel.",
+          "remind_dms": "Lets the bot DM people unprompted: a weekly check-in and a heads-up before a booked slot. Needs day-learning on and only reaches people who chose 📬 DM me. At most 1 DM per person per day and 2 per week.",
+          "plan_dm_weekday": "Day the weekly check-in is sent.",
+          "plan_dm_time": "Time of day the weekly check-in is sent.",
+          "nudge_lead": "How long before a booked slot starts to ask whether it is still wanted.",
+          "trades": "Lets people ask each other, anonymously, to swap a booked slot. Names are revealed only if the swap is accepted."
         }
       }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "waiting": {
+        "name": "Waiting"
+      }
+    },
+    "button": {
+      "test_post": {
+        "name": "Test post"
+      },
+      "reset_session": {
+        "name": "Reset session"
+      },
+      "track_load": {
+        "name": "Track load"
+      },
+      "run_diagnostics": {
+        "name": "Run diagnostics"
+      }
+    },
+    "number": {
+      "energy_idle": {
+        "name": "Flat meter timeout"
+      },
+      "confirm_delay": {
+        "name": "Confirm delay"
+      },
+      "energy_load_jump": {
+        "name": "Load jump threshold"
+      },
+      "handoff_fallback": {
+        "name": "Handoff fallback"
+      },
+      "queue_expiry": {
+        "name": "Queue expiry"
+      },
+      "availability_grace": {
+        "name": "Availability grace"
+      }
+    },
+    "sensor": {
+      "claimed_by": {
+        "name": "Claimed by"
+      },
+      "stage": {
+        "name": "Stage"
+      },
+      "connection_health": {
+        "name": "Connection health"
+      },
+      "health": {
+        "name": "Health"
+      }
+    },
+    "switch": {
+      "ping_claimant_on_complete": {
+        "name": "Ping on complete"
+      },
+      "show_assistant": {
+        "name": "Show assistant"
+      },
+      "learn_habits": {
+        "name": "Learn habits"
+      },
+      "remind_dms": {
+        "name": "Reminder DMs"
+      },
+      "trades": {
+        "name": "Slot trades"
+      }
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "Laundry Discord Bot is not loaded."
     }
   },
   "services": {
     "test_post": {
       "name": "Test post",
-      "description": "Post a sample embed with a working Claim button to test the Discord path without a real wash."
+      "description": "Posts a sample card with a working Claim button, to test the Discord connection without a real wash."
     },
     "reset_session": {
       "name": "Reset session",
-      "description": "Force-close the load the bot thinks is running and go back to idle. Announces nothing and pings nobody."
+      "description": "Force-closes the load the bot is tracking and returns to idle. Announces nothing and pings nobody."
+    },
+    "track_load": {
+      "name": "Track the running load",
+      "description": "Starts tracking a wash that is running but that the bot missed, and posts a normal card. Does nothing if a load is already being tracked."
     },
     "diagnostics": {
       "name": "Diagnostics",
-      "description": "Check the bot's health and return the findings as response data. Changes nothing; safe to run mid-wash."
+      "description": "Checks the bot's health and returns the findings. Changes nothing, so it is safe to run mid-wash."
     }
   }
 }

@@ -1,10 +1,7 @@
 """Tests for the pure "I'm next" queue helpers.
 
-Runnable with plain ``python3 tests/test_queue.py`` — no pytest / Home
-Assistant, mirroring ``tests/test_energy_detector.py``. ``queue.py`` is loaded
-by file path so importing it does not pull in the package ``__init__`` (which
-imports Home Assistant), and under a module name that can't collide with the
-standard library's ``queue``.
+Runnable with plain ``python3 tests/test_queue.py``. ``queue.py`` is loaded by
+file path (avoiding the package ``__init__`` and the stdlib ``queue`` name clash).
 """
 
 from __future__ import annotations
@@ -84,7 +81,6 @@ def test_toggle_removes_from_the_middle_without_reordering() -> None:
 
 
 def test_toggle_does_not_mutate_the_input() -> None:
-    # The coordinator assigns the result; a rejected tap must not half-apply.
     original = [{"id": 1, "name": "Sam", "ts": 0.0}]
     snapshot = json.dumps(original)
     toggle_member(original, 2, "Ty", 1.0)
@@ -140,7 +136,6 @@ def test_prune_drops_entries_with_no_usable_timestamp() -> None:
 
 
 def test_carry_forward_drops_the_claimant_and_keeps_the_rest() -> None:
-    # A's load finishes, B takes the machine, C should still be next.
     q = [
         {"id": 2, "name": "B", "ts": 0.0},
         {"id": 3, "name": "C", "ts": 1.0},
@@ -173,7 +168,6 @@ def test_select_handoff_returns_the_head_and_pops_it() -> None:
 
 
 def test_select_handoff_on_an_empty_line_pops_nothing() -> None:
-    # The normal case: a load finishes and nobody is waiting.
     assert select_handoff([], 10.0, EXPIRY, None) == (None, [])
 
 
@@ -195,8 +189,7 @@ def test_select_handoff_excludes_a_claimant_across_id_types() -> None:
 
 
 def test_select_handoff_skips_a_stale_head_rather_than_pinging_it() -> None:
-    # An entry past expiry must not absorb the handoff and strand the person
-    # who is actually standing there with a basket.
+    # An expired head must not absorb the handoff and strand whoever is waiting.
     q = [
         {"id": 1, "name": "Yesterday", "ts": 0.0},
         {"id": 2, "name": "Fresh", "ts": EXPIRY},
@@ -219,8 +212,7 @@ def test_remove_user_drops_the_claimer_and_tolerates_none() -> None:
     assert _names(remove_user(q, 1)) == ["Ty"]
     assert _names(remove_user(q, "1")) == ["Ty"]
     assert _names(remove_user(q, 99)) == ["Sam", "Ty"]
-    # An unclaimed load passes None; that must remove nobody, including an
-    # entry whose id failed to persist.
+    # None (unclaimed) must remove nobody, including an entry with no persisted id.
     assert remove_user(q, None) == q
     assert remove_user([{"id": None, "name": "Odd", "ts": 0.0}], None) != []
 
@@ -229,8 +221,6 @@ def test_remove_user_drops_the_claimer_and_tolerates_none() -> None:
 
 
 def test_ids_still_match_after_a_json_round_trip() -> None:
-    # HA's Store serialises to JSON. Whatever the ids come back as, a tap from
-    # interaction.user.id (an int) must still find the existing entry.
     q, _ = toggle_member([], 12345, "Sam", 0.0)
     restored = json.loads(json.dumps(q))
     assert find(restored, 12345) is not None
@@ -293,13 +283,7 @@ def test_names_is_order_preserving() -> None:
 
 
 def test_names_carries_nothing_derived_from_the_clock() -> None:
-    """The recorder-churn guard: the same line must render identically later.
-
-    An attribute that changed on the 5-minute health tick would write ~288
-    history rows a day forever — the bug the connection-health sensor was
-    already fixed for. Names cannot drift; timestamps and anything computed
-    from them can, so none of them are here.
-    """
+    """names() must hold no timestamps, or the clock alone would change it (recorder churn)."""
     q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 1.0}]
     assert names(q) == names(q)
     aged = [dict(e) for e in q]  # same people, read a very long time later
@@ -320,8 +304,7 @@ def test_ordinal() -> None:
 def test_tap_notice_joining_names_the_place() -> None:
     assert "**2nd**" in tap_notice(TOGGLE_ADDED, 2)
     assert "**3rd**" in tap_notice(TOGGLE_ADDED, 3)
-    # First in line is told "next", not "1st" — and warned that a finished
-    # washer is not an empty one, which is the whole reason for the ✅ tap.
+    # First in line hears "next", not "1st".
     first = tap_notice(TOGGLE_ADDED, 1)
     assert "**next**" in first
     assert "1st" not in first
@@ -337,8 +320,7 @@ def test_tap_notice_tells_joining_and_leaving_apart() -> None:
 
 
 def test_tap_notice_is_silent_where_the_response_already_spoke() -> None:
-    # TOGGLE_FULL / TOGGLE_STALE answer the interaction with their own
-    # ephemeral; a followup here would say it twice.
+    # TOGGLE_FULL/TOGGLE_STALE already answered via their own ephemeral.
     assert tap_notice(TOGGLE_FULL, None) is None
     assert tap_notice(TOGGLE_STALE, None) is None
     assert tap_notice("something else entirely", 1) is None
@@ -350,7 +332,6 @@ def test_tap_notice_still_confirms_without_a_place() -> None:
 
 
 def test_position_feeds_tap_notice() -> None:
-    """The two halves of the fix, joined up as the button joins them."""
     q, _ = toggle_member([], 1, "Sam", 0.0)
     q, res = toggle_member(q, 2, "Ty", 10.0)
     assert "**2nd**" in tap_notice(res, position(q, 2))
@@ -387,7 +368,6 @@ def test_handoff_line_names_whoever_select_handoff_popped() -> None:
 
 
 def test_attributes_publish_the_line_that_would_actually_act() -> None:
-    """The plain case: everyone fresh, nobody claiming."""
     q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
     assert attributes(q, 100.0, EXPIRY, None) == {
         "queue_count": 2,
@@ -402,28 +382,21 @@ def test_attributes_publish_the_line_that_would_actually_act() -> None:
 
 
 def test_attributes_never_name_somebody_the_handoff_would_skip() -> None:
-    """The stored line is pruned on tap/start/handoff — never on read.
-
-    Sam taps 🔜 in the evening and goes away. Nothing touches the line
-    overnight, so by morning ``coordinator.queue`` still holds an entry that
-    :func:`select_handoff` would drop. Reading it raw had the dashboard
-    announcing a person who is provably not getting the machine.
+    """The stored line is pruned on tap/start/handoff, never on read — a stale
+    overnight entry must not be read raw and announced as next up.
     """
     q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 11 * HOUR}]
     aged = attributes(q, 13 * HOUR, EXPIRY, None)  # EXPIRY is 12h
     assert aged == {"queue_count": 1, "queue": ["Ty"], "next_up": "Ty"}
     # Everybody aged out: an empty line, not a stale head.
     assert attributes(q, 40 * HOUR, EXPIRY, None)["next_up"] is None
-    # ...and expiry disabled keeps them, exactly as the handoff would.
+    # Expiry disabled keeps them, exactly as the handoff would.
     assert attributes(q, 40 * HOUR, 0.0, None)["next_up"] == "Sam"
 
 
 def test_attributes_never_name_the_claimant_as_next_up() -> None:
-    """Claiming takes you out of the line; tapping 🔜 after can put you back.
-
-    ``select_handoff`` refuses to hand the machine to whoever is using it, so
-    the attribute must not promise it either — otherwise the card says the
-    claimant is up next and the ping goes to the person behind them.
+    """The attribute must not name the claimant as next_up, matching what
+    select_handoff refuses to do.
     """
     q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
     attrs = attributes(q, 100.0, EXPIRY, claimant_id=1)
@@ -437,7 +410,6 @@ def test_attributes_never_name_the_claimant_as_next_up() -> None:
 
 
 def test_attributes_agree_with_select_handoff_on_who_is_up() -> None:
-    """Guards the two from drifting apart — the whole point of the fix."""
     q = [
         {"id": 1, "name": "Sam", "ts": 0.0},  # stale
         {"id": 2, "name": "Ty", "ts": 11 * HOUR},  # the claimant
@@ -451,13 +423,8 @@ def test_attributes_agree_with_select_handoff_on_who_is_up() -> None:
 
 
 def test_attributes_carry_nothing_derived_from_the_clock() -> None:
-    """The recorder-churn guard, now that ``now`` is an input.
-
-    Pruning needs the wall clock, which is exactly the shape of thing that
-    wrote ~288 rows a day on the connection-health sensor. It is safe here
-    because the clock only decides *membership*: between two ticks with nobody
-    expiring, the attribute dict must be identical, so HA suppresses the
-    state_changed event and no row is written.
+    """Recorder-churn guard: between ticks where nobody expires, the attribute
+    dict must be identical even though ``now`` is an input.
     """
     q = [{"id": 1, "name": "Sam", "ts": 0.0}, {"id": 2, "name": "Ty", "ts": 0.0}]
     ticks = [attributes(q, 100.0 + 300.0 * i, EXPIRY, None) for i in range(12)]

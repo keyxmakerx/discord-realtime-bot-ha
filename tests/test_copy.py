@@ -1,19 +1,9 @@
-"""Tests for the copy that ships — the panel's own lines and the README's.
+"""Tests that the panel copy and docs/design.md stay true to what the code does,
+not just what it once did.
 
-Every other test file here asks whether the integration *does* the right thing.
-This one asks whether what it *says* about itself is true, which is a different
-failure and a real one: a settings screen is read precisely when somebody is
-deciding whether they need a setting, so a line that is wrong there talks them
-out of the control that would have fixed their complaint. The 🔔 panel shipped
-saying "the earliest I'd reach you is 05:00" — true only at the default
-``nudge_lead``, and a house running the maximum lead of three hours DMs that
-same person at 03:00.
-
-``assistant.py`` imports Home Assistant and ``discord``, so it is read with
-:mod:`ast` rather than imported, exactly as ``tests/test_sensor.py`` reads
-``sensor.py``. The modules that decide the facts being claimed — ``nudge`` for
-the trigger clock, ``trade`` for the reasons a swap ask is refused — are loaded
-for real by file path, so nothing here is a second opinion about either.
+``assistant.py`` imports Home Assistant and ``discord``, so it's read with
+:mod:`ast` rather than imported; ``nudge`` and ``trade`` (which decide the
+facts being claimed) are loaded for real by file path.
 
 Runnable with plain ``python3 tests/test_copy.py``.
 """
@@ -39,9 +29,8 @@ def _load(name: str, filename: str):
     return module
 
 
-# Loaded by file path in dependency order, so the relative imports inside each
-# module fall back to bare ones and find the real neighbour — see the same
-# preamble in tests/test_reminders.py and tests/test_trade.py.
+# Loaded by file path in dependency order, so each module's relative imports
+# fall back to bare ones and find their real neighbour.
 _const = _load("ld_const", "const.py")
 sys.modules["const"] = _const
 _plan = _load("ld_plan", "plan.py")
@@ -58,8 +47,8 @@ _ASSISTANT_PATH = os.path.join(PKG_DIR, "assistant.py")
 with open(_ASSISTANT_PATH, encoding="utf-8") as _fh:
     _TREE = ast.parse(_fh.read(), filename=_ASSISTANT_PATH)
 
-with open(os.path.join(HERE, "..", "README.md"), encoding="utf-8") as _fh:
-    _README = _fh.read()
+with open(os.path.join(HERE, "..", "docs", "design.md"), encoding="utf-8") as _fh:
+    _DESIGN = _fh.read()
 
 
 # --- reading assistant.py without importing it -------------------------------
@@ -88,11 +77,8 @@ def _assignment(name: str) -> ast.expr:
 
 
 def _strings(node) -> list[str]:
-    """Every string literal under ``node``.
-
-    f-string *segments* count and interpolations do not, which is the whole
-    point: a time the panel computes from :data:`plan.SLOT_WINDOWS` cannot go
-    stale, and a time typed into the quotes can.
+    """Every string literal under ``node``; f-string segments count,
+    interpolations don't (a computed value can't go stale, a literal can).
     """
     return [
         child.value
@@ -102,40 +88,33 @@ def _strings(node) -> list[str]:
 
 
 def _fenced_block(marker: str) -> str:
-    """The ``` block in the README containing ``marker``."""
-    blocks = _README.split("```")[1::2]
+    """The ``` block in docs/design.md containing ``marker``."""
+    blocks = _DESIGN.split("```")[1::2]
     for block in blocks:
         if marker in block:
             return block
-    raise AssertionError(f"no README code block contains {marker!r}")
+    raise AssertionError(f"no docs/design.md code block contains {marker!r}")
 
 
 def _section(heading: str) -> str:
-    """One README section, from its heading to the next of any depth."""
-    start = _README.index(heading)
-    rest = _README[start + len(heading):]
+    """One docs/design.md section, from its heading to the next of any depth."""
+    start = _DESIGN.index(heading)
+    rest = _DESIGN[start + len(heading):]
     end = rest.find("\n#")
     return rest if end < 0 else rest[:end]
 
 
 # --- the 🔔 panel's own claims ------------------------------------------------
 def test_the_notify_panel_names_no_hour_a_house_option_can_move() -> None:
-    """The bug this file was written for.
-
-    The heads-up fires at the slot's start minus ``nudge_lead``, an option the
-    config flow offers anywhere from 5 minutes to 3 hours — so *every* clock
-    time in that range is a time some house's DM actually lands at, and none of
-    them may be typed into a panel that never reads the option. 06:00 is
-    different in kind: it is this repo's own AM window and no setting moves it,
-    which is why the panel is allowed to name that one.
+    """``nudge_lead`` (5min-3h) moves every heads-up clock time; the panel must
+    not hard-code one, except 06:00 (the fixed AM window).
     """
     movable = set()
     for slot in _plan.SLOTS:
         for lead in range(_const.MIN_NUDGE_LEAD, _const.MAX_NUDGE_LEAD + 1):
             hour, minute = _nudge.heads_up_clock(slot, lead)
             movable.add(f"{hour:02d}:{minute:02d}")
-    # The default lead and the maximum, both reachable from the options flow,
-    # two hours apart on the one message that can wake somebody up.
+    # Default and max lead, both reachable from the options flow.
     assert _nudge.heads_up_clock("am", _const.DEFAULT_NUDGE_LEAD) == (5, 0)
     assert _nudge.heads_up_clock("am", _const.MAX_NUDGE_LEAD) == (3, 0)
     assert {"05:00", "03:00"} <= movable
@@ -150,23 +129,16 @@ def test_the_notify_panel_names_no_hour_a_house_option_can_move() -> None:
             assert clock not in line, (
                 f"the 🔔 panel says {clock!r}, which nudge_lead moves: {line!r}"
             )
-    # ...and the same claim in words. "An hour before" is the default lead
-    # spelled out, and wrong in the same houses for the same reason.
+    # "An hour before" is the same claim spelled out in words.
     assert "an hour" not in " ".join(copy).lower()
     # The one time it may name, because no option touches it.
     assert _plan.SLOT_WINDOWS[_plan.SLOT_AM][0] == 6
 
 
-# --- the README's account of the panel ---------------------------------------
-def test_the_readme_draws_the_panel_the_code_actually_builds() -> None:
-    """A sketch of a panel is documentation people navigate by.
-
-    Both times a button was added to 🤖 before this, the README sketch was
-    updated in the same commit; the 🔔 one was not, and a reader looking for
-    where to switch off the dawn heads-up found a panel with no such control on
-    it. This walks ``AssistantView`` for the buttons a returning person gets and
-    ``_settings_embed`` for the fields above them, and asks the sketch to
-    contain each.
+# --- docs/design.md's account of the panel ----------------------------------
+def test_the_design_doc_draws_the_panel_the_code_actually_builds() -> None:
+    """Walks ``AssistantView``'s buttons and ``_settings_embed``'s fields, and
+    checks the design doc sketch shows each — a stale sketch once hid a real control.
     """
     view = _method("AssistantView", "__init__")
     classes = {
@@ -185,8 +157,7 @@ def test_the_readme_draws_the_panel_the_code_actually_builds() -> None:
                 for kw in node.keywords:
                     if kw.arg == "emoji" and isinstance(kw.value, ast.Constant):
                         emojis.add(kw.value.value)
-    # ...plus the ones handed in at the call site, which is how the three
-    # reminder-mode buttons get theirs — one class, three emoji.
+    # ...plus emoji handed in at the call site (one class, three reminder-mode buttons).
     emojis |= {
         text
         for text in _strings(view)
@@ -194,10 +165,9 @@ def test_the_readme_draws_the_panel_the_code_actually_builds() -> None:
     }
     sketch = _fenced_block("🤖 Your laundry assistant")
     for emoji in sorted(emojis):
-        assert emoji in sketch, f"the README panel sketch is missing {emoji}"
-    # The embed's fields, by the names the code gives them. "Guessing" is
-    # conditional in the code and drawn in the sketch, which is the state the
-    # sketch is drawn in — day-learning on, monitoring on.
+        assert emoji in sketch, f"the design doc panel sketch is missing {emoji}"
+    # The embed's fields, by name. The sketch is drawn with day-learning and
+    # monitoring on, so conditional fields like "Guessing" are expected.
     fields = {
         kw.value.value
         for node in ast.walk(_method("LaundryAssistant", "_settings_embed"))
@@ -208,29 +178,23 @@ def test_the_readme_draws_the_panel_the_code_actually_builds() -> None:
         if kw.arg == "name" and isinstance(kw.value, ast.Constant)
     }
     for field in sorted(fields):
-        assert field in sketch, f"the README panel sketch is missing {field!r}"
+        assert field in sketch, f"the design doc panel sketch is missing {field!r}"
 
 
-def test_the_readme_names_every_reason_a_swap_ask_is_not_delivered() -> None:
-    """§11: the refusal is flat, so the *documentation* is where they're listed.
-
-    A requester is told the same sentence whichever of these it was, on purpose
-    — a refusal that read differently would be a free oracle about a housemate
-    they cannot even name. That makes the README the only place anybody can
-    find out what stops an ask arriving, so every reason ``reachable`` can
-    return has to be in the guardrail table. A reason with no entry below fails
-    here rather than going quietly undocumented.
+def test_the_design_doc_names_every_reason_a_swap_ask_is_not_delivered() -> None:
+    """The refusal message is intentionally flat (one sentence, whatever the
+    reason), so docs/design.md is the only place a reason is
+    findable — every reason ``reachable`` can return must be listed there.
     """
     documented = {
         _trade.REASON_NOT_OPTED_IN: "never opened the 🤖 panel",
         _trade.REASON_REMINDERS_OFF: "reminders 🚫 off",
         _trade.REASON_NOT_DM: "on the channel default",
-        _trade.REASON_DM_CLOSED: "with DMs closed",
+        _trade.REASON_DM_CLOSED: "DMs closed",
         _trade.REASON_PAUSED: "paused",
-        _trade.REASON_SWAPS_OFF: "🔁 **Swaps** switched off",
+        _trade.REASON_SWAPS_OFF: "🔁 Swaps switched off",
         _trade.REASON_QUIET: "quiet hours",
-        # Not a fact about the holder at all: an unreadable clock is the
-        # caller's bug, and nothing a housemate could have set or unset.
+        # Not a fact about the holder: an unreadable clock is the caller's own bug.
         _trade.REASON_MOMENT: None,
     }
     with open(os.path.join(PKG_DIR, "trade.py"), encoding="utf-8") as fh:
@@ -246,7 +210,7 @@ def test_the_readme_names_every_reason_a_swap_ask_is_not_delivered() -> None:
                 returned.add(getattr(_trade, node.value.id))
     returned.discard(_trade.REASON_OK)
     assert _trade.REASON_SWAPS_OFF in returned and _trade.REASON_QUIET in returned
-    guardrails = _section("#### Every guardrail, spelled out")
+    guardrails = _section("### Who can be asked")
     for reason in sorted(returned):
         assert reason in documented, f"{reason} is undocumented and unlisted here"
         phrase = documented[reason]

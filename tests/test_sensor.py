@@ -1,12 +1,8 @@
-"""Tests for the wiring in ``sensor.py`` that no pure test can reach.
+"""Tests for sensor.py's declarative bits: which attributes are kept out of
+recorder history, and that the queue is read through the pruning helper.
 
-``sensor.py`` imports Home Assistant, so it cannot be loaded here the way
-``queue.py`` is (see ``tests/test_queue.py``). What matters about it, though,
-is declarative — which attributes are kept out of recorder history, and that
-the 🔜 line is read through the pruning helper rather than raw — so it is read
-with :mod:`ast` instead. Runnable with plain ``python3 tests/test_sensor.py``.
-
-The behaviour of the attribute itself is covered by ``test_queue.py``.
+``sensor.py`` imports Home Assistant, so it's read with :mod:`ast` instead of
+imported. Runnable with plain ``python3 tests/test_sensor.py``.
 """
 
 from __future__ import annotations
@@ -67,14 +63,8 @@ def _method(cls: ast.ClassDef, name: str) -> ast.FunctionDef:
 
 
 def test_the_waiters_names_are_kept_out_of_recorder_history() -> None:
-    """Design doc §11: no per-person tally is ever surfaced to the household.
-
-    The recorder writes a row whenever a state *or an attribute* changes, and
-    keeps it for the retention window. With the names persisted, every 🔜 tap
-    leaves a timestamped record of who joined and who left, out of which "Sam
-    queued 14 times this week" falls directly — a stat the Discord card does
-    not leave behind, because it is edited in place. The names still ride on
-    the live state; only their history is dropped.
+    """Privacy rule: no per-person tally may be reconstructed from recorder
+    history (e.g. "Sam queued 14 times"), unlike the live, edited-in-place card.
     """
     unrecorded = _class_attr(_class(STAGE_SENSOR), "_unrecorded_attributes")
     assert unrecorded is not None, "the queue names are being written to history"
@@ -88,10 +78,8 @@ def test_the_count_stays_recorded() -> None:
 
 
 def test_the_attribute_is_read_through_the_pruning_helper() -> None:
-    """Not ``names(coordinator.queue)`` — that publishes expired entries.
-
-    The stored line is pruned only on a tap, a session start or a handoff, so
-    a raw read can name somebody ``select_handoff`` would drop.
+    """Not ``names(coordinator.queue)`` directly — that can publish an expired
+    entry, since the stored line is pruned only on a tap, start or handoff.
     """
     body = _method(_class(STAGE_SENSOR), "extra_state_attributes")
     calls = {

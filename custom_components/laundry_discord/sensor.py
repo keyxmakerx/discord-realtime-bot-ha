@@ -3,24 +3,24 @@
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from . import queue as queue_mod
-from .const import DOMAIN, STAGE_DONE_WAITING, STAGE_LABELS, UNCLAIMED
+from .const import STAGE_DONE_WAITING, STAGE_LABELS, UNCLAIMED
+from .coordinator import LaundryConfigEntry
 from .entity import LaundryEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: LaundryConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the laundry sensors."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     async_add_entities(
         [
             LaundryClaimedBySensor(coordinator, entry),
@@ -32,10 +32,9 @@ async def async_setup_entry(
 
 
 class LaundryClaimedBySensor(LaundryEntity, SensorEntity):
-    """Who currently has the finished load (or 'Unclaimed')."""
+    """Who currently has the load (or 'Unclaimed')."""
 
-    _attr_name = "Laundry Claimed by"
-    _attr_icon = "mdi:account-check"
+    _attr_translation_key = "claimed_by"
 
     def __init__(self, coordinator, entry) -> None:
         super().__init__(coordinator, entry)
@@ -47,16 +46,11 @@ class LaundryClaimedBySensor(LaundryEntity, SensorEntity):
 
 
 class LaundryStageSensor(LaundryEntity, SensorEntity):
-    """Current laundry stage (Idle / Washing / Drying / Done — waiting)."""
+    """Current stage (Idle / Washing / Drying / Done — waiting / Done — claimed)."""
 
-    _attr_name = "Laundry Stage"
-    _attr_icon = "mdi:washing-machine"
-    # The names ride on the live state (that is the point — a dashboard card),
-    # but they are kept out of recorder history. Persisted, every 🔜 tap would
-    # leave a timestamped row naming who joined and who left, and the retention
-    # window would then answer "who queues most" — the tally design doc §11
-    # bans. `queue_count` stays recorded: it is the same shape of fact the card
-    # shows and names nobody.
+    _attr_translation_key = "stage"
+    # The names of who is waiting stay out of recorder history, so the history
+    # can't become a per-person tally. The count is fine to keep.
     _unrecorded_attributes = frozenset({"queue", "next_up"})
 
     def __init__(self, coordinator, entry) -> None:
@@ -75,25 +69,12 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        """The 🔜 line, so it can reach a dashboard without opening Discord.
+        """The 🔜 line: ``queue_count``, ``queue`` and ``next_up``.
 
-        It rides on this entity rather than a new one because it is the same
-        fact — what the machine is doing and who is waiting on it — and a
-        second entity would need its own restore, its own availability and its
-        own row in every dashboard that already shows this one.
-
-        **Count and names only.** The recorder writes a history row whenever a
-        state *or an attribute* changes, and this entity is refreshed by the
-        5-minute health tick, so anything derived from the clock — how long
-        somebody has waited, when they tapped — would differ on every single
-        tick and write ~288 rows a day forever. That is exactly the bug the
-        connection-health sensor had to be fixed for, and it is not worth
-        reintroducing for a number nobody reads. These three change when
-        somebody taps 🔜 (or an entry ages out), and at no other time.
-
-        The selection rules live in :func:`queue.attributes` so the pure tests
-        cover them: the stored line is only pruned when something happens to
-        it, so read cold it can still name somebody the handoff would skip.
+        Nothing clock-derived goes here: this entity is rewritten on every
+        5-minute tick, and a changing attribute would write a recorder row each
+        time. Read through :func:`queue.attributes` so expired entries are
+        pruned.
         """
         coordinator = self.coordinator
         return queue_mod.attributes(
@@ -105,15 +86,9 @@ class LaundryStageSensor(LaundryEntity, SensorEntity):
 
 
 class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
-    """Diagnostic: how often the washer's cloud connection drops out.
+    """Number of times the washer's job-state sensor went unavailable in 24h."""
 
-    State is the number of `unavailable` blips on the job-state sensor in the
-    last 24h. Useful for a dashboard chip and for judging whether a wifi/AP
-    change actually helped. It never notifies — purely visibility.
-    """
-
-    _attr_name = "Laundry Connection Health"
-    _attr_icon = "mdi:wifi-alert"
+    _attr_translation_key = "connection_health"
     _attr_native_unit_of_measurement = "drops/24h"
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -128,21 +103,8 @@ class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Last drop, and roughly how long ago — deliberately *roughly*.
-
-        The recorder writes a history row whenever a state or an attribute
-        changes, and this entity is refreshed by the 5-minute health tick. A
-        minutes-since value recomputed to one decimal therefore differed on
-        every single tick, so this one diagnostic wrote ~288 rows a day
-        forever — and on this washer, whose cloud drops roughly hourly, the
-        flap list is never empty, so it never quiets down.
-
-        Bucketing to a quarter of an hour keeps the attribute answering the
-        only question anyone actually asks it ("recently, or ages ago?") while
-        making it change 4 times an hour at most instead of 12, and not at all
-        overnight once a drop is hours old. The precise value stays available
-        as the timestamp above.
-        """
+        # Minutes are bucketed to 15 so the attribute doesn't change (and write
+        # a recorder row) on every 5-minute tick.
         last = self.coordinator.last_flap
         minutes = self.coordinator.minutes_since_flap
         return {
@@ -154,27 +116,14 @@ class LaundryConnectionHealthSensor(LaundryEntity, SensorEntity):
 
 
 class LaundryHealthSensor(LaundryEntity, SensorEntity):
-    """The diagnostics findings, as an entity you can put on a dashboard.
+    """The diagnostics findings, refreshed every 5 minutes.
 
-    Same checks as the ``laundry_discord.diagnostics`` action — this is where
-    they live between runs. The action still exists and still returns the full
-    picture; this is the always-on version, so "is the bot alright" is a glance
-    rather than a service call, and an automation can alert on it.
-
-    **State is the worst severity, not the sentence.** ``ok`` / ``note`` /
-    ``warning`` / ``problem`` is a four-value state that changes only when the
-    situation does; the readable summary is an attribute. That split is not
-    cosmetic — the recorder writes a history row on every state change, and a
-    state that carried the wording would write one whenever a count moved.
-
-    ``findings`` is unrecorded for the same reason, one level down: several
-    findings carry an age in minutes, so the list differs on most refreshes.
-    It is worth having live on the card and worth nothing in history, where
-    the severity above already tells the story.
+    State is the worst severity (``ok``/``note``/``warning``/``problem``); the
+    summary and findings are attributes. ``findings`` carries ages in minutes,
+    so it is kept out of recorder history.
     """
 
-    _attr_name = "Laundry Health"
-    _attr_icon = "mdi:heart-pulse"
+    _attr_translation_key = "health"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _unrecorded_attributes = frozenset({"findings"})
 
@@ -194,8 +143,6 @@ class LaundryHealthSensor(LaundryEntity, SensorEntity):
             "summary": health.get("summary"),
             "problems": sum(1 for f in findings if f.get("severity") == "problem"),
             "warnings": sum(1 for f in findings if f.get("severity") == "warning"),
-            # The one-line headlines, which is what a dashboard card can show.
-            # The full detail stays in the action, which has room for it.
             "headlines": [f.get("headline") for f in findings],
             "findings": findings,
         }

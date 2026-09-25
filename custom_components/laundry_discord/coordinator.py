@@ -1,9 +1,8 @@
 """Session state machine for the Laundry Discord Bot.
 
 Watches the washer entities, drives the Discord bot (one embed per load), and
-mirrors the lifecycle into HA entities. All Discord work is funnelled through a
-lock so edits never overlap, and every bot call is wrapped so a failure logs
-rather than taking HA down.
+mirrors the lifecycle into HA entities. Discord work is funnelled through a
+lock, and every bot call is wrapped so a failure logs rather than crashing HA.
 """
 
 from __future__ import annotations
@@ -98,14 +97,11 @@ from .discord_bot import ClaimView, DiscordBot, view_for
 
 _LOGGER = logging.getLogger(__name__)
 
-# Colors per stage. One colour, one meaning: grey used to serve **both**
-# "somebody has claimed this load" and "nothing is happening", which are the two
-# states a glance at the channel most needs to tell apart — a claimed load is
-# waiting on a person, an idle card is waiting on nobody. They are split here.
+# Claimed (amber) and idle (grey) are kept visually distinct on purpose.
 _COLOR_WASHING = 0x3498DB
 _COLOR_DRYING = 0xE67E22
 _COLOR_DONE = 0x2ECC71
-_COLOR_CLAIMED = 0xF1C40F  # amber — this load has an owner and they're not done
+_COLOR_CLAIMED = 0xF1C40F  # amber — has an owner, not done
 _COLOR_IDLE = 0x95A5A6  # grey — nothing running, nobody waited on
 _COLOR_TEST = 0x9B59B6
 _COLOR_SELFCLEAN = 0x1ABC9C
@@ -124,11 +120,7 @@ class LaundryCoordinator:
         self.bot = DiscordBot(
             hass, self, self._cfg[CONF_BOT_TOKEN], self._cfg[CONF_CHANNEL_ID]
         )
-        # The 🤖 assistant: per-person prefs (its own Store), the private panel
-        # and the DM plumbing. The dependency runs one way — the coordinator
-        # asks it to deliver a message or open a panel, and it never touches
-        # session state — so a fault in there can't reach the state machine.
-        # It gets the entry to read its own options; it does not get `self`.
+        # One-way dependency: never touches session state; gets the entry, not `self`.
         self.assistant = LaundryAssistant(hass, self.bot, entry)
 
         # Session state (persisted).
@@ -136,114 +128,63 @@ class LaundryCoordinator:
         self.waiting: bool = False
         self.claimed_by: str = UNCLAIMED
         self.claimed_by_id: int | None = None
-        # When True, the claimant is named in plain text at completion instead of
-        # being @mentioned — a visible, push-silent "done" (e.g. they're asleep).
-        self.quiet: bool = False
-        # The "I'm next" line: FIFO entries {"id", "name", "ts"} (see queue.py).
-        # Session state, not planner state — it belongs to the machine, carries
-        # into the next load, and dies with a reset like everything else here.
+        self.quiet: bool = False  # named in plain text at completion, not @mentioned
+        # FIFO "I'm next" entries {"id", "name", "ts"}; see queue.py.
         self.queue: list[dict] = []
-        # True once the claimant confirms they've cleared the drum. A finished
-        # washer is not an *empty* one — their clothes are still in it — so the
-        # handoff to whoever is next waits for this, not for completion.
+        # True once the claimant confirms the drum is cleared; handoff waits for this.
         self.emptied: bool = False
-        # Who this load's handoff ping went to, and whether it was the hedged
-        # backstop rather than a confirmed one. Recorded because the handoff
-        # *pops* the head off the line: without it the "Next up" field simply
-        # disappears at the moment that person was told, and to everybody else
-        # the card reads as though they were never waiting at all.
+        # Who the handoff ping went to, and whether it was the hedged backstop;
+        # needed because the handoff pops the queue head (keeps "Next up" accurate).
         self.handoff_name: str | None = None
         self.handoff_hedged: bool = False
         self.message_id: int | None = None
-        # True when the session was picked up mid-cycle (washer already running
-        # at startup) rather than caught at its off->on start.
-        self.catch_up: bool = False
-        # True while machine_state reports the load is paused mid-cycle.
-        self.paused: bool = False
-        # True when the load in ``done_waiting`` was ended by somebody stopping
-        # the washer rather than by the cycle finishing. It is what stops the
-        # card and the ping claiming a cycle completed when we know it didn't,
-        # and it is the flag ``handle_claim`` checks before logging anything to
-        # the habit model — a stopped load is not a wash.
-        self.cancelled: bool = False
-        # Last confirmed real job phase, ignoring unavailable/unknown blips —
-        # used purely for enrichment now (the wash->dry transition display).
+        self.catch_up: bool = False  # picked up mid-cycle, not at the off->on start
+        self.paused: bool = False  # machine_state reports the load paused mid-cycle
+        self.cancelled: bool = False  # ended by a stop; gates wording + habit-model logging
+        # Last confirmed real job phase; enrichment only (wash->dry display).
         self._last_real_phase: str | None = None
-        # Energy/water meter baselines captured at session start (None when not
-        # measurable, e.g. a mid-cycle catch-up where there's no true baseline).
+        # Energy/water baselines at session start (None if not measurable, e.g. catch-up).
         self._energy_start: float | None = None
         self._water_start: float | None = None
-        # Wall-clock (unix) time the current session started — used to gate the
-        # completion ETA freshness and back the absolute max-session safety net.
-        # None whenever no load is being tracked.
+        # Gates ETA freshness and the max-session net; None when no load is tracked.
         self._session_started_ts: float | None = None
-        # Offline tracking: when the washer first went unavailable during this
-        # load, the last completion estimate we saw, and whether the load was
-        # completed while offline (so the 'done' message is flagged unverified).
+        # First-unavailable time, last ETA seen, and whether completion was offline.
         self._offline_since: float | None = None
         self._last_eta_ts: float | None = None
         self._offline_unverified: bool = False
-        # The energy-primary liveness core: the single source of truth for load
-        # start/finish. job_state/machine_state are only accelerants + enrichment
-        # feeding it; they can never override the meter. See detect.EnergyDetector.
+        # Single source of truth for start/finish; job_state/machine_state only
+        # accelerate or enrich it, never override it.
         self._detector = EnergyDetector(
             start_jump=self.energy_load_jump,
             idle_timeout=float(self.energy_idle_timeout),
         )
-        # Unix timestamps of job_state -> unavailable transitions (connection
-        # health). Pruned to a rolling 24h window.
-        self._flap_times: list[float] = []
+        self._flap_times: list[float] = []  # unavailable transitions; rolling 24h window
 
         self._eta_unsub = None
         self._unsubs: list = []
         self._lock = asyncio.Lock()
         self._restored = False
-        # Cached last-good ETA (target datetime, when last seen) for flap hold.
-        self._eta_cache: tuple[datetime, float] | None = None
-        # Pending job_state confirm-debounce timer (the `for: 30s` equivalent).
-        self._job_confirm_unsub = None
-        # Whether the job_state change that armed that debounce arrived *from*
-        # `unavailable` — i.e. the cloud reconnecting rather than the machine
-        # doing something. It suppresses the job fast-paths for that one
-        # settled value; see `_on_job_state` for what it costs not to.
+        self._eta_cache: tuple[datetime, float] | None = None  # last-good ETA, flap hold
+        self._job_confirm_unsub = None  # job_state confirm-debounce (`for: 30s` equivalent)
+        # Whether the debounce was armed by a value coming from `unavailable` (a cloud
+        # reconnect, not the machine); suppresses the job fast-path once.
         self._job_from_flap = False
-        # ...and WHEN the last recovery from unavailable happened. The flag
-        # alone can be laundered (unavailable -> none -> wash hands the last
-        # hop a clean old_state) or stomped by attribute-only churn; the
-        # timestamp survives both. Consumed by _async_job_confirmed.
+        # When the last unavailable recovery happened. Kept separately from the flag
+        # above, which an intermediate value or attribute churn can launder or stomp.
         self._flap_recovery_ts = None
-        # Pending stop-confirm timer — the same `for: 30s` shape, for "somebody
-        # stopped the wash on the machine". Its own handle rather than a second
-        # debounce mechanism: a stop and a job_state change can be in flight at
-        # the same moment (they are at the end of every normal load) and one
-        # must not disarm the other.
+        # Stop-confirm timer, separate from the job_state one: both can be in flight
+        # together at load end, and neither may disarm the other.
         self._stop_confirm_unsub = None
-        # Pending self-clean detect/end timer (running + job_state stuck none).
-        self._selfclean_unsub = None
-        # Pending handoff-fallback timer (nobody tapped "Emptied it").
-        self._handoff_unsub = None
-        # Every task this coordinator has in flight. Held so :meth:`async_shutdown`
-        # can end them; see :meth:`_create_task`.
-        self._tasks: set[asyncio.Task] = set()
+        self._selfclean_unsub = None  # self-clean detect/end timer
+        self._handoff_unsub = None  # handoff-fallback timer (nobody tapped "Emptied it")
+        self._tasks: set[asyncio.Task] = set()  # in-flight tasks; see _create_task
 
     def _create_task(self, coro) -> None:
-        """Schedule one piece of session work, and keep hold of it.
+        """Schedule session work and track it so shutdown can cancel it.
 
-        Every ``@callback`` here that needs to await something goes through this
-        rather than ``hass.async_create_task`` directly, and the difference is
-        what happens at unload. A task created against ``hass`` is tied to
-        nothing this entry owns: ``async_shutdown`` dropped its listeners and
-        timers and closed the gateway, and anything already running carried on —
-        holding the old session lock, pinning the coordinator, its ``Store`` and
-        a closed client, and keeping ``hass.async_block_till_done()`` from ever
-        returning. ``Client.close()`` makes it unrecoverable rather than merely
-        slow: it *clears* ``_ready`` and drops the loop, so a task waiting on the
-        gateway at that moment can never be woken by anything.
-
-        The set is also the answer to the ordinary asyncio hazard that the loop
-        keeps only a weak reference to a running task, so one nobody holds can
-        be collected mid-flight. Each task removes itself when it finishes, so
-        this is a live view rather than a log.
+        Use this, not `hass.async_create_task`: an untracked task can survive
+        shutdown, holding the lock and a closed client forever. Also keeps a
+        strong reference, since asyncio holds tasks only weakly.
         """
         task = self.hass.async_create_task(coro)
         self._tasks.add(task)
@@ -251,21 +192,10 @@ class LaundryCoordinator:
 
     @callback
     def _task_done(self, task) -> None:
-        """Drop a finished task, and answer for whatever it raised.
+        """Drop a finished task and surface what it raised.
 
-        Bounding the gateway wait turned "hangs forever" into "raises
-        ``TimeoutError``", which is the right trade — the session lock is
-        released either way now. But nothing was *retrieving* that exception, so
-        asyncio logged ``Task exception was never retrieved`` with a full
-        traceback at ERROR, and on a washer whose cloud drops roughly hourly
-        that is a stack trace an hour for a condition the bot handles correctly
-        and by design.
-
-        So the expected one is retrieved and logged at debug, and everything
-        else is re-raised into HA's own handler rather than swallowed: a gateway
-        that was not ready is ordinary, and a ``KeyError`` in the embed builder
-        is not, and quietly eating the second to silence the first is how a real
-        bug hides for a month.
+        A `TimeoutError` (gateway never ready) is expected and logged at debug
+        only; anything else is re-raised into HA's handler so real bugs surface.
         """
         self._tasks.discard(task)
         if task.cancelled():
@@ -279,15 +209,10 @@ class LaundryCoordinator:
         raise exc
 
     async def _async_cancel_tasks(self) -> None:
-        """Stop everything in flight and wait for it to actually be stopped.
+        """Cancel every in-flight task and wait for it to actually stop.
 
-        Awaited rather than fired and forgotten: the point is that when
-        ``async_shutdown`` returns, nothing is left holding this entry's lock or
-        talking to a client that is about to be closed. Cancellation is
-        cooperative, so a task parked on a bot call unwinds through its own
-        ``except`` — which is why the gateway wait is bounded too
-        (:data:`discord_bot._READY_TIMEOUT`); a wait that never returns cannot
-        be cancelled either.
+        Awaited so nothing is left holding the session lock or a closing client
+        when this returns; relies on bot calls being timeout-bounded to unwind.
         """
         pending = [task for task in self._tasks if not task.done()]
         for task in pending:
@@ -377,9 +302,8 @@ class LaundryCoordinator:
     def handoff_fallback(self) -> int:
         """Seconds after a load finishes before the queue head is pinged anyway.
 
-        The claimant's "Emptied it" tap is the real handoff trigger; this is the
-        backstop for when they forget, and its wording hedges accordingly. 0
-        disables the backstop entirely (the tap still works).
+        Backstop for when the claimant forgets "Emptied it"; hedged wording
+        since nobody confirmed. 0 disables the backstop (the tap still works).
         """
         return (
             int(self._cfg.get(CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK)) * 60
@@ -394,9 +318,7 @@ class LaundryCoordinator:
     def show_assistant(self) -> bool:
         """Whether the 🤖 button is on the card.
 
-        On by default: the panel is inert until tapped and it's the onboarding
-        surface. Off hides the button only — anything already chosen in it
-        keeps working.
+        Off hides the button only; prefs already set through it keep working.
         """
         return bool(self._cfg.get(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT))
 
@@ -446,15 +368,13 @@ class LaundryCoordinator:
                     self.hass, [self.machine_state_entity], self._on_machine_state
                 )
             )
-        # The energy meter is now the primary detection signal — react promptly
-        # to every reading (a rise sustains a load; a jump while idle starts one).
+        # Energy is the primary detection signal; react to every reading.
         self._unsubs.append(
             async_track_state_change_event(
                 self.hass, [self.energy_entity], self._on_energy
             )
         )
-        # Always-on tick: feeds the detector while idle (start polling) and drives
-        # the time-based completion, and keeps the connection-health sensor fresh.
+        # 5-minute heartbeat; see _async_health_tick.
         self._unsubs.append(
             async_track_time_interval(
                 self.hass, self._async_health_tick, timedelta(minutes=5)
@@ -463,9 +383,8 @@ class LaundryCoordinator:
 
     @callback
     def _async_health_tick(self, now) -> None:
-        # Always-on heartbeat: feed the detector (catches an offline load's
-        # energy jump while idle, and drives the time-based completion even when
-        # no state events arrive) and keep the health sensor fresh.
+        # Catches an offline load's energy jump while idle, drives time-based
+        # completion with no state events, and keeps the health sensor fresh.
         self._feed_detector()
         self._check_time_completion()
         self.refresh_health()
@@ -483,13 +402,9 @@ class LaundryCoordinator:
     async def async_shutdown(self) -> None:
         """Tear down listeners, timers, in-flight work and the connection.
 
-        Order matters. Listeners and timers go first so nothing new is
-        scheduled, then whatever is already running is cancelled and waited for,
-        and only then is the client closed. Closing first is what made an
-        in-flight task unkillable: ``Client.close()`` clears the ready event and
-        drops the loop, so a task waiting on the gateway had nothing left that
-        could ever wake it — it simply stayed pending for the life of the HA
-        process, holding a lock on an entry that no longer exists.
+        Order matters: listeners/timers first, then cancel in-flight work, then
+        close the client. Closing first leaves a task waiting on the gateway
+        unwakeable forever — `Client.close()` clears the ready event.
         """
         for unsub in self._unsubs:
             unsub()
@@ -521,51 +436,15 @@ class LaundryCoordinator:
             self._start_eta_timer()
             _LOGGER.debug("Restored active laundry session (stage=%s)", self.stage)
         elif self.stage in (STAGE_IDLE, STAGE_DONE_WAITING):
-            # Not tracking an active wash, but the washer may already be
-            # mid-cycle (installed/restarted during a load) or a load may have
-            # run entirely while HA was down. One feed covers both.
-            #
-            # The EARLY half of the accelerant is off here, for the same reason
-            # it is off after a reconnect. "The restored state is settled"
-            # is what this used to assert, and settled was never the question:
-            # `_job_phase()` reads whatever the washer integration is
-            # publishing at this instant, and for a cloud integration that is
-            # routinely the last phase it saw before HA went down. A stale
-            # `wash` read here is `job_is_early` against a detector the restore
-            # has just put in RUN_IDLE, which mints a whole session — card,
-            # Claim button, ETA timer, and an hour later a completion ping —
-            # for a load that never ran.
-            #
-            # Every reload counts, not only restarts: an options change calls
-            # `async_reload`, which builds a fresh coordinator with
-            # `_restored = False`. Changing a setting should not be able to
-            # invent a wash.
-            #
-            # The CATCH-UP half stays on, and this is not a soft option — the
-            # first fix here turned the accelerant off wholesale, and that
-            # quietly regressed the two honest cases: a genuinely mid-cycle
-            # load at restart waited on the next job transition (15-60+
-            # minutes, or forever on a frozen job_state), and a load that ran
-            # entirely while HA was down could be missed outright once the
-            # reconnect's machine_state read `stop` and vetoed the energy
-            # jump. Catch-up requires the meter to have moved since idle, so
-            # it provably cannot fire on the stale-phase/flat-meter shape that
-            # minted the phantom — the corroboration IS the guard.
+            # The washer may be mid-cycle, or a load may have run entirely while HA
+            # was down; one feed covers both. Only catch-up fires here (`allow_early`
+            # off): a restored/reloaded `job_state` is often a replayed phase, and
+            # trusting it would mint a phantom load. Catch-up needs the meter to have
+            # moved since idle, so it can't fire on that shape.
             self._feed_detector(allow_catchup=True)
-            # ...and a *claimed* load still sitting in done_waiting is owed its
-            # handoff backstop. It is armed in exactly one place — the
-            # completion that put it here — so a restart in the window between
-            # "done" and the claimant tapping ✅ dropped it on the floor, and
-            # with it the only remaining route to SIGNAL_WASHER_FREE for this
-            # load, so reminders never heard about it either. The head of the 🔜
-            # line then learned nothing until the *next* load completed, which
-            # can be a day later.
-            #
-            # The full delay restarts from now rather than from the completion:
-            # nothing persists when the load finished, and a backstop that is
-            # late is the thing it is for. The callback re-checks the stage and
-            # `emptied`, and a new load cancels it, so arming it here cannot
-            # fire against a session this one no longer describes.
+            # A claimed done_waiting load's handoff backstop is re-armed here (armed
+            # in exactly one place: the completion that reached done_waiting). The
+            # delay restarts from now, not the original completion.
             if (
                 self.stage == STAGE_DONE_WAITING
                 and not self.emptied
@@ -653,14 +532,10 @@ class LaundryCoordinator:
 
     @callback
     def _notify_entities(self) -> None:
-        # The planner's ``*`` rides along here rather than on the session edges
-        # themselves. There are five places that start or end a session — wash,
-        # dry, self-clean, the completion path and the reset service — and a
-        # push added to four of them is a grid that keeps claiming the washer is
-        # busy after the fifth. This is the one call every one of them already
-        # makes, so it cannot be the one somebody forgets.
+        # Publishing the planner's running-window here, not at each of the five
+        # session start/end sites, means none of them can forget it.
         self._publish_running()
-        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        async_dispatcher_send(self.hass, f"{SIGNAL_UPDATE}_{self.entry.entry_id}")
 
     # ---------------------------------------------------------- state handlers
     def _machine_state(self) -> str | None:
@@ -675,10 +550,8 @@ class LaundryCoordinator:
     def _running_state(self) -> bool | None:
         """Whether the running sensor says on/off, or None when unreadable.
 
-        Deliberately three-valued, unlike the self-clean check's
-        ``running is not None and state == "on"``: for the cancel path
-        "unavailable" and "off" have to be different answers, because the cloud
-        drops hourly and reading that silence as *off* would end a live wash.
+        Three-valued on purpose: the cancel path must not read "unavailable" as
+        "off", or a cloud drop would end a live wash.
         """
         st = self.hass.states.get(self.running_entity) if self.running_entity else None
         if st is None or st.state in UNAVAILABLE_STATES | {"", None}:
@@ -735,20 +608,9 @@ class LaundryCoordinator:
     def _meter_reported_this_session(self) -> bool:
         """Has the energy meter produced a reading since this load began?
 
-        The flat-energy backstop means "the meter rose and then stopped rising,
-        so the load is over". That sentence is only true of a meter that is
-        alive. A value frozen from *before* the session started is not a flat
-        meter, it is no meter — and because ``detect.last_rise_ts`` is seeded
-        when the load starts rather than on a real rise, "flat for an hour"
-        then becomes true on a schedule, whatever the washer is doing.
-
-        Deliberately ``last_changed`` and not ``last_updated``: this asks
-        whether the reading actually *moved* for this load, which is the
-        evidence the backstop spends. An attribute republish carrying the same
-        number is not a meter doing anything.
-
-        True when no session is tracked — the guard is about an active load,
-        and every other caller wants the existing behaviour.
+        Guards the flat-energy backstop against a meter frozen since before
+        the session started. Uses `last_changed`, not `last_updated`: a
+        same-value republish isn't the meter moving. True with no session.
         """
         if self._session_started_ts is None:
             return True
@@ -762,13 +624,9 @@ class LaundryCoordinator:
     def _eta_status(self) -> tuple[bool, bool]:
         """(has_eta, eta_passed) for the washer's own completion estimate.
 
-        ``has_eta`` is True when completion_time holds a real value that was
-        (re)published during the current cycle — a value frozen from a previous
-        load (``last_changed`` before this session started) is treated as no
-        estimate, so a stale ETA can't drive completion. ``eta_passed`` is True
-        once that estimate is in the past. Both False when no load is tracked or
-        completion_time is unavailable (a genuinely offline load). Also snapshots
-        the last good estimate into ``_last_eta_ts`` for the offline-completion.
+        `has_eta` is False for a value frozen from a previous load, so a
+        stale ETA can't drive completion; also False with no load tracked or
+        an unavailable ETA. Snapshots the estimate into `_last_eta_ts`.
         """
         if self._session_started_ts is None:
             return (False, False)
@@ -780,11 +638,9 @@ class LaundryCoordinator:
             return (False, False)
         if target.tzinfo is None:
             target = dt_util.as_utc(target)
-        # Treat the estimate as belonging to this cycle if it was last published
-        # around or after the session began. The margin covers confirm_delay (the
-        # session starts that long after the washer first sets the estimate) so we
-        # don't wrongly reject a fresh estimate and fall back to the offline
-        # backstop; a value frozen from a *previous* load changed long before this.
+        # Margin covers confirm_delay, since the session starts that long after
+        # the washer sets the estimate; a value from a previous load predates
+        # it by much more than this.
         margin = self.confirm_delay + 300
         if st.last_changed.timestamp() < self._session_started_ts - margin:
             return (False, False)  # stale estimate frozen from a previous load
@@ -794,16 +650,9 @@ class LaundryCoordinator:
     def refresh_health(self) -> None:
         """Recompute the health findings and push them to the sensor.
 
-        Cached rather than computed inside the sensor, for the reason the
-        connection-health sensor's attributes are bucketed: the recorder writes
-        a row whenever a state *or an attribute* changes, and several findings
-        carry an age in minutes. Recomputed on read, those would differ on every
-        entity write and the one diagnostic meant to keep the log quiet would
-        instead write history all day. One recompute per 5-minute tick (or per
-        button press), one value until the next.
-
-        Never raises. This runs on a timer, and a health check that can take the
-        coordinator down with it is worse than no health check.
+        Cached, not computed on read: the recorder logs history on every
+        attribute change, and a recomputed age-in-minutes finding would write
+        constantly. Never raises — a crash here is worse than a stale check.
         """
         try:
             snap = self.diagnostic_snapshot()
@@ -838,15 +687,9 @@ class LaundryCoordinator:
     def diagnostic_snapshot(self) -> dict:
         """Everything the health check needs, gathered in one place.
 
-        Deliberately the *live* objects rather than a re-read of the Store: the
-        store is written after a change, so reading it back would show a
-        diagnostic run mid-transition a state that is one save behind. It also
-        means this works before the first save of a fresh install.
-
-        ``watched`` is the washer's own account of itself, and it is the only
-        external truth available — every other field here is the integration
-        reporting on the integration, which cannot catch the case where the bot
-        and the machine disagree.
+        Reads live objects, not the Store, which lags one save behind. Only
+        `watched` is external to the integration, so it's what can catch the
+        bot and the machine disagreeing.
         """
         return {
             "session": {
@@ -881,29 +724,13 @@ class LaundryCoordinator:
                 "job_state": self._entity_state(self.job_state_entity),
                 "eta": self._entity_state(self.eta_entity),
                 "energy": self._entity_state(self.energy_entity),
-                # Reported, and deliberately NOT acted on. field-notes 1.4
-                # records water as the only sensor that told the truth about
-                # whether a load ran, and 3 records the condition attached to
-                # that: nothing gets built on it until a self-clean has been
-                # watched end with water, energy and the two stuck sensors
-                # recorded side by side. Carrying it here (and on the history
-                # card) is how that observation becomes possible without
-                # betting detection on a reading whose *timing* arrives
-                # through the same batching, ~70-minutes-late cloud as
-                # everything else -- see 1.2. Honest value, untrustworthy
-                # clock; it is evidence for a person, not an input to a rule.
+                # For observation only, never detection: honest value, but its
+                # timing arrives through the same laggy cloud as everything else.
                 "water": self._entity_state(self.water_entity),
             },
             "config": {
                 "confirm_delay": self.confirm_delay,
-                # Named by unit, and read through the real property. The first
-                # release of this method read `self.energy_idle`, which does
-                # not exist — and the handler's never-raise wrapper politely
-                # converted that AttributeError into "could not be read" for
-                # every entry, every time. The action shipped dead, and 399
-                # green tests never noticed because nothing called the real
-                # snapshot: the pure suite drove check() with hand-built
-                # dicts. tests/test_coordinator.py now calls this method.
+                # Read through the real property, not a guessed attribute name.
                 "energy_idle_s": self.energy_idle_timeout,
                 "max_session_minutes": MAX_SESSION_MINUTES,
             },
@@ -912,10 +739,9 @@ class LaundryCoordinator:
     def _entity_state(self, entity_id):
         """One watched entity's raw state, or None when unset/missing.
 
-        None covers both "not configured" and "configured but absent", and the
-        check treats them the same: neither can contradict the bot, which is
-        the only thing this field is for. A typo in an entity id therefore
-        shows up as a silently disabled guard rather than as an error.
+        None covers both "not configured" and "absent"; the health check
+        treats them the same, so a typo in an entity id silently disables the
+        guard rather than erroring.
         """
         if not entity_id:
             return None
@@ -926,15 +752,9 @@ class LaundryCoordinator:
     def _publish_running(self) -> None:
         """Tell the planner the live load's window, so its grid can draw ``*``.
 
-        Pushed, never pulled: the assistant must not reach back into the
-        coordinator (§14 rule 5), so that a planner panel still opens when the
-        detection side is wedged. Two floats and no store write, which is what
-        makes it safe to call from a hot path.
-
-        Called from :meth:`_notify_entities`, which every state transition
-        already goes through, *and* from the 5-minute tick. The first makes it
-        prompt; the second makes it self-correcting, so the worst case is one
-        stale grid rather than a ``*`` that never goes away.
+        Pushed, never pulled, so the planner still opens if detection is
+        wedged. Called from every transition and the 5-minute tick, so the
+        worst case is a stale grid, never a stuck ``*``.
         """
         running = self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN)
         self.assistant.note_running(
@@ -944,37 +764,22 @@ class LaundryCoordinator:
 
     @callback
     def _check_time_completion(self, _now=None) -> None:
-        """Time-based completions on the periodic ticks (job 'finish' / the ETA
-        gate normally complete far earlier).
+        """Time-based completions on the periodic ticks.
 
-        - **Offline completion:** the washer has been unavailable a long time AND
-          its last-known ETA has passed (+grace) — finish, flagged *unverified*.
-        - **Max-session:** absolute safety net so a stuck session can't live on.
+        - Offline completion: washer unavailable a long time AND its
+          last-known ETA has passed (+grace) — finish, flagged unverified.
+        - Max-session: absolute safety net so a stuck session can't live on.
 
-        **A self-clean gets both nets too**, which it did not before, and the
-        omission left it as the one session with no time-based way to end at
-        all. Its only two endings are the energy detector and
-        :meth:`_schedule_selfclean_end`, and an outage silences both together:
-        the detector's flat-energy backstop is guarded by ``energy is not None``
-        so it sees nothing while the meter is unavailable, and the end timer is
-        armed by ``running -> "off"`` or ``machine_state -> "stop"``, neither of
-        which is the value ``"unavailable"``. A cloud drop that outlasts the
-        cycle therefore held the session open indefinitely — and, because
-        :meth:`_on_detector_started` returns early on ``self_clean``, swallowed
-        every real load after it: no card, no claim button, no completion ping.
-        A normal load had two independent nets for exactly this; a self-clean
-        had none.
+        Both apply to a self-clean too: its only other endings (the energy
+        detector, `_schedule_selfclean_end`) go silent during an outage,
+        wedging the session and blocking every load after it.
         """
-        # Before the stage guard: an idle machine is exactly when the planner
-        # most needs telling there is nothing running.
+        # Before the stage guard: idle is exactly when the planner needs telling.
         self._publish_running()
         if self.stage not in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             return
-        # Which ending applies is the stage's business, not the net's: a
-        # self-clean has no claimant, no queue and no card to announce, so it
-        # closes through its own finisher. Routing it through
-        # ``_async_handle_finished`` would be a no-op — that method refuses any
-        # stage but washing/drying — which is how this was silently missing.
+        # Self-clean has no claimant/queue/card, so it closes through its own
+        # finisher; `_async_handle_finished` refuses any stage but wash/dry.
         selfclean = self.stage == STAGE_SELF_CLEAN
         now = dt_util.utcnow().timestamp()
         if offline_completion_due(
@@ -988,8 +793,7 @@ class LaundryCoordinator:
             if selfclean:
                 self._create_task(self._async_finish_selfclean())
                 return
-            # Only a load has a card that hedges its wording; the self-clean
-            # embed says "the drum is clean" either way.
+            # Only a load's card hedges wording; self-clean says "clean" either way.
             self._offline_unverified = True
             self._create_task(self._async_handle_finished())
             return
@@ -1007,26 +811,14 @@ class LaundryCoordinator:
     ) -> None:
         """Drive the energy-primary liveness core from current sensor readings.
 
-        Called from every signal (energy/job/machine/running changes, the health
-        tick, the ETA tick, bot-ready). The detector dedupes — it only emits an
-        event on a real transition — so calling this often is safe and cheap.
+        Called from every signal; the detector dedupes, so calling this often
+        is safe. The two fast-paths fail differently:
 
-        The job fast-paths are two different bets and are gated separately,
-        because they fail differently:
-
-        * ``allow_early`` — trust an early phase (and ``finish``) on the
-          cloud's word alone, before the meter has moved. The whole value is
-          starting the card before this meter's 15-45 minute lag; the whole
-          risk is that a *replayed* phase mints a load out of nothing, which
-          is exactly what a reconnect and a restore both delivered. Only the
-          debounced confirm path may set it, and only for a value that did
-          not arrive from a flap. The ``finish`` accelerant rides on this half
-          for the same reason: a replayed ``finish`` is the mirror phantom —
-          it would complete a live load early.
-        * ``allow_catchup`` — trust a mid-cycle phase only when the meter has
-          moved since idle (detect.py enforces the corroboration). Safe by
-          construction against a flat meter, so the restore and even a
-          flap-arrived confirm may set it freely.
+        * `allow_early` — trust an early phase (or `finish`) on the cloud's word
+          alone; only the debounced, non-flap confirm may set it, since a
+          replayed phase would mint (or end) a phantom load.
+        * `allow_catchup` — trust a mid-cycle phase only once the meter has
+          moved since idle (detect.py), safe even for a flap-arrived value.
         """
         self._track_offline()
         phase = self._job_phase()
@@ -1070,9 +862,8 @@ class LaundryCoordinator:
         """A load began. Decide normal vs self-clean and open a session."""
         if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             return  # already tracking (shouldn't happen; detector is deduped)
-        # A real wash phase => a normal load (online). No phase but the washer is
-        # running with job stuck at 'none' => a self-clean. Otherwise the data
-        # arrived after the fact (offline) => a normal catch-up load.
+        # A real phase: normal load. No phase but running with job stuck at
+        # 'none': self-clean. Otherwise: an offline catch-up load.
         if phase in REAL_PHASES:
             _LOGGER.debug("Detector: load started (job=%s)", phase)
             self._create_task(self._async_start_session())
@@ -1103,8 +894,7 @@ class LaundryCoordinator:
         new = event.data.get("new_state")
         if new is None:
             return
-        # Self-clean ends quickly when the washer stops (faster than the energy
-        # idle-timeout, which is the backstop).
+        # Faster than the energy idle-timeout backstop.
         if self.stage == STAGE_SELF_CLEAN and new.state == "off":
             self._schedule_selfclean_end()
             return
@@ -1113,16 +903,12 @@ class LaundryCoordinator:
             cancel_mod.running_off_signalled(
                 old.state if old is not None else None,
                 new.state,
-                # This sensor cannot tell a pause from a stop; machine_state can,
-                # both live and via ``self.paused``. Without that entity there is
-                # nothing to veto it, so it does not arm a stop alone — see
-                # cancel.running_off_signalled.
+                # This sensor can't tell pause from stop; machine_state can veto
+                # it. Without that entity configured, nothing vetoes a stop alone.
                 machine_state_configured=bool(self.machine_state_entity),
             )
         ):
-            # The second way "somebody stopped it" reaches us: a corroborating
-            # trigger for the machine_state signal, faster on units where the
-            # running sensor moves first.
+            # Corroborating trigger — faster on units where running moves first.
             self._schedule_stop_confirm()
         self._feed_detector()
 
@@ -1141,21 +927,15 @@ class LaundryCoordinator:
                 self.paused = False
                 self._create_task(self._async_render_active("resumed"))
             elif new_s == MACHINE_STOP and self.paused:
-                # Cancelling is Start/Pause then Stop on most combo units, so
-                # `pause -> stop` is the *ordinary* cancel. Clear the flag at
-                # the source: the load is no longer on hold, and a stale
-                # "paused" would otherwise outlive the session in the card, in
-                # the persisted state and in the stop verdict. No "resumed"
-                # render — the stop confirm below decides what this card says.
+                # pause -> stop is the ordinary cancel on combo units. Clear the
+                # flag here so it can't outlive the session; no "resumed" render,
+                # the stop confirm below decides what the card says.
                 self.paused = False
             old = event.data.get("old_state")
             if cancel_mod.machine_stop_signalled(
                 old.state if old is not None else None, new_s
             ):
-                # A stop while a load is being tracked. Debounced, then judged —
-                # this is the only route by which "the human ended the cycle"
-                # can ever finish a load (see cancel.py for why it isn't in
-                # detect.py).
+                # The only route from "a human ended the cycle" to a finished load.
                 self._schedule_stop_confirm()
         elif self.stage == STAGE_SELF_CLEAN:
             if new_s == MACHINE_STOP:
@@ -1167,10 +947,9 @@ class LaundryCoordinator:
     def _on_job_state(self, event: Event) -> None:
         """Record connection flaps, then (re)arm the confirm-debounce.
 
-        job_state is no longer authoritative for start/stop — that's the energy
-        meter. We still debounce it (``confirm_delay``) and act on the settled
-        value for *enrichment*: the fast-start accelerant, the wash->dry display
-        transition, and the fast 'finish' completion path.
+        job_state no longer decides start/stop (the energy meter does); the
+        debounced, settled value only drives enrichment: the fast-start
+        accelerant, the wash->dry display, and the fast 'finish' completion.
         """
         new = event.data.get("new_state")
         if new is None:
@@ -1179,14 +958,9 @@ class LaundryCoordinator:
         old = event.data.get("old_state")
         old_s = old.state if old is not None else None
 
-        # An attribute-only republish — HA fires state_changed for those too —
-        # is not a transition. Returning here is load-bearing, not tidiness:
-        # this handler used to overwrite `_job_from_flap` on every event, so a
-        # reconnect's `unavailable -> wash` (flag set True) followed seconds
-        # later by a `wash -> wash` attribute update (flag stomped back to
-        # False, debounce re-armed) handed the replayed phase the fast start
-        # after all — the exact phantom v0.28.1 was written to stop, minted
-        # through a two-event reconnect instead of one.
+        # An attribute-only republish is not a transition. Load-bearing, not
+        # tidiness: without this return, a later same-value update re-arms the
+        # debounce and can hand a replayed phase the fast start after all.
         if old_s == new_s:
             return
 
@@ -1194,36 +968,16 @@ class LaundryCoordinator:
         if new_s == "unavailable" and old_s not in (None, "unavailable"):
             self._record_flap()
 
-        # Ignore values that are themselves a flap (the `not_to:` half).
+        # Ignore values that are themselves a flap.
         if new_s in UNAVAILABLE_STATES:
             return
 
-        # ...and remember when the value arrived *from* one (the `not_from:`
-        # half, which this comment has always claimed and the code never did).
-        #
-        # This washer's cloud drops on a metronome — 19 drops in 15.5 hours,
-        # 3087 seconds apart — and on reconnect it republishes the phase it
-        # last saw. A stale `wash` replayed that way is indistinguishable here
-        # from a real one, so the fast-start accelerant minted a load out of a
-        # reconnect: session start exactly `confirm_delay` after the drop, an
-        # energy meter that never moved (energy_start == idle_energy ==
-        # last_energy), and no ETA ever published because there was nothing to
-        # estimate. It then closed itself an hour later by announcing a load
-        # that never happened.
-        #
-        # The rule already existed and was already trusted — `cancel.is_flap`
-        # guards both stop routes, and its docstring cites *this function* as
-        # the prior art. It was the one place not applying it.
+        # A value arriving FROM `unavailable` is a cloud reconnect replaying the
+        # last phase, not a new load — trusting it would mint (or end) a session
+        # that never happened. See cancel.is_flap.
         self._job_from_flap = cancel_mod.is_flap(old_s)
-        # ...and remember WHEN, not only whether. The per-value flag alone can
-        # be laundered: a reconnect that passes through an intermediate real
-        # value (`unavailable -> none`, then `none -> wash`) hands the second
-        # transition a clean old_state, and the replayed phase regains the
-        # fast start. Reconnect chains complete within seconds, so a short
-        # window after any recovery covers every shape of replay, while a
-        # genuine start that merely lands near a reconnect loses nothing but
-        # the accelerant — the meter or the next settled transition still
-        # starts it.
+        # The flag alone can be laundered by an intermediate value
+        # (`unavailable -> none -> wash`), so also keep a short recovery window.
         if self._job_from_flap:
             self._flap_recovery_ts = dt_util.utcnow().timestamp()
         self._schedule_job_confirm()
@@ -1243,18 +997,17 @@ class LaundryCoordinator:
 
     @callback
     def _async_job_confirmed(self, _now=None) -> None:
-        """Act on the *settled* job_state: feed the detector + drive enrichment.
+        """Act on the settled job_state: feed the detector, drive enrichment.
 
-        Start/finish decisions live in the detector now (energy-primary); here we
-        only (a) feed it the early/finish accelerants and (b) flip the embed to
-        'Drying' when the wash->dry transition is confirmed mid-load.
+        Start/finish decisions live in the detector (energy-primary); this only
+        feeds the early/finish accelerants and flips the embed to 'Drying' on a
+        confirmed mid-load wash->dry transition.
         """
         self._job_confirm_unsub = None
         from_flap = self._job_from_flap
         self._job_from_flap = False
-        # The time memory backs up the flag — see _on_job_state. The window
-        # must outlast the debounce, or a launder chain whose last hop re-armed
-        # the timer would settle just past its own recovery stamp.
+        # Window must outlast the debounce, or a launder chain whose last hop
+        # re-armed the timer would settle just past its own recovery stamp.
         if not from_flap and self._flap_recovery_ts is not None:
             since = dt_util.utcnow().timestamp() - self._flap_recovery_ts
             from_flap = since < (self.confirm_delay + 90)
@@ -1262,19 +1015,9 @@ class LaundryCoordinator:
         if job is None:
             return  # not settled to a real value yet
 
-        # Let the detector see the settled phase. The job fast-paths — the
-        # early-phase start and the `finish` completion — are enabled only when
-        # this value did not arrive from a reconnect: debouncing proves a value
-        # is *settled*, which is not the same as proving it is *new*, and a
-        # republished phase is perfectly settled.
-        #
-        # Suppressed rather than dropped, and only the half that needs it.
-        # The catch-up half stays on even for a flap-arrived value, because it
-        # is corroborated by construction — it requires the meter to have
-        # moved since idle, and the incident's meter provably had not
-        # (11.6 == 11.6 == 11.6). A replayed mid-cycle phase whose meter HAS
-        # moved is a load that is genuinely running, and refusing to pick it
-        # up would trade a phantom for a miss.
+        # allow_early is suppressed for a flap-arrived value: debouncing proves
+        # settled, not new. allow_catchup stays on regardless, since it requires
+        # the meter to have moved since idle.
         self._feed_detector(allow_early=not from_flap, allow_catchup=True)
 
         if job == JOB_STATE_FINISH:
@@ -1282,8 +1025,6 @@ class LaundryCoordinator:
             return
 
         if job in REAL_PHASES:
-            # Enrichment only: flip the live embed to 'Drying' on the confirmed
-            # wash->dry transition while a load is being tracked.
             if (
                 self.stage in (STAGE_WASHING, STAGE_DRYING)
                 and job == JOB_STATE_DRYING
@@ -1299,14 +1040,10 @@ class LaundryCoordinator:
     def _schedule_stop_confirm(self) -> None:
         """(Re)arm the stop-confirm debounce; collapses rapid changes.
 
-        The same shape as :meth:`_schedule_job_confirm` and on the same
-        ``confirm_delay``, which is the point: this washer's cloud drops to
-        ``unavailable`` on a ~51-minute timer, and an undebounced stop signal
-        would end live washes. ``confirm_delay`` is sufficient on its own here
-        and gets no second setting — the flap values never arm this at all
-        (:func:`cancel.is_flap`), and :meth:`_async_stop_confirmed` re-reads the
-        live sensors rather than trusting the event that armed it, so a stop
-        that has gone away by the time this fires decides nothing.
+        Same `confirm_delay` as the job debounce: an undebounced stop would end
+        live washes on every cloud drop. `_async_stop_confirmed` re-reads live
+        sensors rather than trusting the arming event, so a stop that's gone by
+        the time it fires decides nothing.
         """
         self._cancel_stop_confirm()
         delay = self.confirm_delay
@@ -1325,14 +1062,11 @@ class LaundryCoordinator:
 
     @callback
     def _async_stop_confirmed(self, _now=None) -> None:
-        """Act on a stop that is *still* a stop ``confirm_delay`` later.
+        """Act on a stop that is still a stop `confirm_delay` later.
 
-        Everything decided here is decided in :mod:`cancel`, from the live
-        readings — including the difference between "stopped early" and "it
-        finished", which is the washer's own estimate. Nothing in
-        :mod:`detect` is consulted or changed: the ETA gate keeps a frozen
-        meter from firing a false done, and this path is keyed off a different
-        signal entirely.
+        The verdict (stopped-early vs finished) is decided in `cancel`, from
+        live readings. Doesn't touch `detect` — this path is keyed off a
+        different signal entirely.
         """
         self._stop_confirm_unsub = None
         has_eta, eta_passed = self._eta_status()
@@ -1344,20 +1078,17 @@ class LaundryCoordinator:
             paused=self.paused,
             has_eta=has_eta,
             eta_passed=eta_passed,
-            # The last *confirmed* phase counts as well as the live one: at the
-            # natural end of a cycle the machine stops and job_state reports
-            # 'finish', and if that value has since flapped to unavailable we
-            # would otherwise call a real completion "stopped early" on the
-            # strength of an estimate that ran long. A cancel can't be mistaken
-            # for it — job_state goes to 'none' there, which clears this.
+            # Checks the last confirmed phase too, not just the live one: if
+            # job_state hit 'finish' and then flapped to unavailable, this must
+            # not read a real completion as "stopped early".
             job_finished=JOB_STATE_FINISH
             in (self._job_phase(), self._last_real_phase),
         )
         if verdict == cancel_mod.VERDICT_IGNORE:
             return
-        # ``_eta_status`` has just refreshed ``_last_eta_ts`` if there is a real
-        # estimate for this cycle; without one there is no margin to measure and
-        # the retraction test refuses on its own.
+        # `_eta_status` just refreshed `_last_eta_ts` if there's a real
+        # estimate; without one there's no margin, and the retraction test
+        # refuses on its own.
         remaining = (
             self._last_eta_ts - dt_util.utcnow().timestamp()
             if has_eta and self._last_eta_ts is not None
@@ -1367,9 +1098,8 @@ class LaundryCoordinator:
         self._create_task(
             self._async_handle_finished(
                 cancelled=verdict == cancel_mod.VERDICT_STOPPED,
-                # Deliberately *not* the same boolean as the wording. Deleting
-                # somebody's history row is irreversible; calling a completion
-                # "stopped early" is not.
+                # Not the same boolean as the wording: deleting a history row
+                # is irreversible, calling a completion "stopped early" isn't.
                 retract=cancel_mod.retracts_history(
                     verdict=verdict,
                     machine_state=machine_state,
@@ -1382,9 +1112,8 @@ class LaundryCoordinator:
     def _looks_like_selfclean(self) -> bool:
         """Washer is running but job_state is stuck at 'none' (a self-clean).
 
-        Used purely to *label* a detector-started cycle (energy is what decides a
-        cycle is running). A real load shows wash phases; a self-clean never
-        leaves 'none' while the machine reports running.
+        Only labels a detector-started cycle; energy decides that one is
+        running at all. A real load shows wash phases, a self-clean never does.
         """
         if self._job_phase() != JOB_STATE_NONE:
             return False
@@ -1451,26 +1180,18 @@ class LaundryCoordinator:
     # ------------------------------------------------------- lifecycle actions
     async def _async_start_session(self, *, offline: bool = False) -> None:
         async with self._lock:
-            # A wash already in progress wins. A previous *finished* load (still
-            # showing its claim/unclaim message) is simply superseded by this one.
+            # A wash in progress wins; a previous finished load is simply superseded.
             if self.stage in (STAGE_WASHING, STAGE_DRYING):
                 _LOGGER.debug("Start ignored; wash already active (stage=%s)", self.stage)
                 return
-            # An offline detection can race the self-clean path (both fire while
-            # job_state is dark); if a self-clean took the session first, yield.
+            # Can race the self-clean path; yield if self-clean already took it.
             if offline and self.stage == STAGE_SELF_CLEAN:
                 return
-            # Who claimed the *previous* load, captured before the reset below
-            # wipes it — they're the one person the line rolls forward without.
+            # Captured before the reset wipes it, for the queue carry-forward below.
             prev_claimant_id = self.claimed_by_id
-            # Everything from here to the post mutates live session state, and
-            # the post can fail (Discord 5xx, a revoked token, a channel that
-            # was deleted). Snapshot first, because the rollback below used to
-            # restore the stage and the detector and nothing else -- leaving the
-            # superseded load's claimant, its queue, its handoff, its emptied
-            # flag and a session anchor for a session that does not exist. On an
-            # install where the post fails repeatedly (which is what the live
-            # logs showed) every retry silently erased another load's claim.
+            # Snapshot every mutated field before the post, which can fail —
+            # rollback must restore all of them, or a failed post silently loses
+            # the superseded load's claim, queue and handoff.
             rollback = {
                 "waiting": self.waiting,
                 "claimed_by": self.claimed_by,
@@ -1498,10 +1219,7 @@ class LaundryCoordinator:
             self.claimed_by_id = None
             self.quiet = False
             self.message_id = None
-            # The line survives into this load minus whoever just took the
-            # machine: A's load finishes, B claims the next one, C is still
-            # waiting. Stale taps age out here too, so a line nobody cleared
-            # overnight can't strand tomorrow's handoff.
+            # Carries forward minus whoever just took the machine; stale entries age out too.
             self.queue = queue.carry_forward(
                 self.queue,
                 prev_claimant_id,
@@ -1509,46 +1227,33 @@ class LaundryCoordinator:
                 float(self.queue_expiry),
             )
             self.emptied = False
-            # ...and so did its handoff record. Reset wherever `emptied` is:
-            # the two describe the same finished load, and a stale name here
-            # would have the new card announcing the last load's handoff.
+            # Reset alongside `emptied`: a stale name would misattribute the handoff.
             self.handoff_name = None
             self.handoff_hedged = False
             self.cancelled = False  # belonged to the load this one supersedes
-            # Any pending handoff belonged to the load this one supersedes.
+            # Any pending handoff or stop-confirm belonged to the superseded load.
             self._cancel_handoff_timer()
-            # ...as did any stop signal still waiting to be confirmed: this load
-            # is the proof that whatever stopped, stopped before it.
             self._cancel_stop_confirm()
             self.paused = self._machine_state() == MACHINE_PAUSE
-            # Seed the last confirmed phase from the current job state so a
-            # caught-up (already-drying) load still detects its finish.
+            # Seeds the phase so an already-drying catch-up still detects its finish.
             job = self.hass.states.get(self.job_state_entity)
             phase = job.state if job is not None else None
             self._last_real_phase = phase if phase in REAL_PHASES else None
-            # Start directly in the Drying stage if caught already drying.
             self.stage = STAGE_DRYING if phase == JOB_STATE_DRYING else STAGE_WASHING
-            # An offline load is detected after the fact (job_state was dark, so
-            # no phase to anchor to) — treat it as a mid-cycle pickup so it reads
-            # "in progress" and shows no false usage baseline; the detector's
-            # idle-timeout closes it once the meter settles.
+            # Offline load: treat as mid-cycle so it shows no false usage baseline.
             self.catch_up = offline or phase in MIDCYCLE_PHASES
-            # Capture meter baselines for the usage stat — only meaningful for a
-            # load we see from the start (a catch-up has no true baseline).
+            # Baselines are only meaningful for a load seen from the start.
             if self.catch_up:
                 self._energy_start = self._water_start = None
             else:
                 self._energy_start = self._entity_float(self.energy_entity)
                 self._water_start = self._entity_float(self.water_entity)
-            # Anchor the ETA-freshness check + max-session net to this load.
             self._session_started_ts = dt_util.utcnow().timestamp()
             self._offline_since = None
             self._last_eta_ts = None
             self._offline_unverified = False
 
-            # The start post is a normal, visible message with the Claim button
-            # so people can call dibs early. It never @mentions anyone — the only
-            # ping is to the claimant when the load is done.
+            # Visible message with the Claim button; never @mentions anyone.
             embed = self.build_embed()
             try:
                 self.message_id = await self.bot.async_post(
@@ -1559,17 +1264,12 @@ class LaundryCoordinator:
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to post laundry start message")
-                # Put the superseded load back exactly as it was. The two
-                # timers cancelled above (handoff, stop-confirm) cannot be
-                # un-cancelled and are deliberately not faked here: losing a
-                # pending handoff is a missed ping, while a restored-but-dead
-                # timer would be a lie the rest of the machine acts on.
+                # The two timers cancelled above stay cancelled rather than faked
+                # back: a restored-but-dead timer would be a lie the machine acts on.
                 for attr, value in rollback.items():
                     setattr(self, attr, value)
                 self._detector.reset()  # don't strand the detector as active
-                # The post awaits, so another task may have read the half-built
-                # session while it was in flight; refresh so nothing keeps the
-                # values this method was in the middle of writing.
+                # A concurrent reader may have seen the half-built session; refresh now.
                 self._notify_entities()
                 return
 
@@ -1578,26 +1278,13 @@ class LaundryCoordinator:
             self._notify_entities()
 
     async def _async_handle_drying(self) -> None:
-        """Flip the live card to 'Drying'. **Display only** — it starts nothing.
+        """Flip the live card to 'Drying'. Display only — it starts nothing.
 
-        The guard is a whitelist, and it has to be. It used to refuse only
-        ``STAGE_IDLE``, which reads as "refuse when nothing is happening" and is
-        not the same thing: this method is queued from
-        :meth:`_async_job_confirmed`, which first calls ``_feed_detector`` — and
-        that call can emit ``EV_FINISHED`` and queue :meth:`_async_handle_finished`
-        against the same lock. The two tasks run FIFO, so the drying edit lands
-        *after* the completion, and the stage it was scheduled on is stale.
-
-        Putting a ``done_waiting`` session back into ``drying`` wedged the state
-        machine permanently, and every escape route with it: the detector had
-        already been reset to idle so it could not emit another finish,
-        ``_session_started_ts`` had been cleared so the 12-hour max-session net
-        read False, ``_last_eta_ts`` had been cleared so the offline completion
-        read False, and :meth:`_on_detector_started` and
-        :meth:`_async_start_session` both return early on ``drying`` — so no
-        later load ever posted a card either. Only ``reset_session`` recovered
-        it, after somebody had been DMed "your laundry's done" and then watched
-        the card go back to "🌀 Drying".
+        The guard must be a whitelist (only washing/drying), not "not idle":
+        this is queued from `_async_job_confirmed`, whose `_feed_detector`
+        can itself queue `_async_handle_finished` on the same lock. If that
+        runs first, the stage here is stale (`done_waiting`), and writing
+        `drying` over it wedges the session for good.
         """
         async with self._lock:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
@@ -1616,19 +1303,14 @@ class LaundryCoordinator:
     async def _async_handle_finished(
         self, *, cancelled: bool = False, retract: bool = False
     ) -> None:
-        """End the tracked load. ``cancelled`` means the cycle didn't finish.
+        """End the tracked load. `cancelled` means the cycle didn't finish.
 
-        One completion path for every way a load can end (job 'finish', the ETA
-        gate, the offline path, the max-session net and now a stop on the
-        machine) so the handoff, the queue carry and the persistence can't drift
-        apart.
-
-        ``cancelled`` decides what is *said* — the card, the ping — and whether
-        a claim tapped from here on is logged. ``retract`` decides the one
-        irreversible thing: deleting the claimant's existing history row for
-        this load. They are separate arguments because they answer to different
-        standards of proof (see :func:`cancel.retracts_history`); a hedged
-        wording costs one card, a wrong deletion is permanent.
+        One completion path for every way a load can end, so the handoff,
+        queue carry and persistence can't drift apart. `cancelled` decides
+        what's said (card, ping) and whether a later claim is logged;
+        `retract` decides the one irreversible thing — deleting the
+        claimant's history row — and needs stronger evidence (see
+        `cancel.retracts_history`).
         """
         async with self._lock:
             if self.stage not in (STAGE_WASHING, STAGE_DRYING):
@@ -1638,38 +1320,22 @@ class LaundryCoordinator:
             self.stage = STAGE_DONE_WAITING
             self.paused = False
             self.cancelled = cancelled
-            # Keep the detector in lockstep with the session, regardless of which
-            # path completed the load (dry timer, job 'finish', energy backstop).
+            # Keep the detector in lockstep regardless of which path completed the load.
             self._detector.reset()
-            # Captured before the reset below: it bounds the history retraction
-            # to this load's own session.
+            # Captured before the reset: bounds the history retraction to this session.
             started_ts = self._session_started_ts
             self._session_started_ts = None
             self._offline_since = None
             self._last_eta_ts = None
             unverified = self._offline_unverified
-            # A pre-claim made during the wash carries through to completion.
             claimed = self.claimed_by != UNCLAIMED and self.claimed_by_id is not None
             self.waiting = not claimed
-            # Done is not empty: this load's clothes are still in the drum until
-            # somebody says otherwise, so every completion starts un-emptied,
-            # and with nobody yet told the machine is theirs.
-            self.emptied = False
+            self.emptied = False  # done is not empty; every completion starts un-emptied
             self.handoff_name = None
             self.handoff_hedged = False
-            # A cancel is not a wash (design doc §2). A claim made *during* the
-            # wash has already written its history row, so the row is retracted
-            # here — inside the transition that decided this load never
-            # happened — rather than being left for a reader to filter out.
-            # Bounded to this session's window, so an earlier real load of
-            # theirs can't be caught by it. A claim tapped *after* this point is
-            # stopped at the other end, by the `cancelled` check in
-            # handle_claim: between them a stopped cycle has no route into the
-            # model that predicts everybody's wash times.
-            # ...and only when the stop is unambiguous enough to stand behind
-            # deleting data (``retract``, not ``cancelled``): a real completion
-            # that merely beat its own drifting estimate reaches this transition
-            # worded as a stop, and must not take somebody's history with it.
+            # A cancel is not a wash: retract a mid-wash claim's history row, bounded
+            # to this session. Gated on `retract`, not `cancelled` — a real completion
+            # that merely beat its own estimate must not take history with it.
             if retract and claimed and started_ts is not None:
                 await self.assistant.async_forget_load(
                     self.claimed_by_id, started_ts, dt_util.utcnow().timestamp()
@@ -1684,9 +1350,8 @@ class LaundryCoordinator:
                 else ""
             )
             if cancelled:
-                # Never "done". The bot knows this cycle didn't finish, and a
-                # completion ping that turns out to be wrong is how the pings
-                # stop being read at all.
+                # Never "done" — a wrong completion ping is how pings stop
+                # being trusted.
                 ping_body = (
                     "🛑 Looks like your load was **stopped early** — the washer's "
                     "free, but your things are probably still in it."
@@ -1713,33 +1378,24 @@ class LaundryCoordinator:
                 if self.message_id:
                     await self.bot.async_edit(self.message_id, embed, view=view)
                 if claimed and self.quiet:
-                    # Quiet mode: name them, but no @mention and no push — a
-                    # visible "done" that won't wake them.
+                    # Named, no @mention, no push — visible but won't wake them.
                     await self.bot.async_announce_done(quiet_body)
                 elif claimed and self.ping_claimant_on_complete:
-                    # The one push per load, routed by whatever the claimant
-                    # chose in 🤖 — an @mention in the channel unless they've
-                    # opted into a DM. Unset means channel, i.e. unchanged.
+                    # Routed by their 🤖 preference: @mention unless they chose a DM.
                     await self.assistant.async_route_ping(
                         self.claimed_by_id,
                         dm_text=ping_body,
                         channel_text=f"<@{self.claimed_by_id}> {ping_body}",
                     )
                 elif not claimed:
-                    # Nobody claimed it: no @ping, but drop a short, push-silent
-                    # text nudge at the bottom of the channel so the finished load
-                    # is visible (the original card above keeps the Claim button).
-                    # Plain text, not a second embed, so it isn't a duplicate card.
+                    # Push-silent nudge, not a second embed, so it's visible
+                    # without duplicating the card.
                     await self.bot.async_announce_done(grabs)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to update finished state")
-            # The handoff. A claimed load is released by the claimant's ✅ tap,
-            # with the fallback timer as the backstop for when they forget. An
-            # *unclaimed* one has nobody to do the emptying, so whoever's next
-            # is told straight away — in addition to the up-for-grabs nudge
-            # above, which is aimed at the house rather than at them.
-            # NOTE: the lock is already held here, hence the _locked variant —
-            # asyncio.Lock is not reentrant and would deadlock the session.
+            # Claimed: released by the tap, fallback timer as backstop. Unclaimed:
+            # nobody to empty it, so whoever's next is told now. Lock already held;
+            # asyncio.Lock isn't reentrant, hence _locked.
             if claimed:
                 self._arm_handoff_timer()
             else:
@@ -1815,27 +1471,16 @@ class LaundryCoordinator:
             return False
         self.claimed_by = who
         self.claimed_by_id = user_id
-        # Taking the machine means you are no longer waiting for it (§4.3). The
-        # carry-forward at session start can only drop the *previous* load's
-        # claimant — this load's claimant isn't known until right now — so
-        # without this the card would read "Claimed by 🧺 Alex / Next up 🔜
-        # Alex", and Alex would later be handed the washer they are using.
+        # Taking the machine means you're no longer waiting for it; the session-start
+        # carry-forward can only drop the previous claimant, not this one.
         self.queue = queue.remove_user(self.queue, user_id)
         if self.stage == STAGE_DONE_WAITING:
             self.waiting = False
         await self._async_save()
         self._notify_entities()
-        # A Claim tap is the habit model's only data point (design doc §7.1),
-        # and reporting it is the whole of the coordinator's involvement:
-        # consent, de-duplication, retention and whether any of it is ever
-        # rendered are the assistant's business. Never raises.
-        #
-        # ...except on a load that was stopped on the machine, which is not a
-        # wash and must never move somebody's predicted times. Claiming one is
-        # still allowed and still useful — it is how you say "those are mine,
-        # I'll deal with it" — it just isn't evidence. The card says "stopped
-        # early", so the state that decides the wording is also the state that
-        # decides this: one flag, no second notion of a cancelled load.
+        # Reports the claim as the habit model's only data point; consent, dedup
+        # and retention are the assistant's business. Skipped when cancelled: a
+        # stopped load isn't a wash and must not move anyone's predicted times.
         if not self.cancelled:
             await self.assistant.async_note_claim(user_id)
         return True
@@ -1869,15 +1514,13 @@ class LaundryCoordinator:
     async def handle_next_toggle(self, who: str, user_id: int) -> str:
         """Join or leave the "I'm next" line (the 🔜 button).
 
-        Returns one of the ``queue.TOGGLE_*`` results so the button can pick its
-        reply — ``TOGGLE_STALE`` on a tap against an old card with no live load
-        behind it, which is what happens when someone scrolls up in the channel.
+        Returns one of the `queue.TOGGLE_*` results; `TOGGLE_STALE` means a tap
+        against an old card with no live load behind it.
         """
         if self.stage not in self._CLAIMABLE_STAGES:
             return queue.TOGGLE_STALE
         now = dt_util.utcnow().timestamp()
-        # Prune before toggling: an expired entry must not hold a slot against
-        # the cap, and whatever we re-render should already be the current line.
+        # Prune before toggling: an expired entry must not hold a slot against the cap.
         pruned = queue.prune(self.queue, now, float(self.queue_expiry))
         self.queue, result = queue.toggle_member(pruned, user_id, who, now)
         await self._async_save()
@@ -1885,31 +1528,21 @@ class LaundryCoordinator:
         return result
 
     async def handle_emptied(self) -> bool:
-        """The claimant confirming the drum is actually clear (the ✅ button).
+        """The claimant confirming the drum is clear (the ✅ button).
 
-        This is the handoff trigger — completion only means the machine stopped,
-        and pinging someone to a full washer is how the ping stops being
-        trusted. Returns False on a stale tap.
-
-        The ``emptied`` half of the guard matters: the button vanishes once
-        tapped, but a card further up the channel that never got its edit
-        through still shows it — and a second tap must not hand the machine to
-        a second person.
+        The real handoff trigger — completion only means the machine stopped.
+        Returns False on a stale tap. The `emptied` guard matters because a
+        stale card (an edit that never landed) can still show the button, and
+        a second tap must not hand the machine to a second person.
         """
         if self.stage != STAGE_DONE_WAITING or self.emptied:
             return False
         self.emptied = True
-        # The backstop exists for exactly this not happening; it just did.
         self._cancel_handoff_timer()
         await self._async_save()
         self._notify_entities()
-        # The handoff is deliberately *not* awaited. It takes the session lock
-        # and does two Discord round trips (the ping, then the card refresh),
-        # and the button's callback still has to answer the interaction inside
-        # Discord's 3-second window — one rate-limit sleep on the message-edit
-        # bucket and the token is dead, leaving the tapper with "interaction
-        # failed" and a card that still offers ✅. State is already saved, so
-        # the ping is safe to finish on its own.
+        # Not awaited: takes the lock and does two round trips, and this callback
+        # must answer Discord's interaction within 3 seconds. State is already saved.
         self._create_task(
             self._async_ping_next(hedged=False, expect_emptied=True)
         )
@@ -1917,30 +1550,18 @@ class LaundryCoordinator:
 
     # ------------------------------------------------------------- the handoff
     async def _async_ping_next_locked(self, *, hedged: bool) -> None:
-        """Hand the washer to whoever is next. **Assumes the lock is held.**
+        """Hand the washer to whoever is next. Assumes the lock is held.
 
-        ``asyncio.Lock`` is not reentrant, so the caller that already owns it
-        (``_async_handle_finished``) must use this variant — taking the lock a
-        second time there would deadlock the whole session machine.
-
-        ``hedged`` softens the wording for the fallback timer, where nobody has
-        confirmed anything and we genuinely don't know the machine is free.
+        `asyncio.Lock` isn't reentrant, so a caller that already holds it
+        (`_async_handle_finished`) must use this variant, not take it again.
+        `hedged` softens the wording for the fallback timer, where nothing is
+        actually confirmed.
         """
         now = dt_util.utcnow().timestamp()
         claimant_id = self.claimed_by_id
-        # A load can only be handed off once. All three moments converge here,
-        # and two of them can fire for the *same* load: the backstop timer pings
-        # the head of the line, and the claimant taps ✅ afterwards. The
-        # ``expect_emptied`` guard in :meth:`_async_ping_next` catches the
-        # opposite order and not this one, so without this the queue pops twice
-        # and two people are each told the same washer is theirs — the second of
-        # them waiting on a machine that is already somebody's.
-        #
-        # ``handoff_name`` is set only when somebody was actually taken off the
-        # line, so a handoff attempted against an *empty* line leaves this open
-        # for a real one to whoever joins afterwards. A repeat still falls
-        # through to the card refresh below, because the state it renders (the
-        # ✅ button going away once ``emptied`` is set) did change.
+        # Handed off only once: the backstop timer and a later ✅ tap can both
+        # reach here for the same load. `handoff_name` set means it already
+        # happened — skip the pop (the card refresh below still runs).
         head = None
         already_handed_off = self.handoff_name is not None
         if not already_handed_off:
@@ -1949,19 +1570,8 @@ class LaundryCoordinator:
             head, self.queue = queue.select_handoff(
                 self.queue, now, float(self.queue_expiry), self.claimed_by_id
             )
-            # All three handoff moments — the ✅ tap, the fallback timer and an
-            # unclaimed completion — arrive here, so this is where "the washer
-            # is now free" already exists. Announcing it costs nothing when
-            # nobody is listening and saves the planner inventing a second one
-            # (§14 rule 5).
-            #
-            # Announced *after* the pop, and carrying its outcome, because the
-            # answer to "is the washer free" is not the same before and after: a
-            # machine just handed to the head of the 🔜 line is somebody's, and
-            # a listener told otherwise would tell a second person the same
-            # machine is theirs. ``hedged`` travels for the same reason — at the
-            # backstop nobody has confirmed anything, so "free" is a guess and a
-            # listener must be allowed to apply its own stricter test.
+            # Announced after the pop, since "is the washer free" changes once it's
+            # handed off; `hedged` travels so a listener can apply its own stricter test.
             async_dispatcher_send(
                 self.hass,
                 SIGNAL_WASHER_FREE,
@@ -1974,10 +1584,8 @@ class LaundryCoordinator:
             if head is None:
                 return  # nobody waiting — an empty line is the normal case
         if head is not None:
-            # Recorded *here*, next to the pop that causes the problem, and
-            # before the ping rather than after it: the line has already lost
-            # them either way, so a ping that fails and gets logged must still
-            # leave the card saying who it was for. The render below picks it up.
+            # Recorded before the ping: the queue has already lost them either way,
+            # so a failed ping must still leave the card saying who it was for.
             self.handoff_name = queue.entry_name(head)
             self.handoff_hedged = hedged
             if hedged:
@@ -1988,11 +1596,7 @@ class LaundryCoordinator:
             else:
                 body = "🔜 Washer's free — you're up."
             try:
-                # However they asked to be reached in 🤖, defaulting to a real
-                # @mention in the channel (users only) — the whole point is a
-                # push, and an embed edit never makes a phone buzz. A DM that
-                # bounces falls back to that same mention, so the handoff is
-                # never lost.
+                # Routed via 🤖 prefs: a channel @mention (a push) unless a DM bounces.
                 await self.assistant.async_route_ping(
                     head.get("id"),
                     dm_text=body,
@@ -2000,11 +1604,8 @@ class LaundryCoordinator:
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to ping the next person in line")
-        # The line just moved, so the card's "Next up" is stale. Silent edit,
-        # but with the state-derived view attached: on the ✅ path the button's
-        # own edit may never land (expired token, transient 5xx), and without
-        # this the card would keep offering "✅ Emptied it" forever — there is
-        # no further re-render in done_waiting, the ETA timer having stopped.
+        # The queue moved, so "Next up" is stale. Re-attach the view too: if the
+        # button's own edit never lands, ✅ would otherwise offer forever.
         if self.message_id:
             try:
                 await self.bot.async_edit(
@@ -2018,13 +1619,10 @@ class LaundryCoordinator:
     async def _async_ping_next(self, *, hedged: bool, expect_emptied: bool) -> None:
         """Lock-taking wrapper for callers that don't already hold the lock.
 
-        Both callers are scheduled tasks that can sit behind the lock for a
-        while — a session transition posts to Discord while holding it — so the
-        check they did before scheduling is stale by the time we get in. A new
-        load may have started, or the ✅ tap may have already handed this one
-        off, and pinging then would push "washer's free" mid-wash *and* burn
-        that person's place in line. ``expect_emptied`` is the state this ping
-        was decided under; anything else means it no longer applies.
+        Both callers are scheduled tasks that can sit behind the lock a while,
+        so the check that scheduled them may be stale by the time this runs.
+        `expect_emptied` is the state the ping was decided under; anything
+        else means it no longer applies.
         """
         async with self._lock:
             if self.stage != STAGE_DONE_WAITING or self.emptied != expect_emptied:
@@ -2056,9 +1654,8 @@ class LaundryCoordinator:
     def _async_handoff_fallback(self, _now=None) -> None:
         """The claimant never confirmed — tell the next person anyway, hedged."""
         self._handoff_unsub = None
-        # Never fire against a superseded session: a new load may have started
-        # since, or the claimant may have cleared it and cancelled this timer's
-        # reason to exist a moment before it fired.
+        # Never fire against a superseded session: a new load may have started,
+        # or the claimant may have emptied it moments before this fired.
         if self.stage != STAGE_DONE_WAITING or self.emptied:
             return
         self._create_task(
@@ -2068,22 +1665,12 @@ class LaundryCoordinator:
     async def async_reset_session(self) -> None:
         """Service: force-close whatever session is being tracked.
 
-        The backstop for the failures we haven't thought of. Detection ends a
-        load on its own in every case it knows about — job 'finish', the ETA
-        gate, the flat-energy backstop, an offline completion, and now a stop on
-        the machine — but the absolute net is ``MAX_SESSION_MINUTES``, and
-        waiting 12 hours for a card to unstick itself is not a recovery plan.
-
-        Deliberately a *reset*, not a completion: it announces nothing, pings
-        nobody and hands the machine to no one, because a human calling this is
-        saying "you are wrong about the state of the washer", which is no basis
-        for telling six other people their laundry is ready. The card is closed
-        so it can't be tapped, and the next real load posts a fresh one.
-
-        The 🔜 line is deliberately left alone — the people in it are still
-        waiting for the machine, whatever the bot got wrong about the load —
-        and so is history: an unwedging is not a statement about whether the
-        wash happened, and the cancel path is what retracts a load that didn't.
+        Manual backstop for failures detection misses on its own (the
+        absolute net, `MAX_SESSION_MINUTES`, is too slow to be a recovery
+        plan). A reset, not a completion: announces and pings nobody, since
+        calling this means the bot is wrong about the washer, not that
+        laundry is ready. Leaves the 🔜 line and history untouched — that's
+        the cancel path's job.
         """
         async with self._lock:
             self._stop_eta_timer()
@@ -2114,8 +1701,7 @@ class LaundryCoordinator:
             self._offline_since = None
             self._last_eta_ts = None
             self._offline_unverified = False
-            # In lockstep with the session, as at every other completion — a
-            # detector left ACTIVE would refuse to start the next real load.
+            # Left ACTIVE, the detector would refuse the next real load.
             self._detector.reset()
             if message_id:
                 try:
@@ -2138,34 +1724,13 @@ class LaundryCoordinator:
             self._notify_entities()
 
     async def async_track_current_load(self) -> bool:
-        """Service: start tracking the load that is running *right now*.
+        """Service: start tracking the load that is running right now.
 
-        The mirror of :meth:`async_reset_session`, and it exists for the same
-        reason: detection on this machine fails in both directions, and only
-        one of them had a way out. ``reset_session`` retracts a load the bot
-        invented; until now nothing picked up a load the bot missed, and a
-        missed load has no self-healing path at all — no card, no claim
-        button, and no completion ping for whoever is actually using the
-        machine. The household waits for the next load, which can be a day.
-
-        Everything automatic here has to weigh evidence from sensors that
-        freeze (``running``, ``machine_state``), lag 15-45 minutes and
-        sometimes an hour (the energy meter), or get replayed wholesale by a
-        cloud reconnect (``job_state``). A person standing in front of the
-        washer has none of those problems. So this route trusts no sensor: it
-        takes "it is running, I can see it" as the fact and builds the session
-        around it.
-
-        Tracked as a **catch-up**, because it is one — the card reads "in
-        progress" rather than claiming a start time it cannot know, and no
-        usage baseline is captured, since a mid-load reading would make the
-        energy/water summary understate the wash by however much of it already
-        happened.
-
-        Returns True when a session was opened. False means one was already
-        being tracked (this is not an override — ``reset_session`` first if the
-        bot is tracking the *wrong* load) or the Discord post failed, in which
-        case ``_async_start_session`` has already rolled its own state back.
+        Mirror of `async_reset_session`, for a missed load instead of an
+        invented one: a human saying "it's running" beats a sensor that can
+        freeze, lag, or get replayed. Tracked as a catch-up (no start time or
+        baseline claimed). Returns True when opened; False if already tracked
+        (`reset_session` first) or the post failed and rolled itself back.
         """
         if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             _LOGGER.debug(
@@ -2175,25 +1740,16 @@ class LaundryCoordinator:
         await self._async_start_session(offline=True)
         if self.stage not in (STAGE_WASHING, STAGE_DRYING):
             return False  # the post failed and rolled itself back
-        # Only now is the detector moved, and the order is the point. The two
-        # halves of the state machine must never disagree — `diagnose` calls
-        # that a wedge and it is right, neither half can end a load the other
-        # is not in — and `_async_start_session` can fail at the Discord post
-        # and restore its stage. Seeding the detector first would leave it
-        # ACTIVE against an idle session, refusing every subsequent real load.
+        # Order matters: `_async_start_session` can fail and restore stage to idle.
+        # Seeding the detector first would leave it ACTIVE against an idle session,
+        # refusing every real load after (the wedge `diagnose` reports).
         now = dt_util.utcnow().timestamp()
         self._detector.phase = RUN_ACTIVE
         self._detector.last_energy = self._entity_float(self.energy_entity)
-        # The flat-meter backstop is armed from here rather than from whenever
-        # the meter last moved: this load has been running for an unknown
-        # while, and dating the timer from a reading that may be an hour old
-        # would let the backstop fire almost immediately on the load a human
-        # just told us is live.
+        # Armed from now, not the meter's last move, which may be an hour old.
         self._detector.last_rise_ts = now
-        # `_async_start_session` has already armed the ETA timer and saved, but
-        # it saved before the two lines above — the detector is persisted, so
-        # without this a restart would restore an active session behind an idle
-        # detector, which is the wedge `diagnose` reports as unrecoverable.
+        # `_async_start_session` already saved, but before these two lines ran; save
+        # again so a restart can't restore an active session behind an idle detector.
         await self._async_save()
         self._notify_entities()
         _LOGGER.debug("Now tracking the running load, by hand (track_load)")
@@ -2207,11 +1763,8 @@ class LaundryCoordinator:
             self.claimed_by = UNCLAIMED
             self.claimed_by_id = None
             self.cancelled = False
-            # A real load's handoff must not fire against this synthetic state:
-            # the debug post forces done_waiting and repoints message_id, so a
-            # timer armed by an actual finished load would sail past its guard,
-            # ping the head of the line for a load that no longer exists and
-            # overwrite the sample message with the live embed.
+            # A real handoff timer must not fire against this synthetic state:
+            # cancel it, since the debug post forces done_waiting and repoints message_id.
             self.emptied = False
             self.handoff_name = None
             self.handoff_hedged = False
@@ -2220,8 +1773,7 @@ class LaundryCoordinator:
             try:
                 self.message_id = await self.bot.async_post(
                     embed,
-                    # 🤖 rides along so the panel can be opened (and the DM
-                    # route tested) without waiting for a real load.
+                    # 🤖 rides along so the panel/DM route can be tested without a real load.
                     view=ClaimView(
                         self, show="claim", with_assistant=self.show_assistant
                     ),
@@ -2246,8 +1798,7 @@ class LaundryCoordinator:
             self._eta_unsub = None
 
     async def _async_eta_tick(self, now) -> None:
-        # Drive the detector + the time-based completion (dry timer / max
-        # session) while a cycle is active, then refresh the live embed.
+        # Drives the detector + time-based completion, then refreshes the live embed.
         self._feed_detector()
         self._check_time_completion()
         if not self.message_id:
@@ -2401,9 +1952,7 @@ class LaundryCoordinator:
             self._add_offline_notice(embed)
         elif self.stage == STAGE_DONE_WAITING:
             if self.cancelled:
-                # "Stopped", never "done": the cycle didn't finish and the card
-                # says so. Claiming still works — it is how somebody says the
-                # clothes in the drum are theirs — so the buttons are unchanged.
+                # "Stopped", never "done" — claiming still works, unchanged.
                 who = (
                     f"**{self.claimed_by}**'s load"
                     if self.claimed_by and self.claimed_by != UNCLAIMED
@@ -2416,9 +1965,7 @@ class LaundryCoordinator:
                         "rather than finishing.\nThe washer's free — whatever's "
                         "in the drum still needs moving."
                     ),
-                    # Grey rather than amber: the machine is idle and the bot is
-                    # not waiting on anybody. It deliberately does not borrow the
-                    # green of a finished load — this cycle did not finish.
+                    # Grey, not amber or green: idle, and this cycle didn't finish.
                     color=_COLOR_IDLE,
                 )
             elif self.claimed_by and self.claimed_by != UNCLAIMED:
@@ -2478,8 +2025,7 @@ class LaundryCoordinator:
     def _add_queue(self, embed: discord.Embed) -> None:
         """Show the "I'm next" line, so contention is visible without asking.
 
-        Named only — the line is never @mentioned from the card; the one ping
-        anybody in it gets is the handoff, sent as its own message.
+        Named only; the one ping anybody in it gets is the handoff, sent separately.
         """
         line = queue.format_queue(self.queue)
         if not line:
@@ -2497,15 +2043,8 @@ class LaundryCoordinator:
     def _add_handoff(self, embed: discord.Embed) -> None:
         """Show that the line moved, once the head has been taken off it.
 
-        Without this the handoff is a disappearance: the ping pops whoever was
-        first, so "Next up" loses them at the exact moment they were told, and
-        to everyone else the card reads as though they never tapped 🔜 at all.
-        Done-waiting only — it is the one stage in which a handoff can have
-        happened for the load the card is describing.
-
-        Named, like "Claimed by" and "Next up" above it. This is the live card,
-        where the house can already see who is doing what; §11's anonymity rule
-        governs the forward plan, not this.
+        Otherwise the handoff is a disappearance: the pop loses them from "Next
+        up" the moment they were told, as if they'd never tapped 🔜 at all.
         """
         if not self.handoff_name:
             return
@@ -2548,3 +2087,6 @@ class LaundryCoordinator:
                 unit = self._entity_unit(self.water_entity) or "L"
                 parts.append(f"💧 {used:.0f} {unit}")
         return " · ".join(parts) if parts else None
+
+
+type LaundryConfigEntry = ConfigEntry[LaundryCoordinator]
