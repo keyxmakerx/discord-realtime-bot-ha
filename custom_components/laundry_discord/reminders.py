@@ -25,7 +25,9 @@ from homeassistant.helpers.event import async_track_time_change
 
 from . import habit as habit_mod
 from . import nudge as nudge_mod
+from . import people as people_mod
 from . import plan as plan_mod
+from . import queue as queue_mod
 from .const import (
     CONF_NUDGE_LEAD,
     CONF_PLAN_DM_TIME,
@@ -43,12 +45,16 @@ from .const import (
     PLAN_CHANGE_CUSTOM_ID,
     PLAN_STOP_CUSTOM_ID,
     PLAN_YES_CUSTOM_ID,
+    SIGNAL_LOAD_CLAIMED,
     SIGNAL_WASHER_FREE,
     STAGE_DONE_WAITING,
     STAGE_DRYING,
     STAGE_IDLE,
     STAGE_SELF_CLEAN,
     STAGE_WASHING,
+    TAKEN_NEXT_CUSTOM_ID,
+    TAKEN_OK_CUSTOM_ID,
+    TAKEN_PUSH_CUSTOM_ID,
     UNCLAIMED,
 )
 
@@ -272,6 +278,76 @@ class NudgeView(discord.ui.View):
             self.add_item(_NudgeSkipButton(assistant))
 
 
+class _TakenNextButton(_ReminderButton):
+    """🔜 Put me next — joins the line, so the normal handoff tells them when
+    the washer is actually free. Never leaves the line, unlike the card's 🔜.
+    """
+
+    def __init__(
+        self, assistant: "LaundryAssistant", coordinator: "LaundryCoordinator"
+    ) -> None:
+        super().__init__(assistant, "Put me next", "🔜", TAKEN_NEXT_CUSTOM_ID)
+        self.coordinator = coordinator
+
+    async def act(self, interaction: discord.Interaction) -> str:
+        user = interaction.user
+        result, place = await self.coordinator.handle_next_join(
+            user.display_name, user.id
+        )
+        if result == queue_mod.TOGGLE_STALE:
+            return "🧺 Nothing's running any more — the washer should be free."
+        if result == queue_mod.TOGGLE_FULL:
+            return "🔜 The line's full right now — try 🔜 on the card in a bit."
+        if result == queue_mod.TOGGLE_ALREADY:
+            where = f" ({queue_mod.ordinal(place)})" if place else ""
+            return f"🔜 You're already in line{where} — I'll ping you when it's free."
+        return queue_mod.tap_notice(result, place) or "🔜 You're in line."
+
+
+class _TakenPushButton(_ReminderButton):
+    """⏭ Move to tomorrow — books the same slot tomorrow. Not a habit-model
+    correction: they didn't choose to skip, someone else got there first.
+    """
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(assistant, "Move to tomorrow", "⏭", TAKEN_PUSH_CUSTOM_ID)
+
+    async def act(self, interaction: discord.Interaction) -> str:
+        user_id = interaction.user.id
+        cell = self.assistant.nudge_cell(
+            user_id, getattr(getattr(interaction, "message", None), "id", None)
+        )
+        tomorrow = habit_mod.next_day_cell(cell) if cell else None
+        if tomorrow is None:
+            return _STALE_TAP
+        week = plan_mod.iso_week_key(self.assistant.now() + timedelta(days=1))
+        if not await self.assistant.async_book_cell(user_id, tomorrow, week):
+            return _STALE_TAP
+        return "⏭ Done — you're down for the same slot tomorrow."
+
+
+class _TakenOkButton(_ReminderButton):
+    """👍 It's fine — acknowledged; changes nothing."""
+
+    def __init__(self, assistant: "LaundryAssistant") -> None:
+        super().__init__(assistant, "It's fine", "👍", TAKEN_OK_CUSTOM_ID)
+
+    async def act(self, interaction: discord.Interaction) -> str:
+        return "👍 No worries — your booking's unchanged."
+
+
+class SlotTakenView(discord.ui.View):
+    """The slot-taken DM's three answers."""
+
+    def __init__(
+        self, assistant: "LaundryAssistant", coordinator: "LaundryCoordinator"
+    ) -> None:
+        super().__init__(timeout=None)
+        self.add_item(_TakenNextButton(assistant, coordinator))
+        self.add_item(_TakenPushButton(assistant))
+        self.add_item(_TakenOkButton(assistant))
+
+
 # Shown for a tap on an ended or unidentifiable slot. Nothing is written, so
 # the wording must not imply that it was.
 _STALE_TAP = (
@@ -456,6 +532,11 @@ class LaundryReminders:
                 self.hass, SIGNAL_WASHER_FREE, self._on_washer_free
             )
         )
+        self._unsubs.append(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_LOAD_CLAIMED, self._on_load_claimed
+            )
+        )
 
     async def shutdown(self) -> None:
         """Drop every trigger/listener and cancel any pass in flight (safe to
@@ -506,7 +587,54 @@ class LaundryReminders:
             )
         )
 
+    @callback
+    def _on_load_claimed(self, payload=None) -> None:
+        """Someone claimed a load; tell anyone whose booked slot it's in."""
+        data = payload if isinstance(payload, dict) else {}
+        self._create_task(self._async_send_taken(data.get("claimant_id")))
+
     # ------------------------------------------------------------- the sending
+    async def _async_send_taken(self, claimant_id) -> None:
+        """The slot-taken DM: one per person per slot, never naming anyone.
+
+        Not charged to the DM budget (it's about their own booking and would
+        otherwise be blocked on any day they already had a heads-up), but
+        gated like every reminder DM, including 🔔 Slot taken and quiet hours.
+        """
+        now = self._assistant.now()
+        targets = nudge_mod.slot_taken_targets(
+            self._assistant.running_cells(),
+            self._assistant.occupancy(),
+            claimant_id,
+            waiting=[entry.get("id") for entry in self._coordinator.queue],
+        )
+        for user_id, cell in targets.items():
+            try:
+                if nudge_mod.eligible(
+                    self._assistant.people_map,
+                    user_id,
+                    now,
+                    kind=people_mod.KIND_TAKEN,
+                ) != nudge_mod.REASON_OK:
+                    continue
+                text = nudge_mod.taken_text(cell)
+                # Recorded before sending: a bounced DM mustn't be retried.
+                if text is None or not await self._assistant.async_claim_taken_notice(
+                    user_id, cell
+                ):
+                    continue
+                message = await self._async_deliver(
+                    user_id, text, SlotTakenView(self._assistant, self._coordinator)
+                )
+                if message is None:
+                    continue
+                await self._assistant.async_note_nudge_cell(
+                    user_id, cell, getattr(message, "id", None)
+                )
+                _LOGGER.debug("Sent the slot-taken DM to %s", user_id)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to send a slot-taken DM to %s", user_id)
+
     async def _async_send_plan_dms(self) -> None:
         """The Sunday plan DM, one per opted-in person. Nobody with no
         confident prediction is sent anything — silence is the default, not a

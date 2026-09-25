@@ -42,7 +42,7 @@ from .queue import (
     position as queue_position,
     tap_notice,
 )
-from .reminders import NudgeView, PlanDMView
+from .reminders import NudgeView, PlanDMView, SlotTakenView
 
 if TYPE_CHECKING:
     from .coordinator import LaundryCoordinator
@@ -433,6 +433,9 @@ class LaundryDiscordClient(discord.Client):
                 self.add_view(NotifyView(self.coordinator.assistant))
                 self.add_view(PlanDMView(self.coordinator.assistant))
                 self.add_view(NudgeView(self.coordinator.assistant))
+                self.add_view(
+                    SlotTakenView(self.coordinator.assistant, self.coordinator)
+                )
                 self.add_view(TradeAskView(self.coordinator.assistant))
                 self.add_view(TradeRequestView(self.coordinator.assistant))
                 self._view_registered = True

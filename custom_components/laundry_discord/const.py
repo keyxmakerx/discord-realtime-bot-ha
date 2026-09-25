@@ -30,6 +30,8 @@ CONF_PLAN_DM_WEEKDAY = "plan_dm_weekday"
 CONF_PLAN_DM_TIME = "plan_dm_time"
 CONF_NUDGE_LEAD = "nudge_lead"
 CONF_TRADES = "trades"
+CONF_EMPTY_REMINDER = "empty_reminder"
+CONF_ANNOUNCE_FREE = "announce_free"
 
 # --- Default washer entities ---
 DEFAULT_RUNNING_ENTITY = "binary_sensor.washer_running"
@@ -106,6 +108,15 @@ MIN_NUDGE_LEAD = 5
 MAX_NUDGE_LEAD = 180
 # Let housemates ask each other, anonymously, to swap slots. Off by default.
 DEFAULT_TRADES = False
+# Minutes after a claimed load finishes before its claimant is reminded to
+# empty it, if they haven't tapped ✅. Fires before the handoff backstop by
+# default. 0 disables.
+DEFAULT_EMPTY_REMINDER = 15
+MIN_EMPTY_REMINDER = 0
+MAX_EMPTY_REMINDER = 240
+# Post a push-silent "washer's free" line in the channel at each handoff,
+# even when the next person was told by DM.
+DEFAULT_ANNOUNCE_FREE = True
 
 # States that mean "I don't know" rather than a real value.
 UNAVAILABLE_STATES = {"unavailable", "unknown"}
@@ -127,6 +138,9 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 # Sent at the handoff moments only (✅ Emptied it, the handoff backstop, an
 # unclaimed completion). Carries {"handed_off", "hedged", "claimant_id"}.
 SIGNAL_WASHER_FREE = f"{DOMAIN}_washer_free"
+# Sent when someone claims a load that wasn't stopped early. Carries
+# {"claimant_id"}; the reminder loop uses it for the slot-taken DM.
+SIGNAL_LOAD_CLAIMED = f"{DOMAIN}_load_claimed"
 
 # hass.data key naming the one config entry that runs the reminder loop. The
 # planner store is shared, so a second entry must not send every DM twice.
@@ -171,6 +185,8 @@ NOTIFY_KIND_CUSTOM_IDS = {
     "slot": "laundry_discord_notify_slot",
     "opportunity": "laundry_discord_notify_opportunity",
     "trades": "laundry_discord_notify_trades",
+    "empty": "laundry_discord_notify_empty",
+    "taken": "laundry_discord_notify_taken",
 }
 NOTIFY_QUIET_CUSTOM_ID = "laundry_discord_notify_quiet"
 NOTIFY_BACK_CUSTOM_ID = "laundry_discord_notify_back"
@@ -182,6 +198,10 @@ NUDGE_ON_IT_CUSTOM_ID = "laundry_discord_nudge_on_it"
 NUDGE_PUSH_CUSTOM_ID = "laundry_discord_nudge_push"
 NUDGE_SKIP_CUSTOM_ID = "laundry_discord_nudge_skip"
 NUDGE_FREE_CUSTOM_ID = "laundry_discord_nudge_free"
+# Slot-taken DM replies
+TAKEN_NEXT_CUSTOM_ID = "laundry_discord_taken_next"
+TAKEN_PUSH_CUSTOM_ID = "laundry_discord_taken_push"
+TAKEN_OK_CUSTOM_ID = "laundry_discord_taken_ok"
 # 🔁 Swap requests. Nothing per-request fits in a persistent custom_id, so a
 # tap is matched to its request by recipient and DM timestamp
 # (trade.match_request).

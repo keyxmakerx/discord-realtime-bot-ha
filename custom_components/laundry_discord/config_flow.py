@@ -16,10 +16,12 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_ANNOUNCE_FREE,
     CONF_AVAILABILITY_GRACE,
     CONF_BOT_TOKEN,
     CONF_CHANNEL_ID,
     CONF_CONFIRM_DELAY,
+    CONF_EMPTY_REMINDER,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
@@ -40,8 +42,10 @@ from .const import (
     CONF_TRADES,
     CONF_WATER_ENTITY,
     CONF_WRINKLE_ENTITY,
+    DEFAULT_ANNOUNCE_FREE,
     DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_CONFIRM_DELAY,
+    DEFAULT_EMPTY_REMINDER,
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_ETA_ENTITY,
@@ -62,6 +66,7 @@ from .const import (
     DOMAIN,
     MAX_AVAILABILITY_GRACE,
     MAX_CONFIRM_DELAY,
+    MAX_EMPTY_REMINDER,
     MAX_ENERGY_IDLE,
     MAX_ENERGY_LOAD_JUMP,
     MAX_ETA_INTERVAL,
@@ -70,6 +75,7 @@ from .const import (
     MAX_QUEUE_EXPIRY,
     MIN_AVAILABILITY_GRACE,
     MIN_CONFIRM_DELAY,
+    MIN_EMPTY_REMINDER,
     MIN_ENERGY_IDLE,
     MIN_ENERGY_LOAD_JUMP,
     MIN_ETA_INTERVAL,
@@ -123,11 +129,17 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
             required(
                 CONF_PING_CLAIMANT_ON_COMPLETE, DEFAULT_PING_CLAIMANT_ON_COMPLETE
             ): selector.BooleanSelector(),
+            required(CONF_ANNOUNCE_FREE, DEFAULT_ANNOUNCE_FREE): (
+                selector.BooleanSelector()
+            ),
             required(CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE): _number(
                 MIN_AVAILABILITY_GRACE, MAX_AVAILABILITY_GRACE, 1, "minutes"
             ),
             required(CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK): _number(
                 MIN_HANDOFF_FALLBACK, MAX_HANDOFF_FALLBACK, 5, "minutes"
+            ),
+            required(CONF_EMPTY_REMINDER, DEFAULT_EMPTY_REMINDER): _number(
+                MIN_EMPTY_REMINDER, MAX_EMPTY_REMINDER, 5, "minutes"
             ),
             required(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY): _number(
                 MIN_QUEUE_EXPIRY, MAX_QUEUE_EXPIRY, 1, "hours"
@@ -267,8 +279,10 @@ class LaundryDiscordOptionsFlow(OptionsFlow):
                     CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
                         CONF_PING_CLAIMANT_ON_COMPLETE
                     ],
+                    CONF_ANNOUNCE_FREE: user_input[CONF_ANNOUNCE_FREE],
                     CONF_AVAILABILITY_GRACE: int(user_input[CONF_AVAILABILITY_GRACE]),
                     CONF_HANDOFF_FALLBACK: int(user_input[CONF_HANDOFF_FALLBACK]),
+                    CONF_EMPTY_REMINDER: int(user_input[CONF_EMPTY_REMINDER]),
                     CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
                     CONF_SHOW_ASSISTANT: user_input[CONF_SHOW_ASSISTANT],
                     CONF_LEARN_HABITS: user_input[CONF_LEARN_HABITS],
