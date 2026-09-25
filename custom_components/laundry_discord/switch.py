@@ -13,11 +13,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
+    CONF_ANNOUNCE_FREE,
     CONF_LEARN_HABITS,
     CONF_PING_CLAIMANT_ON_COMPLETE,
     CONF_REMIND_DMS,
     CONF_SHOW_ASSISTANT,
     CONF_TRADES,
+    DEFAULT_ANNOUNCE_FREE,
     DEFAULT_LEARN_HABITS,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_REMIND_DMS,
@@ -30,6 +32,7 @@ from .entity import LaundryEntity
 # Option key (also the translation key), default.
 _SWITCHES = (
     (CONF_PING_CLAIMANT_ON_COMPLETE, DEFAULT_PING_CLAIMANT_ON_COMPLETE),
+    (CONF_ANNOUNCE_FREE, DEFAULT_ANNOUNCE_FREE),
     (CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT),
     (CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS),
     (CONF_REMIND_DMS, DEFAULT_REMIND_DMS),

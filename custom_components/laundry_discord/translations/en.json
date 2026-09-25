@@ -48,8 +48,10 @@
           "energy_idle": "Flat-meter timeout",
           "energy_load_jump": "Offline load threshold",
           "ping_claimant_on_complete": "Ping the claimant when done",
+          "announce_free": "Post when the washer is free",
           "availability_grace": "ETA hold time",
           "handoff_fallback": "Handoff backstop",
+          "empty_reminder": "Empty-it reminder",
           "queue_expiry": "Queue expiry",
           "show_assistant": "Show the 🤖 assistant button",
           "learn_habits": "Learn the days each person washes",
@@ -65,8 +67,10 @@
           "energy_idle": "Offline backstop: end a load once the energy meter has been flat this long. Only used when the washer's own finish estimate is unavailable.",
           "energy_load_jump": "A single energy jump this large, with no wash phase reported, counts as a load that ran while the washer was offline.",
           "ping_claimant_on_complete": "Mention whoever claimed the load when it finishes.",
+          "announce_free": "At each handoff, post a short silent line in the channel (\"Washer's free — Sam's up next\"), even when the next person was told by DM.",
           "availability_grace": "Keep showing the last ETA for this long while the completion sensor is unavailable.",
           "handoff_fallback": "Ping whoever is next this long after a claimed load finishes if nobody taps ✅ Emptied it. 0 disables the backstop.",
+          "empty_reminder": "Remind the claimant this long after their load finishes if nobody has tapped ✅ Emptied it. Each person can switch it off in 🔔. 0 turns it off for everyone.",
           "queue_expiry": "Drop someone from the 🔜 line this long after they joined it.",
           "show_assistant": "Adds a button to the card that opens a private panel with the explainer and each person's settings.",
           "learn_habits": "Logs each Claim tap and marks a person's usual slots with ? on their own week grid. Nobody sees anyone else's guesses, and each person can opt out in the panel.",
@@ -117,6 +121,9 @@
       },
       "availability_grace": {
         "name": "Availability grace"
+      },
+      "empty_reminder": {
+        "name": "Empty reminder"
       }
     },
     "sensor": {
@@ -148,6 +155,9 @@
       },
       "trades": {
         "name": "Slot trades"
+      },
+      "announce_free": {
+        "name": "Announce free"
       }
     }
   },

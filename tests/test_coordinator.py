@@ -122,6 +122,9 @@ class FakeBot:
     async def async_edit(self, message_id, embed, **kwargs):
         self.calls.append(("edit", message_id))
 
+    async def async_announce_done(self, content):
+        self.calls.append(("announce", content))
+
     async def async_close(self) -> None:
         self.closed = True
 
@@ -196,6 +199,8 @@ def _coordinator(**state):
     c._stop_confirm_unsub = None
     c._selfclean_unsub = None
     c._handoff_unsub = None
+    c._empty_unsub = None
+    c.empty_reminded = False
     c.__dict__.update(state)
     # Stubbed: a Store write, dispatcher send, and Discord embed - not what
     # these tests check.
@@ -282,10 +287,23 @@ def test_a_restart_re_arms_the_handoff_backstop() -> None:
         claimed_by_id=111,
         queue=[{"id": "222", "name": "Bo", "ts": 1.0}],
     )
-    c._cfg = {const.CONF_HANDOFF_FALLBACK: 25}  # minutes
-    # Detector feed is stubbed; only the timer matters here.
+    c._cfg = {const.CONF_HANDOFF_FALLBACK: 25, const.CONF_EMPTY_REMINDER: 15}
+    # Detector feed is stubbed; only the timers matter here.
     c._feed_detector = lambda *a, **kw: None
     _run(c.async_on_bot_ready())
+    assert [delay for delay, _ in TIMERS.armed] == [25 * 60, 15 * 60]
+
+    # A claimant already reminded isn't reminded again after a restart.
+    TIMERS.armed.clear()
+    reminded = _coordinator(stage=const.STAGE_DONE_WAITING,
+        message_id=7,
+        claimed_by="Alex",
+        claimed_by_id=111,
+        empty_reminded=True,
+    )
+    reminded._cfg = dict(c._cfg)
+    reminded._feed_detector = lambda *a, **kw: None
+    _run(reminded.async_on_bot_ready())
     assert [delay for delay, _ in TIMERS.armed] == [25 * 60]
 
     # No claimant means nothing to back up.
@@ -1063,6 +1081,146 @@ def test_the_dashboard_only_references_entities_the_platforms_create() -> None:
     assert not missing, f"dashboard names entities nothing creates: {missing}"
     unused = sorted(expected - referenced)
     assert not unused, f"entities exist but the dashboard never shows them: {unused}"
+
+
+
+# --- the empty-it reminder, the washer-free line and the claim signal ----------
+def _no_dispatch():
+    """Swap the module's dispatcher send for a recorder; returns (sent, undo)."""
+    sent: list = []
+    was = coord_mod.async_dispatcher_send
+    coord_mod.async_dispatcher_send = lambda hass, signal, *args: sent.append(
+        (signal, args)
+    )
+
+    def _undo():
+        coord_mod.async_dispatcher_send = was
+
+    return sent, _undo
+
+
+def test_the_claimant_is_reminded_once_while_the_load_is_not_emptied() -> None:
+    calls: list = []
+
+    async def _remind(user_id, **kwargs):
+        calls.append((user_id, kwargs))
+        return "dm"
+
+    c = _coordinator(stage=const.STAGE_DONE_WAITING,
+        claimed_by="Alex",
+        claimed_by_id=111,
+        queue=[{"id": 222, "name": "Bo", "ts": time.time()}],
+    )
+    c._cfg = dict(_ENTITY_CFG)
+    c.assistant.async_remind_empty = _remind
+    _run(c._async_send_empty_reminder())
+    assert calls == [(111, {"name": "Alex", "waiting": True, "quiet": False})]
+    assert c.empty_reminded
+    _run(c._async_send_empty_reminder())
+    assert len(calls) == 1  # once per load
+
+    emptied = _coordinator(stage=const.STAGE_DONE_WAITING,
+        claimed_by="Alex", claimed_by_id=111, emptied=True,
+    )
+    emptied._cfg = dict(_ENTITY_CFG)
+    emptied.assistant.async_remind_empty = _remind
+    _run(emptied._async_send_empty_reminder())
+    assert len(calls) == 1
+
+
+def test_emptying_cancels_the_reminder_and_announces_the_washer_is_free() -> None:
+    sent, undo = _no_dispatch()
+    try:
+        TIMERS.armed.clear()
+        c = _coordinator(stage=const.STAGE_DONE_WAITING,
+            claimed_by="Robin", claimed_by_id=7, message_id=4242,
+        )
+        c._cfg = {**_ENTITY_CFG, const.CONF_EMPTY_REMINDER: 15}
+        c._arm_empty_timer()
+        assert [delay for delay, _ in TIMERS.armed] == [15 * 60]
+        _run(c.handle_emptied())
+        _run(c.hass.drain())
+        assert TIMERS.armed == []
+        assert ("announce", "🧺 Washer's free.") in c.bot.calls
+    finally:
+        undo()
+
+
+def test_the_free_line_names_the_next_person_unless_they_were_told_in_channel() -> None:
+    sent, undo = _no_dispatch()
+    try:
+        for route, expected in (
+            ("dm", [("announce", "🔜 Washer's free — Sam's up next.")]),
+            (None, [("announce", "🔜 Washer's free — Sam's up next.")]),
+            ("channel", []),
+        ):
+            async def _route(user_id, _route=route, **kwargs):
+                return _route
+
+            c = _coordinator(stage=const.STAGE_DONE_WAITING,
+                claimed_by="Robin", claimed_by_id=7, emptied=True,
+                queue=[{"id": 9, "name": "Sam", "ts": time.time()}],
+            )
+            c._cfg = dict(_ENTITY_CFG)
+            c.assistant.async_route_ping = _route
+            _run(c._async_ping_next_locked(hedged=False))
+            assert [call for call in c.bot.calls if call[0] == "announce"] == expected
+
+        # Switched off, and an unclaimed completion (which already posted), say nothing.
+        off = _coordinator(stage=const.STAGE_DONE_WAITING, emptied=True)
+        off._cfg = {**_ENTITY_CFG, const.CONF_ANNOUNCE_FREE: False}
+        _run(off._async_ping_next_locked(hedged=False))
+        quiet = _coordinator(stage=const.STAGE_DONE_WAITING)
+        quiet._cfg = dict(_ENTITY_CFG)
+        _run(quiet._async_ping_next_locked(hedged=False, announce=False))
+        hedged = _coordinator(stage=const.STAGE_DONE_WAITING, claimed_by_id=7)
+        hedged._cfg = dict(_ENTITY_CFG)
+        _run(hedged._async_ping_next_locked(hedged=True))
+        for coordinator in (off, quiet, hedged):
+            assert not [call for call in coordinator.bot.calls if call[0] == "announce"]
+    finally:
+        undo()
+
+
+def test_a_claim_signals_the_reminder_loop_and_arms_a_late_reminder() -> None:
+    sent, undo = _no_dispatch()
+    try:
+        TIMERS.armed.clear()
+        noted: list = []
+
+        async def _note(user_id):
+            noted.append(user_id)
+
+        washing = _coordinator(stage=const.STAGE_WASHING)
+        washing._cfg = dict(_ENTITY_CFG)
+        washing.assistant.async_note_claim = _note
+        assert _run(washing.handle_claim("Bo", 222))
+        assert (const.SIGNAL_LOAD_CLAIMED, ({"claimant_id": 222},)) in sent
+        assert TIMERS.armed == []  # armed at completion, not at a mid-wash claim
+
+        # A stopped load is not a wash: no signal.
+        sent.clear()
+        stopped = _coordinator(stage=const.STAGE_DONE_WAITING, cancelled=True)
+        stopped._cfg = {**_ENTITY_CFG, const.CONF_EMPTY_REMINDER: 15}
+        stopped.assistant.async_note_claim = _note
+        _run(stopped.handle_claim("Bo", 222))
+        assert sent == []
+        # ...but claiming a finished load still arms its empty-it reminder.
+        assert [delay for delay, _ in TIMERS.armed] == [15 * 60]
+    finally:
+        undo()
+
+
+def test_joining_from_a_dm_adds_once_and_refuses_a_dead_card() -> None:
+    c = _coordinator(stage=const.STAGE_DRYING, message_id=5)
+    c._cfg = dict(_ENTITY_CFG)
+    assert _run(c.handle_next_join("Sam", 9)) == ("added", 1)
+    _run(c.hass.drain())
+    assert ("edit", 5) in c.bot.calls  # the card's "Next up" is re-rendered
+    assert _run(c.handle_next_join("Sam", 9)) == ("already", 1)
+    assert [entry["id"] for entry in c.queue] == [9]
+    idle = _coordinator()
+    assert _run(idle.handle_next_join("Sam", 9)) == ("stale", None)
 
 
 def _run_all() -> None:

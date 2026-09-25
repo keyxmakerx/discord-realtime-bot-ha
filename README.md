@@ -25,7 +25,7 @@ moves (paused, drying, offline, done). Edits never notify anyone.
 | 🧺 **Claim** / **Unclaim** | Call dibs from the moment the wash starts. The claimant gets the one "done" ping. Unclaimed loads finish with no ping. |
 | 🌙 **Quiet** | The claimant is named at completion but not pinged (for when they're asleep). |
 | 🔜 **I'm next** | Join or leave the line. The next person is pinged when the washer is actually *free*, not merely finished. |
-| ✅ **Emptied it** | Appears on a claimed load once it finishes. Tapping it says the drum is clear and hands the washer to the next person. If nobody taps it, the next person gets a hedged ping after the handoff backstop (25 min by default). |
+| ✅ **Emptied it** | Appears on a claimed load once it finishes. Tapping it says the drum is clear and hands the washer to the next person. If nobody taps it, the claimant gets one reminder (15 min by default), then the next person gets a hedged ping after the handoff backstop (25 min by default). |
 | 🤖 | Opens a private panel (only you can see it): a first-time explainer, and your own settings. |
 
 **The 🤖 panel** lets each person choose where pings about *them* go (an @mention
@@ -43,8 +43,11 @@ in the channel by default, a DM, or no ping), and opens:
 | Option | What it adds |
 |---|---|
 | Learn the days each person washes | Logs each Claim tap and marks your usual slots with `?` on *your* grid only. No stats are ever shown to the house. Each person can opt out (👁 Monitoring) or stop the guesses (🔮). |
-| Send reminder DMs | A weekly check-in and a heads-up before a slot you booked, only to people who chose **📬 DM me**. At most 1 DM per person per day and 2 per week; anything over is dropped. Never posted in the channel. |
+| Send reminder DMs | A weekly check-in and a heads-up before a slot you booked, only to people who chose **📬 DM me**. At most 1 DM per person per day and 2 per week; anything over is dropped. Never posted in the channel. Also tells you, once per slot, when someone else is using the washer in a slot you booked, and offers to put you next in line (never saying who). |
 | Swap requests | Ask whoever holds a slot, anonymously, whether they'd trade. Names are revealed only if they accept. Guardrails limit asking (one ask per slot per week, refusals stick, a permanent 🚫, asks expire after 48 h). |
+
+Whenever the washer comes free, a short silent line goes in the channel ("🔜
+Washer's free — Sam's up next."), even if the next person was told by DM.
 
 Quiet hours and the 🔔 switches only ever remove messages. Replies to something
 you did (your load is done, the washer is yours) are never held back.
@@ -122,8 +125,10 @@ reloads the integration and briefly reconnects the bot):
 | Flat-meter timeout (offline backstop) | 60 min | 10–240 |
 | Offline load threshold | 0.3 kWh | 0.1–5 |
 | Ping the claimant when done | on | |
+| Post when the washer is free | on | |
 | ETA hold time while the sensor is unavailable | 5 min | 1–120 |
 | Handoff backstop (0 disables) | 25 min | 0–240 |
+| Empty-it reminder (0 disables) | 15 min | 0–240 |
 | Queue expiry | 12 h | 1–72 |
 | Show the 🤖 assistant button | on | |
 | Learn the days each person washes | off | |

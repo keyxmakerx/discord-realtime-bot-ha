@@ -581,6 +581,39 @@ def heads_up_text(cell, minutes=None) -> str | None:
     )
 
 
+def slot_taken_targets(running, occupancy, claimant_id, waiting=()) -> dict[str, str]:
+    """Who to tell that someone else is using the washer in their booked slot.
+
+    ``{holder_id: cell}`` for every holder of a cell the live load occupies,
+    except the claimant and anyone already in the 🔜 line. A holder of several
+    such cells is told about the first. Ids are strings throughout.
+    """
+    claimant = None if claimant_id is None else str(claimant_id)
+    skip = {str(item) for item in waiting if item is not None}
+    targets: dict[str, str] = {}
+    for cell in plan.running_cells(running):
+        for holder in plan.holders(occupancy, cell):
+            if holder == claimant or holder in skip or holder in targets:
+                continue
+            targets[holder] = cell
+    return targets
+
+
+def taken_text(cell) -> str | None:
+    """The slot-taken DM's body, or None when the cell isn't renderable.
+    Never says who is using the washer: plans stay anonymous.
+    """
+    parsed = plan.parse_cell(plan.normalise_cell(cell))
+    if parsed is None:
+        return None
+    _weekday, slot = parsed
+    return (
+        "🏃 **Someone else got to the washer first**\n"
+        f"It's in use during the slot you booked for {TODAY_PHRASES[slot]}. "
+        "Want me to put you next in line?"
+    )
+
+
 def opportunity_text(cell, prediction=None, gap_days=None) -> str | None:
     """The opportunity nudge's body, or None when the cell isn't renderable.
     States only what the person can't see themselves: the machine is free

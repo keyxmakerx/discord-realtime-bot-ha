@@ -747,6 +747,38 @@ def test_a_reply_is_refused_once_its_slot_has_gone() -> None:
     assert slot_ended(THU_EVE, None) is False
 
 
+
+# --- the slot-taken DM ----------------------------------------------------------
+def _occupancy(**cells):
+    return {
+        cell: {_plan.OCC_HOLDERS: list(held), _plan.OCC_RECURRING: []}
+        for cell, held in cells.items()
+    }
+
+
+def test_slot_taken_goes_to_every_other_holder_of_the_running_slot() -> None:
+    week = _occupancy(**{"3-eve": ["1", "2"], "3-pm": ["3"]})
+    # Ids compare as strings: the claimant's int id must still exclude them.
+    assert _nudge.slot_taken_targets(["3-eve"], week, 1) == {"2": "3-eve"}
+    # A load spanning two slots reaches both slots' holders, once each.
+    assert _nudge.slot_taken_targets(["3-pm", "3-eve"], week, 1) == {
+        "3": "3-pm",
+        "2": "3-eve",
+    }
+
+
+def test_slot_taken_skips_people_already_in_line() -> None:
+    week = _occupancy(**{"3-eve": ["2"]})
+    assert _nudge.slot_taken_targets(["3-eve"], week, 1, waiting=[2]) == {}
+    assert _nudge.slot_taken_targets([], week, 1) == {}
+
+
+def test_the_slot_taken_text_never_names_anyone() -> None:
+    text = _nudge.taken_text("3-eve")
+    assert "Someone else got to the washer first" in text and "tonight" in text
+    assert _nudge.taken_text("not-a-cell") is None
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

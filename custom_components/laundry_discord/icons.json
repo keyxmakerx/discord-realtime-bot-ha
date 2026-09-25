@@ -37,6 +37,9 @@
       },
       "availability_grace": {
         "default": "mdi:cloud-question"
+      },
+      "empty_reminder": {
+        "default": "mdi:bell-alert-outline"
       }
     },
     "sensor": {
@@ -72,6 +75,9 @@
       },
       "trades": {
         "default": "mdi:swap-horizontal"
+      },
+      "announce_free": {
+        "default": "mdi:bullhorn-outline"
       }
     }
   },

@@ -23,7 +23,16 @@ KIND_CHECKIN = "checkin"  # the Sunday plan DM
 KIND_SLOT = "slot"  # ⏰ heads-up before a slot you booked
 KIND_OPPORTUNITY = "opportunity"  # 💡 "tonight's wide open and you're overdue"
 KIND_TRADES = "trades"  # 🔁 a housemate asking for your slot
-KINDS = (KIND_CHECKIN, KIND_SLOT, KIND_OPPORTUNITY, KIND_TRADES)
+KIND_EMPTY = "empty"  # 🧺 your finished load is still in the washer
+KIND_TAKEN = "taken"  # 🏃 someone else is using the washer in your booked slot
+KINDS = (
+    KIND_CHECKIN,
+    KIND_SLOT,
+    KIND_OPPORTUNITY,
+    KIND_TRADES,
+    KIND_EMPTY,
+    KIND_TAKEN,
+)
 
 # Which stored field each kind reads. A kind added here without a matching
 # default in :func:`_defaults` would silently never persist a change.
@@ -32,6 +41,8 @@ KIND_FIELDS = {
     KIND_SLOT: "dm_headsup",
     KIND_OPPORTUNITY: "dm_opportunity",
     KIND_TRADES: "dm_trades",
+    KIND_EMPTY: "dm_empty",
+    KIND_TAKEN: "dm_taken",
 }
 
 
@@ -57,6 +68,8 @@ def _defaults() -> dict:
         "dm_headsup": True,
         "dm_opportunity": True,
         "dm_trades": True,
+        "dm_empty": True,
+        "dm_taken": True,
         # Local hours, wraps midnight (22 -> 8); None/None means no window.
         "quiet_start": None,
         "quiet_end": None,

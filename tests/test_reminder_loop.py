@@ -267,6 +267,8 @@ class FakeAssistant:
         self.nudge_cells: dict = {}
         self.next_message_id = 100
         self.week: dict = {}
+        self.running: list = []
+        self.taken_sent: dict = {}
 
     def now(self):
         return self.moment
@@ -286,6 +288,15 @@ class FakeAssistant:
 
     def occupancy(self):
         return dict(self.week)
+
+    def running_cells(self):
+        return list(self.running)
+
+    async def async_claim_taken_notice(self, user_id, cell):
+        if self.taken_sent.get(str(user_id)) == cell:
+            return False
+        self.taken_sent[str(user_id)] = cell
+        return True
 
     def is_due(self, user_id):
         return bool(self.due.get(str(user_id), False))
@@ -337,6 +348,11 @@ class FakeCoordinator:
         self.emptied = emptied
         self.claimed_by = claimed_by
         self.queue: list = []
+        self.joined: list = []
+
+    async def handle_next_join(self, who, user_id):
+        self.joined.append((who, user_id))
+        return ("added", len(self.joined))
 
 
 def _loop(hass=None, entry=None, assistant=None, coordinator=None):
@@ -671,6 +687,65 @@ def test_a_sunday_push_books_the_week_it_actually_lands_in() -> None:
         )
     )
     assert assistant.booked_calls == [("1", "1-eve", "2026-W32")]
+
+
+
+# --- the slot-taken DM ------------------------------------------------------
+def _claimed(loop, hass, claimant_id):
+    handler = hass.signals[const.SIGNAL_LOAD_CLAIMED][0]
+    handler({"claimant_id": claimant_id})
+    _run(hass.drain())
+
+
+def _taken_setup():
+    loop, hass, assistant = _loop()
+    assistant.running = [THU_EVE]
+    assistant.week = {
+        THU_EVE: {plan.OCC_HOLDERS: ["1", "2"], plan.OCC_RECURRING: []}
+    }
+    _run(loop.async_setup())
+    return loop, hass, assistant
+
+
+def test_the_slot_taken_dm_goes_to_the_other_holder_without_names() -> None:
+    loop, hass, assistant = _taken_setup()
+    _claimed(loop, hass, 1)  # an int id, as Discord hands it over
+    assert [uid for uid, _text in assistant.sent] == ["2"]
+    text = assistant.sent[0][1]
+    assert "Someone else got to the washer first" in text
+    assert "Alex" not in text and "Bo" not in text
+    # The reply buttons act on the slot the DM was about.
+    assert assistant.nudge_cells["2"]["cell"] == THU_EVE
+
+
+def test_the_slot_taken_dm_goes_out_once_per_slot() -> None:
+    loop, hass, assistant = _taken_setup()
+    _claimed(loop, hass, 1)
+    _claimed(loop, hass, 1)  # unclaim and reclaim
+    assert [uid for uid, _text in assistant.sent] == ["2"]
+
+
+def test_the_slot_taken_dm_respects_the_switch_and_the_line() -> None:
+    loop, hass, assistant = _taken_setup()
+    assistant._people = people.set_person(assistant._people, "2", dm_taken=False)
+    _claimed(loop, hass, 1)
+    assert assistant.sent == []
+
+    loop, hass, assistant = _taken_setup()
+    loop._coordinator.queue = [{"id": 2, "name": "Bo", "ts": 1.0}]
+    _claimed(loop, hass, 1)
+    assert assistant.sent == []  # already waiting for the washer
+
+
+def test_put_me_next_joins_the_line_from_the_dm() -> None:
+    assistant = FakeAssistant()
+    coordinator = FakeCoordinator(assistant)
+    button = reminders._TakenNextButton(assistant, coordinator)
+    interaction = FakeInteraction("2")
+    interaction.user.display_name = "Bo"
+    note = _run(button.act(interaction))
+    assert coordinator.joined == [("Bo", "2")]
+    assert "next" in note.lower()
 
 
 def _run_all() -> None:
