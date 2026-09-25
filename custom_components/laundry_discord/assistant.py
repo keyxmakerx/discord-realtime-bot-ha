@@ -20,8 +20,10 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from . import habit as habit_mod
+from . import nudge as nudge_mod
 from . import people as people_mod
 from . import plan as plan_mod
+from . import queue as queue_mod
 from . import trade as trade_mod
 from .const import (
     CONF_LEARN_HABITS,
@@ -110,6 +112,16 @@ _NOTIFY_KINDS = {
         "🔁",
         "Swaps",
         "a housemate asking whether they can have one of your slots",
+    ),
+    people_mod.KIND_EMPTY: (
+        "🧺",
+        "Empty-it",
+        "a reminder when your finished load is still in the washer",
+    ),
+    people_mod.KIND_TAKEN: (
+        "🏃",
+        "Slot taken",
+        "when someone else is using the washer in a slot you booked",
     ),
 }
 
@@ -455,6 +467,7 @@ class _NotifyKindButton(discord.ui.Button):
         emoji: str,
         *,
         enabled: bool | None,
+        row: int = 0,
     ) -> None:
         super().__init__(
             label=(
@@ -465,7 +478,7 @@ class _NotifyKindButton(discord.ui.Button):
             style=discord.ButtonStyle.secondary,
             emoji=emoji,
             custom_id=NOTIFY_KIND_CUSTOM_IDS[kind],
-            row=0,
+            row=row,
         )
         self.assistant = assistant
         self.kind = kind
@@ -494,7 +507,7 @@ class _NotifyQuietSelect(discord.ui.Select):
             custom_id=NOTIFY_QUIET_CUSTOM_ID,
             min_values=1,
             max_values=1,
-            row=1,
+            row=2,
             options=[
                 discord.SelectOption(
                     label=_quiet_label(preset),
@@ -525,7 +538,7 @@ class _NotifyBackButton(discord.ui.Button):
             style=discord.ButtonStyle.secondary,
             emoji="↩️",
             custom_id=NOTIFY_BACK_CUSTOM_ID,
-            row=2,
+            row=3,
         )
         self.assistant = assistant
 
@@ -538,7 +551,7 @@ class _NotifyBackButton(discord.ui.Button):
 
 
 class NotifyView(discord.ui.View):
-    """The 🔔 panel: four kind toggles, the quiet-hours select, and back.
+    """The 🔔 panel: a toggle per kind (four to a row), quiet hours, and back.
 
     ``person=None`` is the registration template. A kind missing from
     :data:`_NOTIFY_KINDS` or :data:`const.NOTIFY_KIND_CUSTOM_IDS` raises
@@ -549,7 +562,7 @@ class NotifyView(discord.ui.View):
         self, assistant: "LaundryAssistant", *, person: dict | None = None
     ) -> None:
         super().__init__(timeout=None)
-        for kind in people_mod.KINDS:
+        for index, kind in enumerate(people_mod.KINDS):
             emoji, label, _what = _NOTIFY_KINDS[kind]
             self.add_item(
                 _NotifyKindButton(
@@ -562,6 +575,7 @@ class NotifyView(discord.ui.View):
                         if person is not None
                         else None
                     ),
+                    row=index // 4,
                 )
             )
         self.add_item(
@@ -1020,6 +1034,8 @@ class LaundryAssistant:
         self._last_cell: dict[str, str] = {}
         # Which cell (and message id) each person's last reminder DM was about. Persisted.
         self._nudge_cell: dict[str, dict] = {}
+        # Last slot-taken DM per person, as "week:cell": one per slot.
+        self._taken_sent: dict[str, str] = {}
         # The live load's window, pushed by the coordinator; memory only.
         self._running_from: float | None = None
         self._running_until: float | None = None
@@ -1080,6 +1096,12 @@ class LaundryAssistant:
         # Which DM was about which cell; a row missing either half is dropped.
         raw_nudges = data.get("nudges") if isinstance(data, dict) else None
         self._nudge_cell = _normalise_nudge_cells(raw_nudges)
+        raw_taken = data.get("taken") if isinstance(data, dict) else None
+        self._taken_sent = (
+            {str(k): v for k, v in raw_taken.items() if isinstance(v, str)}
+            if isinstance(raw_taken, dict)
+            else {}
+        )
 
     async def _async_save(self) -> None:
         """Persist prefs. A failed save must not break the button that caused it."""
@@ -1093,6 +1115,7 @@ class LaundryAssistant:
                     "budgets": self._budgets,
                     "trades": self._trades,
                     "nudges": self._nudge_cell,
+                    "taken": self._taken_sent,
                 }
             )
         except Exception:  # noqa: BLE001
@@ -1124,6 +1147,10 @@ class LaundryAssistant:
         """
         self._running_from = started_ts if isinstance(started_ts, (int, float)) else None
         self._running_until = eta_ts if isinstance(eta_ts, (int, float)) else None
+
+    def running_cells(self) -> list[str]:
+        """The cells the live load occupies right now (see `_running_cells`)."""
+        return self._running_cells()
 
     def _running_cells(self) -> list[str]:
         """The cells the washer is mid-load in, worked out fresh right now.
@@ -1356,6 +1383,18 @@ class LaundryAssistant:
         self._nudge_cell[str(user_id)] = row
         await self._async_save()
 
+    async def async_claim_taken_notice(self, user_id, cell) -> bool:
+        """Record a slot-taken DM for this person's cell this week.
+
+        False when one already went out for the same slot, so it's sent once.
+        """
+        key = f"{self._current_week()}:{plan_mod.normalise_cell(cell)}"
+        if self._taken_sent.get(str(user_id)) == key:
+            return False
+        self._taken_sent[str(user_id)] = key
+        await self._async_save()
+        return True
+
     def nudge_cell(self, user_id, message_id) -> str | None:
         """The cell this particular DM was about, or None if unrecognised.
 
@@ -1415,23 +1454,24 @@ class LaundryAssistant:
 
     async def async_route_ping(
         self, user_id, *, dm_text: str, channel_text: str
-    ) -> bool:
+    ) -> str | None:
         """Deliver one personal message the way this person asked for it.
 
-        Defaults to the channel; returns True if delivered. dm falls back on
-        failure; off suppresses mentions rather than dropping the message.
-        A ``None`` user id still goes to the channel, since ``select_handoff``
-        already popped that entry.
+        Defaults to the channel. Returns the route actually used (a
+        ``people.REMIND_*`` mode), or None if nothing was delivered. dm falls
+        back to the channel on failure; off posts without the mention rather
+        than dropping the message. A ``None`` user id still goes to the
+        channel, since ``select_handoff`` already popped that entry.
         """
         mode = (
             people_mod.REMIND_CHANNEL
             if user_id is None
             else people_mod.delivery(self._people, user_id)
         )
-        if mode == people_mod.REMIND_DM and (
-            await self.async_send_dm(user_id, dm_text) is not None
-        ):
-            return True
+        if mode == people_mod.REMIND_DM:
+            if await self.async_send_dm(user_id, dm_text) is not None:
+                return people_mod.REMIND_DM
+            mode = people_mod.REMIND_CHANNEL
         try:
             if mode == people_mod.REMIND_OFF:
                 await self.bot.async_announce_done(channel_text)
@@ -1439,8 +1479,32 @@ class LaundryAssistant:
                 await self.bot.async_send_ping(channel_text)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Failed to deliver a laundry ping to %s", user_id)
-            return False
-        return True
+            return None
+        return mode
+
+    async def async_remind_empty(
+        self, user_id, *, name: str, waiting: bool, quiet: bool
+    ) -> str | None:
+        """Remind a claimant that their finished load is still in the washer.
+
+        Blockable per person (🔔 Empty-it) and dropped inside their quiet
+        hours. Follows their Pings route; 🌙 Quiet on the card names them
+        without a push. Returns the route used, or None if not sent.
+        """
+        person = people_mod.get_person(self._people, user_id)
+        if not people_mod.wants_kind(person, people_mod.KIND_EMPTY):
+            return None
+        if nudge_mod.in_quiet_hours(person, self._now()):
+            return None
+        if quiet:
+            await self.bot.async_announce_done(
+                queue_mod.empty_reminder_text(waiting=waiting, name=name)
+            )
+            return people_mod.REMIND_OFF
+        body = queue_mod.empty_reminder_text(waiting=waiting)
+        return await self.async_route_ping(
+            user_id, dm_text=body, channel_text=f"<@{user_id}> {body}"
+        )
 
     # ------------------------------------------------------------------- panel
     async def async_open_panel(self, interaction: discord.Interaction) -> None:
@@ -2393,7 +2457,7 @@ class LaundryAssistant:
             if not people_mod.wants_kind(person, kind)
         ]
         window = people_mod.quiet_hours(person)
-        kinds = "🔔 all four on" if not off else "🔕 off: " + ", ".join(off)
+        kinds = "🔔 all on" if not off else "🔕 off: " + ", ".join(off)
         quiet = (
             "no quiet hours"
             if window is None
@@ -2411,10 +2475,10 @@ class LaundryAssistant:
         # Prepended, not a field: this caveat must be read first, and fields render after it.
         if person["reminders"] != people_mod.REMIND_DM:
             route = (
-                "⚠️ None of these can reach you at the moment — **Pings** is "
-                "set to something other than 📬 **DM me**, and every message "
-                "below is a DM. Your answers here are kept for when you change "
-                "it back.\n\n"
+                "⚠️ Most of these can't reach you at the moment — **Pings** is "
+                "set to something other than 📬 **DM me**, and they are DMs. "
+                "(🧺 Empty-it follows **Pings**, so it still reaches you.) Your "
+                "answers here are kept for when you change it back.\n\n"
             )
         elif person["dm_ok"] is False:
             route = (
@@ -2427,7 +2491,8 @@ class LaundryAssistant:
             title="🔔 What I send you",
             description=(
                 route
-                + "These are the messages **I** start — on a schedule, or "
+                + "These are the messages **I** start — on a schedule, when your "
+                "load needs you, or "
                 "because a housemate asked me to. Switching one off means I "
                 "won't send it.\n\n"
                 "Nothing here touches the messages that answer something *you* "

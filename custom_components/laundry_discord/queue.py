@@ -16,6 +16,7 @@ TOGGLE_ADDED = "added"
 TOGGLE_REMOVED = "removed"
 TOGGLE_FULL = "full"
 TOGGLE_STALE = "stale"
+TOGGLE_ALREADY = "already"  # join-only: already waiting
 
 
 def same_user(entry: dict, user_id) -> bool:
@@ -84,6 +85,19 @@ def toggle_member(
         [*queue, {"id": user_id, "name": name, "ts": now}],
         TOGGLE_ADDED,
     )
+
+
+def join_member(
+    queue: list[dict], user_id, name: str, now: float
+) -> tuple[list[dict], str]:
+    """Join the back of the line without the toggle's leave (for DM replies).
+
+    Returns `(new_queue, result)`: `TOGGLE_ADDED`, `TOGGLE_FULL`, or
+    `TOGGLE_ALREADY` when they're already waiting.
+    """
+    if find(queue, user_id) is not None:
+        return (list(queue), TOGGLE_ALREADY)
+    return toggle_member(queue, user_id, name, now)
 
 
 def remove_user(queue: list[dict], user_id) -> list[dict]:
@@ -233,3 +247,35 @@ def handoff_line(name: str | None, *, hedged: bool) -> str:
     if hedged:
         return f"🔜 {who} — nudged that it's probably free (nobody confirmed)."
     return f"🔜 {who} — told the washer's free."
+
+
+def free_announcement(name: str | None, *, hedged: bool) -> str | None:
+    """The channel line posted when the washer comes free, or None.
+
+    ``name`` is whoever was just handed the washer (None when nobody was
+    waiting). A hedged backstop with nobody waiting says nothing: done isn't
+    empty, and the house would be told "free" on no evidence.
+    """
+    if name:
+        if hedged:
+            return (
+                f"🔜 The washer's probably free — nobody's confirmed. "
+                f"{name}'s up next."
+            )
+        return f"🔜 Washer's free — {name}'s up next."
+    if hedged:
+        return None
+    return "🧺 Washer's free."
+
+
+def empty_reminder_text(*, waiting: bool, name: str | None = None) -> str:
+    """The reminder for a claimant who hasn't tapped ✅ Emptied it.
+
+    ``name`` gives the push-free form used when they set 🌙 Quiet on the card.
+    """
+    tail = " — someone's waiting for it." if waiting else "."
+    if name:
+        return f"🌙 {name}, your laundry's still in the washer{tail}"
+    if waiting:
+        return f"🧺 Your laundry's still in the washer{tail}"
+    return "🧺 Reminder: your laundry's done and still in the washer."

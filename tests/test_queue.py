@@ -433,6 +433,38 @@ def test_attributes_carry_nothing_derived_from_the_clock() -> None:
     assert not any(isinstance(v, float) for v in ticks[0].values())
 
 
+
+# --- the washer-free line, the empty-it reminder and joining from a DM --------
+def test_the_free_line_names_whoever_was_handed_the_washer() -> None:
+    assert _queue.free_announcement("Sam", hedged=False) == (
+        "🔜 Washer's free — Sam's up next."
+    )
+    assert "nobody's confirmed" in _queue.free_announcement("Sam", hedged=True)
+    assert _queue.free_announcement(None, hedged=False) == "🧺 Washer's free."
+
+
+def test_a_hedged_backstop_with_nobody_waiting_announces_nothing() -> None:
+    # Done isn't empty: with nobody confirmed, "free" would be a guess.
+    assert _queue.free_announcement(None, hedged=True) is None
+
+
+def test_the_empty_reminder_says_when_someone_is_waiting() -> None:
+    assert "someone's waiting" in _queue.empty_reminder_text(waiting=True)
+    assert "someone's waiting" not in _queue.empty_reminder_text(waiting=False)
+    quiet = _queue.empty_reminder_text(waiting=False, name="Alex")
+    assert quiet.startswith("🌙 Alex,") and "<@" not in quiet
+
+
+def test_joining_from_a_dm_never_leaves_the_line() -> None:
+    line, result = _queue.join_member([], 7, "Sam", 100.0)
+    assert result == TOGGLE_ADDED and [e["id"] for e in line] == [7]
+    again, result = _queue.join_member(line, "7", "Sam", 200.0)
+    assert result == _queue.TOGGLE_ALREADY and again == line
+    full = [{"id": n, "name": str(n), "ts": 1.0} for n in range(QUEUE_CAP)]
+    _unchanged, result = _queue.join_member(full, 99, "X", 1.0)
+    assert result == _queue.TOGGLE_FULL
+
+
 def _run() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

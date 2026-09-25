@@ -75,6 +75,18 @@ short `@mention` beside the edited embed instead.
 - **Handed-over field.** The done card records who was told and whether it was
   confirmed or hedged — popping them off the queue the instant they're told
   would otherwise make it look like they were never waiting.
+- **Empty-it reminder.** `empty_reminder` (default 15 min, 0–240; 0 disables)
+  after a claimed load finishes without ✅, the claimant gets one reminder through
+  their Pings route (🌙 Quiet names them without a push), saying if someone's
+  waiting. Also armed when a finished load is claimed later. `empty_reminded` is
+  persisted and set before sending, so a restart can't repeat it. Blockable
+  (🔔 Empty-it) and dropped inside quiet hours. It fires before the backstop by
+  default, so the claimant gets a chance before the next person is told.
+- **Washer-free line.** At each handoff a push-silent, no-mention channel line
+  (`queue.free_announcement`), so the house sees it even when the next person
+  was DMed. Skipped for an unclaimed completion (its "up for grabs" line already
+  says it), when the next person's own ping went to the channel, and for a
+  hedged backstop with nobody waiting (done isn't empty). `announce_free` option.
 - **Not a new stage.** "Emptied" is a boolean on `STAGE_DONE_WAITING`; the stage
   machine itself is never extended.
 
@@ -106,7 +118,7 @@ short `@mention` beside the edited embed instead.
 
   Pings             💬 In the channel, with an @mention
   Monitoring        👁 on — when you tap Claim I note the day and time
-  What I send you   🔔 all four on · no quiet hours
+  What I send you   🔔 all on · no quiet hours
   Guessing          🔮 on — I'll mark your usual days with ? on your week
 
 [ 📬 DM me ] [ 💬 In the channel ] [ 🚫 No pings ]
@@ -126,9 +138,10 @@ short `@mention` beside the edited embed instead.
   only signal the bot ever gets that it may work now.
 - **Monitoring gates the write, not the read.** `habit.record_load` requires
   `monitor is True` exactly — off means the tap is never logged at all.
-- **Four notification kinds** (`people.KINDS`), all default on: check-in,
-  heads-up, opportunity, trades. An unrecognised kind reads as **True**
-  (`wants_kind`) — a typo can only fail open, never silently mute someone.
+- **Six notification kinds** (`people.KINDS`), all default on: check-in,
+  heads-up, opportunity, trades, empty-it, slot taken. An unrecognised kind
+  reads as **True** (`wants_kind`) — a typo can only fail open, never silently
+  mute someone. All are DMs except empty-it, which follows Pings.
 - **Quiet hours are both-or-neither** (a half-set pair is *no window*) and
   wrap midnight; the panel offers presets only, because Discord has no time
   input.
@@ -138,7 +151,8 @@ short `@mention` beside the edited embed instead.
   unaffected.
 - **Replies are never gated by kind or quiet hours.** The done ping and the
   handoff ping answer something the person just did and are time-critical;
-  they're gated only by delivery mode itself.
+  they're gated only by delivery mode itself. The empty-it reminder is a nag,
+  not a reply, so it is gated.
 
 ## Week grid
 
@@ -223,6 +237,16 @@ short `@mention` beside the edited embed instead.
 - **Whichever trigger fires first wins** — the washer actually coming free, or
   a fixed lead-before-start tick — and the other is dropped, so nobody hears
   about one evening twice.
+- **Slot taken.** When a load is claimed (not stopped early), every other holder
+  of a slot the running load occupies gets one DM per slot
+  (`nudge.slot_taken_targets`): "someone else got to the washer first", with 🔜
+  Put me next (joins the line; never leaves it), ⏭ Move to tomorrow and 👍 It's
+  fine. It names nobody, skips people already in the line, and says nothing for
+  a load nobody claims (the booker may have started it). The person who used
+  the slot is told nothing. Gated like every reminder DM, including 🔔 Slot
+  taken and quiet hours, but **not charged to the budget**: it's about their
+  own booking, and would otherwise be blocked on any day they already had a
+  heads-up.
 
 ## Swap requests
 

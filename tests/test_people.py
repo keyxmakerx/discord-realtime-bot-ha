@@ -184,7 +184,7 @@ def test_every_dm_kind_starts_on_and_no_quiet_hours_are_set() -> None:
     assert person["quiet_start"] is None
     assert person["quiet_end"] is None
     assert quiet_hours(person) is None
-    assert [wants_kind(person, kind) for kind in KINDS] == [True] * 4
+    assert [wants_kind(person, kind) for kind in KINDS] == [True] * len(KINDS)
     # Every kind must name a field that actually exists on the record.
     assert set(KIND_FIELDS.values()) <= set(person)
 

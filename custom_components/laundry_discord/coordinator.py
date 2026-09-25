@@ -34,6 +34,8 @@ from .const import (
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
+    CONF_ANNOUNCE_FREE,
+    CONF_EMPTY_REMINDER,
     CONF_HANDOFF_FALLBACK,
     CONF_JOB_STATE_ENTITY,
     CONF_MACHINE_STATE_ENTITY,
@@ -49,6 +51,8 @@ from .const import (
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_ETA_INTERVAL,
+    DEFAULT_ANNOUNCE_FREE,
+    DEFAULT_EMPTY_REMINDER,
     DEFAULT_HANDOFF_FALLBACK,
     DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
@@ -69,6 +73,7 @@ from .const import (
     JOB_STATE_FINISH,
     JOB_STATE_NONE,
     REAL_PHASES,
+    SIGNAL_LOAD_CLAIMED,
     SIGNAL_UPDATE,
     SIGNAL_WASHER_FREE,
     STAGE_DONE_WAITING,
@@ -82,6 +87,7 @@ from .const import (
 )
 from . import cancel as cancel_mod
 from . import diagnose as diagnose_mod
+from . import people as people_mod
 from . import queue
 from .assistant import LaundryAssistant
 from .detect import (
@@ -137,6 +143,8 @@ class LaundryCoordinator:
         # needed because the handoff pops the queue head (keeps "Next up" accurate).
         self.handoff_name: str | None = None
         self.handoff_hedged: bool = False
+        # Whether this load's claimant has had their one empty-it reminder.
+        self.empty_reminded: bool = False
         self.message_id: int | None = None
         self.catch_up: bool = False  # picked up mid-cycle, not at the off->on start
         self.paused: bool = False  # machine_state reports the load paused mid-cycle
@@ -177,6 +185,7 @@ class LaundryCoordinator:
         self._stop_confirm_unsub = None
         self._selfclean_unsub = None  # self-clean detect/end timer
         self._handoff_unsub = None  # handoff-fallback timer (nobody tapped "Emptied it")
+        self._empty_unsub = None  # empty-it reminder timer
         self._tasks: set[asyncio.Task] = set()  # in-flight tasks; see _create_task
 
     def _create_task(self, coro) -> None:
@@ -310,6 +319,17 @@ class LaundryCoordinator:
         )
 
     @property
+    def empty_reminder(self) -> int:
+        """Seconds after a claimed load finishes before its claimant is
+        reminded to empty it. 0 disables."""
+        return int(self._cfg.get(CONF_EMPTY_REMINDER, DEFAULT_EMPTY_REMINDER)) * 60
+
+    @property
+    def announce_free(self) -> bool:
+        """Whether a handoff also posts a push-silent "washer's free" line."""
+        return bool(self._cfg.get(CONF_ANNOUNCE_FREE, DEFAULT_ANNOUNCE_FREE))
+
+    @property
     def queue_expiry(self) -> int:
         """Seconds an "I'm next" entry survives before it ages out of the line."""
         return int(self._cfg.get(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY)) * 3600
@@ -418,6 +438,7 @@ class LaundryCoordinator:
             self._selfclean_unsub()
             self._selfclean_unsub = None
         self._cancel_handoff_timer()
+        self._cancel_empty_timer()
         await self._async_cancel_tasks()
         try:
             await self.bot.async_close()
@@ -451,6 +472,8 @@ class LaundryCoordinator:
                 and self.claimed_by_id is not None
             ):
                 self._arm_handoff_timer()
+                if not self.empty_reminded:
+                    self._arm_empty_timer()
         # DONE_WAITING also keeps its claim/unclaim button working via the
         # persistent ClaimView re-registered in on_ready.
         self._notify_entities()
@@ -471,6 +494,7 @@ class LaundryCoordinator:
         self.emptied = data.get("emptied", False)
         self.handoff_name = data.get("handoff_name")
         self.handoff_hedged = data.get("handoff_hedged", False)
+        self.empty_reminded = data.get("empty_reminded", False)
         self.message_id = data.get("message_id")
         self.catch_up = data.get("catch_up", False)
         self.paused = data.get("paused", False)
@@ -509,6 +533,7 @@ class LaundryCoordinator:
                 "emptied": self.emptied,
                 "handoff_name": self.handoff_name,
                 "handoff_hedged": self.handoff_hedged,
+                "empty_reminded": self.empty_reminded,
                 "message_id": self.message_id,
                 "catch_up": self.catch_up,
                 "paused": self.paused,
@@ -1202,6 +1227,7 @@ class LaundryCoordinator:
                 "emptied": self.emptied,
                 "handoff_name": self.handoff_name,
                 "handoff_hedged": self.handoff_hedged,
+                "empty_reminded": self.empty_reminded,
                 "cancelled": self.cancelled,
                 "paused": self.paused,
                 "stage": self.stage,
@@ -1230,9 +1256,11 @@ class LaundryCoordinator:
             # Reset alongside `emptied`: a stale name would misattribute the handoff.
             self.handoff_name = None
             self.handoff_hedged = False
+            self.empty_reminded = False
             self.cancelled = False  # belonged to the load this one supersedes
             # Any pending handoff or stop-confirm belonged to the superseded load.
             self._cancel_handoff_timer()
+            self._cancel_empty_timer()
             self._cancel_stop_confirm()
             self.paused = self._machine_state() == MACHINE_PAUSE
             # Seeds the phase so an already-drying catch-up still detects its finish.
@@ -1333,6 +1361,7 @@ class LaundryCoordinator:
             self.emptied = False  # done is not empty; every completion starts un-emptied
             self.handoff_name = None
             self.handoff_hedged = False
+            self.empty_reminded = False
             # A cancel is not a wash: retract a mid-wash claim's history row, bounded
             # to this session. Gated on `retract`, not `cancelled` — a real completion
             # that merely beat its own estimate must not take history with it.
@@ -1398,8 +1427,10 @@ class LaundryCoordinator:
             # asyncio.Lock isn't reentrant, hence _locked.
             if claimed:
                 self._arm_handoff_timer()
+                self._arm_empty_timer()
             else:
-                await self._async_ping_next_locked(hedged=False)
+                # The "up for grabs" line above already tells the channel.
+                await self._async_ping_next_locked(hedged=False, announce=False)
             self._offline_unverified = False
             await self._async_save()
             self._notify_entities()
@@ -1483,6 +1514,18 @@ class LaundryCoordinator:
         # stopped load isn't a wash and must not move anyone's predicted times.
         if not self.cancelled:
             await self.assistant.async_note_claim(user_id)
+            # Lets the reminder loop tell anyone whose booked slot this load is in.
+            async_dispatcher_send(
+                self.hass, SIGNAL_LOAD_CLAIMED, {"claimant_id": user_id}
+            )
+        # A load claimed after it finished gets its empty-it reminder from now.
+        if (
+            self.stage == STAGE_DONE_WAITING
+            and not self.emptied
+            and not self.empty_reminded
+            and self._empty_unsub is None
+        ):
+            self._arm_empty_timer()
         return True
 
     async def handle_unclaim(self) -> bool:
@@ -1492,6 +1535,7 @@ class LaundryCoordinator:
         self.claimed_by = UNCLAIMED
         self.claimed_by_id = None
         self.quiet = False  # quiet belonged to the (now gone) claimant
+        self._cancel_empty_timer()  # nobody left to remind
         if self.stage == STAGE_DONE_WAITING:
             self.waiting = True
         await self._async_save()
@@ -1527,6 +1571,35 @@ class LaundryCoordinator:
         self._notify_entities()
         return result
 
+    async def handle_next_join(self, who: str, user_id: int) -> tuple[str, int | None]:
+        """Join the 🔜 line from a DM reply; unlike the card's toggle, never leaves.
+
+        Returns `(result, place)` with a `queue.TOGGLE_*` result.
+        """
+        if self.stage not in self._CLAIMABLE_STAGES:
+            return (queue.TOGGLE_STALE, None)
+        now = dt_util.utcnow().timestamp()
+        pruned = queue.prune(self.queue, now, float(self.queue_expiry))
+        self.queue, result = queue.join_member(pruned, user_id, who, now)
+        if result == queue.TOGGLE_ADDED:
+            await self._async_save()
+            self._notify_entities()
+            # The card's "Next up" is now stale, and it wasn't the card that was tapped.
+            self._create_task(self._async_refresh_card())
+        return (result, queue.position(self.queue, user_id))
+
+    async def _async_refresh_card(self) -> None:
+        """Re-render the live card after a change made outside it."""
+        async with self._lock:
+            if not self.message_id or self.stage not in self._CLAIMABLE_STAGES:
+                return
+            try:
+                await self.bot.async_edit(
+                    self.message_id, self.build_embed(), view=view_for(self)
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to refresh the card")
+
     async def handle_emptied(self) -> bool:
         """The claimant confirming the drum is clear (the ✅ button).
 
@@ -1539,6 +1612,7 @@ class LaundryCoordinator:
             return False
         self.emptied = True
         self._cancel_handoff_timer()
+        self._cancel_empty_timer()
         await self._async_save()
         self._notify_entities()
         # Not awaited: takes the lock and does two round trips, and this callback
@@ -1549,13 +1623,16 @@ class LaundryCoordinator:
         return True
 
     # ------------------------------------------------------------- the handoff
-    async def _async_ping_next_locked(self, *, hedged: bool) -> None:
+    async def _async_ping_next_locked(
+        self, *, hedged: bool, announce: bool = True
+    ) -> None:
         """Hand the washer to whoever is next. Assumes the lock is held.
 
         `asyncio.Lock` isn't reentrant, so a caller that already holds it
         (`_async_handle_finished`) must use this variant, not take it again.
         `hedged` softens the wording for the fallback timer, where nothing is
-        actually confirmed.
+        actually confirmed. `announce` posts the channel's "washer's free" line
+        (off for an unclaimed completion, which has already posted one).
         """
         now = dt_util.utcnow().timestamp()
         claimant_id = self.claimed_by_id
@@ -1582,6 +1659,8 @@ class LaundryCoordinator:
                 },
             )
             if head is None:
+                if announce:
+                    await self._async_announce_free(None, hedged=hedged)
                 return  # nobody waiting — an empty line is the normal case
         if head is not None:
             # Recorded before the ping: the queue has already lost them either way,
@@ -1595,15 +1674,20 @@ class LaundryCoordinator:
                 )
             else:
                 body = "🔜 Washer's free — you're up."
+            route = None
             try:
                 # Routed via 🤖 prefs: a channel @mention (a push) unless a DM bounces.
-                await self.assistant.async_route_ping(
+                route = await self.assistant.async_route_ping(
                     head.get("id"),
                     dm_text=body,
                     channel_text=f"<@{head.get('id')}> {body}",
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to ping the next person in line")
+            if announce:
+                await self._async_announce_free(
+                    self.handoff_name, hedged=hedged, route=route
+                )
         # The queue moved, so "Next up" is stale. Re-attach the view too: if the
         # button's own edit never lands, ✅ would otherwise offer forever.
         if self.message_id:
@@ -1628,6 +1712,25 @@ class LaundryCoordinator:
             if self.stage != STAGE_DONE_WAITING or self.emptied != expect_emptied:
                 return
             await self._async_ping_next_locked(hedged=hedged)
+
+    async def _async_announce_free(self, name, *, hedged: bool, route=None) -> None:
+        """Post the push-silent "washer's free" line, if enabled.
+
+        Skipped when the next person's own ping already went to the channel
+        (`route`), since that message already says it.
+        """
+        if not self.announce_free or route in (
+            people_mod.REMIND_CHANNEL,
+            people_mod.REMIND_OFF,
+        ):
+            return
+        line = queue.free_announcement(name, hedged=hedged)
+        if line is None:
+            return
+        try:
+            await self.bot.async_announce_done(line)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to post the washer-free line")
 
     @callback
     def _arm_handoff_timer(self) -> None:
@@ -1662,6 +1765,59 @@ class LaundryCoordinator:
             self._async_ping_next(hedged=True, expect_emptied=False)
         )
 
+    # ---------------------------------------------------------- empty-it reminder
+    @callback
+    def _arm_empty_timer(self) -> None:
+        """Arm the one-shot reminder to this finished load's claimant."""
+        self._cancel_empty_timer()
+        delay = self.empty_reminder
+        if delay <= 0:
+            return
+        self._empty_unsub = async_call_later(
+            self.hass, delay, self._async_empty_reminder_due
+        )
+
+    @callback
+    def _cancel_empty_timer(self) -> None:
+        if self._empty_unsub is not None:
+            self._empty_unsub()
+            self._empty_unsub = None
+
+    @callback
+    def _async_empty_reminder_due(self, _now=None) -> None:
+        self._empty_unsub = None
+        if self.stage != STAGE_DONE_WAITING or self.emptied or self.empty_reminded:
+            return
+        self._create_task(self._async_send_empty_reminder())
+
+    async def _async_send_empty_reminder(self) -> None:
+        """Remind the claimant once. Marked sent before sending, so a restart
+        can't repeat it."""
+        async with self._lock:
+            if (
+                self.stage != STAGE_DONE_WAITING
+                or self.emptied
+                or self.empty_reminded
+                or self.claimed_by_id is None
+            ):
+                return
+            self.empty_reminded = True
+            await self._async_save()
+            now = dt_util.utcnow().timestamp()
+            waiting = any(
+                not queue.same_user(entry, self.claimed_by_id)
+                for entry in queue.prune(self.queue, now, float(self.queue_expiry))
+            )
+            try:
+                await self.assistant.async_remind_empty(
+                    self.claimed_by_id,
+                    name=self.claimed_by,
+                    waiting=waiting,
+                    quiet=self.quiet,
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to send the empty-it reminder")
+
     async def async_reset_session(self) -> None:
         """Service: force-close whatever session is being tracked.
 
@@ -1676,6 +1832,7 @@ class LaundryCoordinator:
             self._stop_eta_timer()
             self._cancel_stop_confirm()
             self._cancel_handoff_timer()
+            self._cancel_empty_timer()
             if self._job_confirm_unsub is not None:
                 self._job_confirm_unsub()
                 self._job_confirm_unsub = None
@@ -1691,6 +1848,7 @@ class LaundryCoordinator:
             self.emptied = False
             self.handoff_name = None
             self.handoff_hedged = False
+            self.empty_reminded = False
             self.paused = False
             self.cancelled = False
             self.catch_up = False
@@ -1768,7 +1926,9 @@ class LaundryCoordinator:
             self.emptied = False
             self.handoff_name = None
             self.handoff_hedged = False
+            self.empty_reminded = False
             self._cancel_handoff_timer()
+            self._cancel_empty_timer()
             embed = self.build_embed(test=True)
             try:
                 self.message_id = await self.bot.async_post(
