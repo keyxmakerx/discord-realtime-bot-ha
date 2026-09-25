@@ -1,64 +1,20 @@
-"""Pure, dependency-free rules for the double-blind trade broker (§9).
+"""Rules for the anonymous slot-swap broker.
 
-Kept free of Home Assistant / discord imports so the only question that matters
-here — *may this person ask that person for that slot, right now?* — can be
-unit-tested without the HA test harness, the same discipline that made
-:mod:`detect`, :mod:`queue`, :mod:`people`, :mod:`plan`, :mod:`habit` and
-:mod:`nudge` reliable. :mod:`assistant` owns the ``Store``, the Discord calls
-and the delivery; this module owns every rule, every state and every string
-that is written before an accept.
-
-A trade request is the only message in this integration that one housemate
-causes to arrive on another housemate's phone. In a house of seven that is one
-step away from being a way to pester somebody, so the guardrails are not
-decoration — they *are* the feature, and they all live here, in one readable
-list, rather than spread across button callbacks where a stray ``return`` is
-invisible:
-
-* **Anonymity until an accept, and it is structural.** Nothing this module
-  renders before :data:`STATE_ACCEPTED` takes a name or an id — the pre-accept
-  text functions have nowhere to put one, because they do not accept one as an
-  argument. "Someone" is the only correct word (§9 step 2), and the two
-  functions that *are* allowed a name say so in their own names.
-* **Refusals are told back flat.** Several different refusals share one
-  sentence on purpose (:func:`refusal_text`): a requester who cannot see who
-  holds a cell must not be able to learn, from *how* the bot says no, that a
-  particular person has blocked them, has DMs closed, or is already being asked
-  by somebody else. The reason codes stay distinct so the behaviour is
-  testable; the rendering does not.
-* **Every guardrail refuses on its own.** :func:`check_request` and
-  :func:`check_holder` return the **first** rule that said no, and each one is
-  sufficient — no rule needs another to be true to bite.
-* **Expiry is read, never swept.** A request's liveness is computed from its
-  timestamp at the moment somebody looks (:func:`state_of`), so nothing has to
-  run on a tick to age one out and nothing writes to the store to make an old
-  request stop working. An expired request cannot be answered
-  (:func:`answer`), and requests from a week that has passed are dropped the
-  next time the list is written (:func:`prune_requests`).
-* **The caller passes the clock.** Nothing here reads the time, exactly like
-  :mod:`habit` and :mod:`nudge`.
-* **Nothing is mutated.** Every function returns new data, so a rejected store
-  write can't half-apply.
-
-The moment passed in must be **timezone-aware local time** (HA's
-``dt_util.now()``); :mod:`habit` refuses a naive one outright rather than
-guessing which evening it meant, and every read of the clock here goes through
-it.
+Pure: no Home Assistant or discord imports, so it is unit-tested directly.
+:mod:`assistant` owns the Store and Discord calls; this module owns every
+rule and string shown before an accept, using a timezone-aware moment.
 """
 
 from __future__ import annotations
 
-try:  # the normal path — sibling modules inside the integration package
+try:  # normal path: sibling modules inside the integration package
     from . import habit
     from . import nudge
     from . import people
     from . import plan
-except ImportError:  # pragma: no cover - loaded by file path, as the tests do
-    # There is no package when this is exec'd from a file path, which is how the
-    # pure suite runs it. The budget, the week maths, the preference record and
-    # "is this person paused" are *not* reimplemented here: a second copy of any
-    # of them is how the broker and the panel start disagreeing about what
-    # somebody chose.
+except ImportError:  # pragma: no cover - loaded by file path in tests
+    # No package when exec'd by file path. Don't reimplement habit/plan/people
+    # logic here or this module and the panel will disagree.
     import habit  # type: ignore[no-redef]
     import nudge  # type: ignore[no-redef]
     import people  # type: ignore[no-redef]
@@ -66,55 +22,36 @@ except ImportError:  # pragma: no cover - loaded by file path, as the tests do
 
 SECONDS_PER_HOUR = 3600
 
-# --- the guardrail numbers (design doc §9) ----------------------------------
-# How long an unanswered ask lives. A week's plan is worthless a week later, and
-# an ask that is still sitting there on Friday is about a Tuesday that has
-# happened. Two days is long enough for somebody who only opens Discord in the
-# evening and short enough that the answer still means something.
+# --- guardrail numbers -------------------------------------------------------
+# How long an unanswered ask lives before it lapses.
 REQUEST_TTL_HOURS = 48
 
-# How many asks one person can have in flight at once. Two is enough to have
-# more than one iron in the fire; more than that and one person's week becomes
-# everybody else's inbox.
+# Max asks one person can have in flight at once.
 MAX_OPEN_PER_REQUESTER = 2
 
-# ...and how many can be waiting on one person. Exactly one, for two reasons:
-# nobody should open Discord to a queue of people wanting their Thursday, and it
-# is what makes a tap on a trade DM unambiguous — the buttons cannot carry a
-# request id (a per-request ``custom_id`` cannot be a persistent view, so it
-# would die at the next restart), so "the open request addressed to you" has to
-# be a single thing. :func:`match_request` still checks the DM's own timestamp
-# on top of that.
+# Max asks waiting on one person; kept at 1 so a tap on a trade DM is unambiguous.
 MAX_OPEN_PER_HOLDER = 1
 
-# An absolute ceiling on the stored list, the same belt-and-braces
-# :data:`habit.HISTORY_MAX` is. The rules already bound it — one request per
-# requester per cell per week is 7 people x 28 cells — so this cannot be reached
-# by ordinary use; it exists so "it can never grow without bound" is true of the
-# code rather than of the happy path.
+# Ceiling on the stored request list, so it can't grow without bound.
 MAX_REQUESTS = 250
 
-# How far a trade DM's own timestamp may be from the request it is taken to be
-# about. The DM goes out immediately after the request is written, so this is
-# generous; it exists so a *stale* DM — one whose request has since expired and
-# been replaced by somebody else's — cannot be tapped into answering a request
-# its reader has never seen.
+# Max drift between a DM's own timestamp and its request, so a stale DM
+# can't be tapped into answering a newer ask.
 MATCH_WINDOW_SECONDS = 300
 
 # --- states ------------------------------------------------------------------
-# Only the first four are ever *stored*. "Expired" is computed from the row's
-# timestamp when somebody looks (:func:`state_of`), so ageing costs no write.
+# Only the first four are stored; "expired" is computed at read time
+# (:func:`state_of`), so ageing costs no write.
 STATE_OPEN = "open"
 STATE_ACCEPTED = "accepted"
 STATE_DECLINED = "declined"
-STATE_BLOCKED = "blocked"  # ❌ Pass, plus 🚫 don't ask me again
+STATE_BLOCKED = "blocked"  # pass, or permanent "don't ask me again"
 STATE_EXPIRED = "expired"
 STORED_STATES = (STATE_OPEN, STATE_ACCEPTED, STATE_DECLINED, STATE_BLOCKED)
 STATES = (*STORED_STATES, STATE_EXPIRED)
 
-# Both of these are somebody saying no, and both close the slot to *everybody*
-# for the rest of the week (§9). The difference is only what else happened: a
-# block also writes the permanent per-pair refusal onto the holder's record.
+# Both are a refusal, and both close the slot to everybody for the week.
+# A block also adds a permanent per-pair refusal on the holder's record.
 REFUSED_STATES = (STATE_DECLINED, STATE_BLOCKED)
 
 # The three answers a trade DM carries.
@@ -130,18 +67,11 @@ _ACTION_STATES = {
 }
 
 # --- why an ask was or wasn't allowed ---------------------------------------
-# One reason per gate, distinguishable for the tests and for "is this working".
-# What the *requester* is shown collapses several of them into one sentence —
-# see :func:`refusal_text`, which is the only thing allowed to render these.
+# One reason per gate. :func:`refusal_text` collapses the holder-side ones
+# into a single sentence for the requester.
 REASON_OK = "ok"
 REASON_MOMENT = "moment"  # an unreadable clock — never act on a guess
-# The ask was recorded but nothing was sent, because the holder-side rules said
-# no. The requester is told exactly what a delivered ask is told (:func:`sent_text`)
-# and it lapses unanswered, because *whether a DM went out at all* is itself a
-# fact about the holder: a refusal that costs nothing is a free, repeatable
-# oracle that partitions the grid by who refuses, which is the one thing
-# anonymity is for. See :func:`claim_request`.
-REASON_SILENT = "silent"
+REASON_SILENT = "silent"  # ask recorded but not delivered; see claim_request
 REASON_TRADES_OFF = "trades_off"  # the house switch, checked by the caller
 REASON_BAD_CELL = "bad_cell"  # unusable want/offer, or the same cell twice
 REASON_BAD_WEEK = "bad_week"
@@ -152,9 +82,8 @@ REASON_ALREADY_ASKED = "already_asked"  # you, this slot, this week
 REASON_SLOT_REFUSED = "slot_refused"  # somebody said no to this slot this week
 REASON_TOO_MANY_OPEN = "too_many_open"  # your own outstanding asks
 REASON_NO_REPLY_PATH = "no_reply_path"  # *you* can't be DMed the answer
-# Everything below here is a fact about the *holder*, and all of it renders as
-# one identical sentence. Learning which of these applied would be learning
-# something about a person the requester cannot even name.
+# Below here: facts about the holder. All render as one sentence so the
+# requester can't tell them apart.
 REASON_BLOCKED = "blocked"  # 🚫 don't ask me again, permanently
 REASON_NOT_OPTED_IN = "not_opted_in"  # no record, or never answered the panel
 REASON_REMINDERS_OFF = "reminders_off"  # 🚫 in the panel
@@ -165,12 +94,8 @@ REASON_SWAPS_OFF = "swaps_off"  # 🔁 off on *their* record — not the house s
 REASON_QUIET = "quiet"  # inside their overnight quiet window
 REASON_HOLDER_BUSY = "holder_busy"  # they already have an ask waiting
 REASON_BUDGET_DAY = "budget_day"  # their 1-DM-a-day cap
-# The DM did not leave the building. Nothing renders this any more — the caller
-# withdraws the ask and says nothing extra, because an outcome only *this*
-# holder-side condition produces would identify that holder as one with DMs
-# closed. It stays in :data:`HOLDER_REASONS` so the "these must all read
-# identically" test keeps covering it, and so the reason the withdrawal exists
-# is still named somewhere.
+# DM never left the building. Nothing renders this: the caller withdraws the
+# ask silently. Kept in :data:`HOLDER_REASONS` so the sentence stays uniform.
 REASON_UNDELIVERED = "undelivered"
 
 REASONS = (
@@ -200,9 +125,7 @@ REASONS = (
     REASON_UNDELIVERED,
 )
 
-# The reasons that are facts about the holder rather than about the request.
-# Grouped here so the "these must all read identically" rule is a data
-# structure the tests can iterate, not a promise in a docstring.
+# Facts about the holder; grouped so the tests can check they all render alike.
 HOLDER_REASONS = (
     REASON_BLOCKED,
     REASON_NOT_OPTED_IN,
@@ -220,13 +143,9 @@ HOLDER_REASONS = (
 
 # --- small defensive readers -------------------------------------------------
 def _id(value) -> str | None:
-    """A user id in its string form, or None for something unusable.
-
-    Same hazard as everywhere else in this integration: ``interaction.user.id``
-    is an int and HA's ``Store`` is JSON, so it comes back as ``"123"``. A
-    request whose two ends were spelled differently would silently never match
-    anybody.
-    """
+    """A user id as a string, or None if unusable. `interaction.user.id`
+    is an int but HA's Store round-trips it as JSON, coming back as
+    `"123"`, so ids must be compared as strings."""
     if value is None or isinstance(value, bool):
         return None
     key = str(value)
@@ -250,13 +169,9 @@ def _week(value) -> str | None:
 
 # --- request records ---------------------------------------------------------
 def request_id(week, requester, want) -> str | None:
-    """The stable id for one ask: ``"2026-W32:123:3-eve"``.
-
-    Deterministic rather than random, because *one request per slot per
-    requester per week* is a hard rule (§9) and this is exactly that rule's
-    natural key: two rows for one ask cannot be written even by a caller that
-    forgets to check.
-    """
+    """The stable id for one ask: ``"2026-W32:123:3-eve"``. Deterministic,
+    not random: one request per slot per requester per week is the key, so
+    a duplicate ask can't be written even by mistake."""
     key = plan.normalise_cell(want)
     who = _id(requester)
     stamp = _week(week)
@@ -266,22 +181,9 @@ def request_id(week, requester, want) -> str | None:
 
 
 def new_request(requester, holder, want, offer, week, moment) -> dict | None:
-    """One request row, or None if it could not be a usable one.
-
-    ``{"id", "from", "to", "want", "offer", "week", "ts", "made", "state"}`` —
-    §12's shape plus the ISO week, which the doc's sketch leaves out and every
-    once-per-week rule in here needs (a bare timestamp cannot say which week it
-    belongs to without redoing the week maths at every read), plus ``made``.
-
-    ``ts`` and ``made`` are the same number on a fresh row and diverge on
-    exactly two paths: :func:`_lapsed_request` and :func:`withdraw` both age
-    ``ts`` past the TTL so the row is born, or becomes, inert. ``ts`` is
-    therefore *liveness* — is anybody waiting on an answer — and ``made`` is
-    *when this person asked*, which is the only honest basis for a cap on their
-    own outstanding asks. Keeping one field for both is what let a holder-side
-    refusal refund the asker's cap and turn :data:`REASON_TOO_MANY_OPEN` into
-    an oracle; see :func:`pending_from`.
-    """
+    """One request row, or None if it could not be a usable one. Fields:
+    id, from, to, want, offer, week, ts, made, state. ``made`` is when the
+    ask was made; ``ts`` is liveness, aged past TTL to lapse it."""
     ident = request_id(week, requester, want)
     who = _id(requester)
     them = _id(holder)
@@ -306,12 +208,8 @@ def new_request(requester, holder, want, offer, week, moment) -> dict | None:
 
 
 def normalise_request(record) -> dict | None:
-    """A stored request, rebuilt field by field — or None if unusable.
-
-    Rebuilt rather than trusted, because these come off disk: a row with no
-    timestamp can never expire, and a row missing either end belongs to nobody,
-    so both are dropped rather than carried forever.
-    """
+    """A stored request rebuilt field by field, or None if unusable. Rows
+    missing a timestamp or either end are dropped rather than kept."""
     if not isinstance(record, dict):
         return None
     who = _id(record.get("from"))
@@ -326,10 +224,7 @@ def normalise_request(record) -> dict | None:
         return None
     state = record.get("state")
     ident = record.get("id")
-    # A row written before ``made`` existed falls back to ``ts``, which is what
-    # it meant at the time. That reads a *stored* lapsed row as older than it
-    # is, so the very first upgrade can under-count somebody's cap by one ask
-    # for at most two days — the alternative is refusing to read the store.
+    # Rows from before `made` existed fall back to `ts`.
     made = _ts(record.get("made"))
     return {
         "id": ident if isinstance(ident, str) and ident else request_id(
@@ -360,18 +255,9 @@ def normalise_requests(requests) -> list[dict]:
 
 
 def prune_requests(requests, week) -> list[dict]:
-    """Drop requests from weeks that have already happened, and cap the rest.
-
-    Rows from the **current** week are kept whatever state they are in, expired
-    ones included: "you already asked for this slot this week" and "somebody was
-    refused this slot this week" are both answered by looking at them, and
-    dropping an expired ask would quietly hand its author a second go at the
-    same person for the same slot. A week later they are inert, and they go.
-
-    Week keys are zero-padded and ISO-year-first (:func:`plan.iso_week_key`), so
-    "older than now" is a string comparison — the same trick
-    :func:`plan.prune_overrides` uses, for the same reason.
-    """
+    """Drop requests from past weeks, and cap the rest. Current-week rows
+    are kept regardless of state, so an expired ask can't be retried early.
+    Week keys sort as strings, so "older" is a plain comparison."""
     rows = normalise_requests(requests)
     current = _week(week)
     if current is not None:
@@ -391,14 +277,9 @@ def expires_at(request) -> float | None:
 
 
 def is_expired(request, moment) -> bool:
-    """Whether this request has aged out at ``moment``.
-
-    An unreadable moment reads as **expired**, and that direction is deliberate:
-    the two things expiry protects are somebody answering an ask about a slot
-    that has passed, and a stale ask blocking a fresh one. If we cannot tell
-    what time it is, refusing to act on an old request costs a tap and getting
-    it wrong the other way acts on a week-old plan.
-    """
+    """Whether this request has aged out at ``moment``. An unreadable
+    moment reads as expired: refusing to act costs a tap, acting on a
+    stale request costs more."""
     deadline = expires_at(request)
     now = habit.moment_ts(moment)
     if deadline is None:
@@ -409,14 +290,9 @@ def is_expired(request, moment) -> bool:
 
 
 def state_of(request, moment) -> str | None:
-    """This request's state right now — the stored one, or expired.
-
-    Answered rows keep their answer forever (an accept does not un-happen, and a
-    decline has to keep closing its slot for the week). Only an **open** row can
-    become :data:`STATE_EXPIRED`, and it does so by arithmetic at read time:
-    nothing runs on a tick to age it out, and nothing is written to the store to
-    record that it aged.
-    """
+    """This request's state right now: the stored one, or expired. Only
+    an open row can become expired, computed at read time; nothing ever
+    writes that transition to the store."""
     row = normalise_request(request)
     if row is None:
         return None
@@ -443,29 +319,9 @@ def open_from(requests, requester, moment) -> list[dict]:
 
 def pending_from(requests, requester, moment) -> list[dict]:
     """The asks this person has spent, for :data:`MAX_OPEN_PER_REQUESTER`.
-
-    :func:`open_from` with one difference, and the difference is the whole
-    reason this exists: it ages a row by **``made``** rather than by ``ts``, so
-    an ask that was silently refused (:func:`claim_request`) or could not be
-    delivered (:func:`withdraw`) still occupies one of the asker's two slots for
-    the full TTL, exactly as a delivered one does.
-
-    Counting those by liveness made the cap leak the one fact the flat refusal
-    text and the lapsed row exist to hide. A delivered ask holds the cap; a
-    holder-side refusal writes a row that is inert by construction and held
-    nothing — so a requester who fired three asks and got the distinctive "you
-    have 2 asks waiting already" on the third had learned that the first two
-    were genuinely delivered, and one who sailed through had learned that they
-    were not. Repeat with different cells and the grid partitions by who
-    refuses, which is precisely the oracle :func:`_lapsed_request` was written
-    to close. :func:`check_request`'s docstring promises that every reason it
-    returns is a fact about the asker's own week; ``made`` is what makes that
-    true of this one.
-
-    An *answered* ask still frees the cap immediately, and must: the asker was
-    told the answer, so nothing is being hidden, and holding their slot after a
-    "no" would be a second punishment for having asked.
-    """
+    Ages by ``made`` rather than ``ts`` (unlike :func:`open_from`), so a
+    silently-refused or undelivered ask still spends a slot for the full
+    TTL instead of leaking whether it was delivered."""
     key = _id(requester)
     now = habit.moment_ts(moment)
     if key is None:
@@ -476,10 +332,7 @@ def pending_from(requests, requester, moment) -> list[dict]:
         for row in normalise_requests(requests)
         if row["from"] == key
         and row["state"] == STATE_OPEN
-        # An unreadable clock reads as "still pending", the same direction
-        # :func:`is_expired` errs in: refusing one more ask costs a tap, and
-        # the other way round hands out unlimited probes to anybody whose HA
-        # host cannot tell the time.
+        # Unreadable clock reads as still pending (same direction as is_expired).
         and (now is None or now < row["made"] + ttl)
     ]
 
@@ -505,19 +358,11 @@ def find_request(requests, ident) -> dict | None:
 
 
 def match_request(requests, holder, moment, sent_ts=None) -> dict | None:
-    """The request a trade DM in front of us is about, or None.
-
-    The buttons cannot carry the id (see :data:`MAX_OPEN_PER_HOLDER`), so the
-    request is resolved from the recipient plus, when Discord gives us one, the
-    **DM's own timestamp**. A DM sits in an inbox indefinitely; without the
-    timestamp check, tapping a week-old message whose request expired long ago
-    would answer whatever ask happens to be open now — somebody passing on a
-    request they have never read, and the requester being told "they passed" by
-    a person who was answering something else entirely.
-
-    With no timestamp available it falls back to the single open request, which
-    is the pre-Discord-metadata behaviour and still bounded to one.
-    """
+    """The request a trade DM in front of us is about, or None. Buttons
+    can't carry the request id, so this resolves it from the recipient
+    plus the DM's own timestamp, when available, so a stale DM can't
+    answer a newer request. Falls back to the single open request
+    otherwise."""
     waiting = open_to(requests, holder, moment)
     if not waiting:
         return None
@@ -531,25 +376,11 @@ def match_request(requests, holder, moment, sent_ts=None) -> dict | None:
 
 
 def match_any_request(requests, holder, sent_ts=None) -> dict | None:
-    """The request a trade DM refers to, **whatever state it is in now**.
-
-    :func:`match_request` deliberately resolves only *answerable* asks, because
-    everything it feeds — accept, pass, the swap itself — must not act on a week
-    old plan. 🚫 *Don't ask me again* is the exception, and it is the whole
-    reason this function exists: it is not an answer to the request at all, it
-    is a standing decision about a **person**, and it stays true long after the
-    ask it was provoked by has lapsed.
-
-    Somebody who opens Discord on Monday, reads a swap DM that went out on
-    Friday and taps 🚫 has done the one thing the guardrail exists to allow. If
-    that tap needed the request to still be open, the only opt-out a pestered
-    housemate has would quietly do nothing for the 48-hours-old DMs that are
-    exactly the ones likely to still be sitting unread in an inbox.
-
-    Matching is by recipient plus the DM's own timestamp, as in
-    :func:`match_request`; with no timestamp it falls back to the most recent
-    ask addressed to this person, which is the one their newest DM is about.
-    """
+    """The request a trade DM refers to, whatever state it is in now.
+    Unlike :func:`match_request`, also matches lapsed/answered requests:
+    "don't ask me again" is a standing decision about a person, so it
+    works on old, expired DMs too. Matches by recipient plus timestamp,
+    or the most recent ask to this person if none is given."""
     key = _id(holder)
     if key is None:
         return None
@@ -566,27 +397,10 @@ def match_any_request(requests, holder, sent_ts=None) -> dict | None:
 
 
 def dm_sent_ts(moment, dm_ts, tapped_ts) -> float | None:
-    """Where a Discord message sits on **our** clock. None if it can't be told.
-
-    Both :func:`match_request` and :func:`match_any_request` compare a DM's
-    timestamp against a request row's, and those two numbers come off different
-    clocks: the row is stamped by the HA host, the message by Discord (its
-    snowflake). An HA box whose clock is out by more than
-    :data:`MATCH_WINDOW_SECONDS` — an RPi with no RTC that has not re-synced NTP
-    after a power cut, the same hazard :mod:`habit` already defends against —
-    would otherwise match *nothing*, ever: every swap DM in the house would say
-    "that one's lapsed", including 🚫.
-
-    So the DM is never placed by its absolute timestamp. It is placed by its
-    **age**, measured entirely on Discord's clock (the tap's own timestamp minus
-    the message's) and then subtracted from our own now. Any constant offset
-    between the two clocks cancels, and what the window still catches — a DM
-    that is genuinely hours older than the request open now — is unaffected,
-    because that age is real on either clock.
-
-    A tap that appears to predate its own message is a clock we cannot reason
-    about at all, so it reads as unknown rather than as a guess.
-    """
+    """Where a Discord message sits on our clock, or None if it can't be
+    told. Measures the DM's age on Discord's clock (tap time minus send
+    time) and subtracts that from our own now, since the two clocks can
+    drift. A tap that predates its own message reads as unknown."""
     now = habit.moment_ts(moment)
     sent = _ts(dm_ts)
     tapped = _ts(tapped_ts)
@@ -600,12 +414,8 @@ def dm_sent_ts(moment, dm_ts, tapped_ts) -> float | None:
 
 def asked_this_week(requests, requester, want, week) -> bool:
     """Whether this person has already asked for this slot this week.
-
-    Counts the ask, not the answer: a request that expired unanswered still used
-    up the one ask this person gets for this slot this week. Re-asking somebody
-    who did not reply is the exact behaviour "one request per slot per requester
-    per week" exists to stop.
-    """
+    Counts the ask, not the answer: an expired, unanswered ask still
+    counts, so re-asking someone who didn't reply is blocked too."""
     key = plan.normalise_cell(want)
     who = _id(requester)
     stamp = _week(week)
@@ -618,14 +428,9 @@ def asked_this_week(requests, requester, want, week) -> bool:
 
 
 def slot_refused(requests, want, week) -> bool:
-    """Whether **anybody** was told no about this slot this week.
-
-    A declined slot is closed to the whole house for the rest of the week, not
-    just to whoever was refused (§9). Otherwise "no" to one person is an
-    invitation to the next five, which is the same pestering arriving from
-    different directions — and the holder cannot even tell it apart, because
-    every ask is anonymous.
-    """
+    """Whether anybody was told no about this slot this week. A refusal
+    closes the slot to the whole house for the week, not just to whoever
+    asked, so "no" to one person can't be retried by the next five."""
     key = plan.normalise_cell(want)
     stamp = _week(week)
     if key is None or stamp is None:
@@ -640,12 +445,9 @@ def slot_refused(requests, want, week) -> bool:
 
 # --- "never ask me again", per requester-pair --------------------------------
 def block_list(people_map, holder) -> list[str]:
-    """Who this person has permanently refused, as string ids.
-
-    Stored on the holder's own record (``no_trade_from``, which :mod:`people`
-    has carried since the panel shipped) rather than in the request list,
-    because it has to outlive every request and every week.
-    """
+    """Who this person has permanently refused, as string ids. Stored on
+    the holder's own record (`no_trade_from`) rather than in the request
+    list, since it must outlive every request and every week."""
     stored = people.get_person(people_map, holder)["no_trade_from"]
     blocked: list[str] = []
     for item in stored if isinstance(stored, list) else []:
@@ -656,27 +458,17 @@ def block_list(people_map, holder) -> list[str]:
 
 
 def is_blocked(people_map, requester, holder) -> bool:
-    """Whether this holder has told this requester never again.
-
-    Per **pair**, deliberately: 🚫 is about one person's asks, not about the
-    feature. Somebody who blocks one housemate keeps working normally with the
-    other five, and never learns that the block is why they stopped hearing
-    from them — the refusal reads exactly like every other holder-side refusal
-    (:func:`refusal_text`).
-    """
+    """Whether this holder has told this requester never again. Per pair:
+    blocking one housemate doesn't affect asks to or from anyone else,
+    and reads as an ordinary refusal (:func:`refusal_text`)."""
     key = _id(requester)
     return key is not None and key in block_list(people_map, holder)
 
 
 def with_block(people_map, requester, holder) -> list[str]:
     """The holder's new ``no_trade_from`` list, with this requester added.
-
-    Returns the list rather than the mapping: the caller writes it through
-    :func:`people.set_person`, which is the only thing that owns the record's
-    shape. Permanent, and there is deliberately no function here that removes
-    one — an opt-out somebody chose in order to stop being asked is not
-    something the asker gets to argue with.
-    """
+    Returns the list, not the mapping; the caller writes it through
+    :func:`people.set_person`. Permanent by design: there is no unblock."""
     current = block_list(people_map, holder)
     key = _id(requester)
     if key is None or key in current:
@@ -686,34 +478,12 @@ def with_block(people_map, requester, holder) -> list[str]:
 
 # --- can this person be reached at all? --------------------------------------
 def _delivery_gate(people_map, user_id, moment) -> str:
-    """Whether a DM can land on this person at all: the **route**, not the message.
-
-    Split out from :func:`reachable` because the two questions have different
-    answers for the same person: everything here is about whether a DM reaches
-    them, and the two gates :func:`reachable` adds on top are about whether this
-    particular message should be sent. An ask and the *answer* to your own ask
-    need different halves, and conflating them is how somebody's quiet hours
-    would stop them being told what a housemate said.
-
-    Returns :data:`REASON_OK` or the first gate that said no. The gates are the
-    ones that mean *this person can be sent an unprompted DM*, which is a
-    strictly narrower set than :func:`nudge.eligible` uses: 🔮 guessing and 👁
-    monitoring are consents about the **habit model**, and a housemate asking
-    about Thursday is not the model talking. Somebody who turned the guessing
-    off is still a person who can be asked whether they want to swap.
-
-    What does gate it is every choice about being messaged at all:
-
-    * **Not opted in** — no record, or one that never answered the panel.
-    * **🚫 No pings** — off means off, everywhere.
-    * **The channel** — the panel's default, and the answer somebody who never
-      opened it has. A trade ask cannot be posted in the channel: "someone wants
-      your Thursday" in front of six people is neither anonymous nor quiet, so
-      the channel preference means *not reachable*, not "reachable, loudly".
-    * **DMs closed** — a previous send raised ``Forbidden`` (50007).
-    * **⏸ Paused / ⏭ Skip this week** — quiet until the timestamp passes,
-      via :func:`nudge.is_paused` so there is one definition of paused.
-    """
+    """Whether a DM can reach this person at all (the route, not this
+    message). Returns :data:`REASON_OK` or the first gate that said no:
+    not opted in, reminders off, channel-only (a trade can't post there),
+    DMs closed (`Forbidden`/50007), or paused. Split from :func:`reachable`
+    so the reply to your own ask still passes even when its extra gates
+    wouldn't."""
     if habit.moment_ts(moment) is None:
         return REASON_MOMENT
     if not people.is_known(people_map, user_id):
@@ -734,27 +504,10 @@ def _delivery_gate(people_map, user_id, moment) -> str:
 
 
 def reachable(people_map, user_id, moment) -> str:
-    """Whether an **unprompted** trade ask may be delivered to this person.
-
-    :func:`_delivery_gate` plus the two settings that are about the message
-    rather than the route:
-
-    * **🔁 Swap requests off.** Its own switch, and deliberately not folded into
-      🔮 *Stop guessing*: a swap ask is a **housemate** talking, not the model,
-      so somebody who doesn't want to be predicted at is still a person who can
-      be asked whether they'd swap. The reverse holds too, which is why this
-      exists — somebody can now refuse the asks without refusing the bot.
-    * **Quiet hours**, via :func:`nudge.in_quiet_hours` so there is exactly one
-      definition of the wrapping window, the way :func:`nudge.is_paused` is
-      already the one definition of paused for both modules.
-
-    Both reasons are in :data:`HOLDER_REASONS`, so they render as the same flat
-    sentence every other holder-side refusal does (:func:`refusal_text`) *and*
-    cost the requester the same lapsed row (:func:`claim_request`). That is not
-    tidiness: "swaps off" and "asleep" are facts about a housemate the requester
-    cannot even name, and a refusal that looked or cost different would be a
-    free oracle for exactly the thing anonymity is for.
-    """
+    """Whether an unprompted trade ask may be delivered to this person.
+    :func:`_delivery_gate` plus swap requests off and quiet hours
+    (:func:`nudge.in_quiet_hours`); both render as the same holder-side
+    refusal, so neither leaks which one applied."""
     verdict = _delivery_gate(people_map, user_id, moment)
     if verdict != REASON_OK:
         return verdict
@@ -770,29 +523,11 @@ def reachable(people_map, user_id, moment) -> str:
 def check_request(
     people_map, requests, requester, want, offer, week, moment, *, mine=()
 ) -> str:
-    """The rules that are about the **ask**, not about who holds the slot.
-
-    Checked once, before any holder is considered, so a refusal that has nothing
-    to do with a particular person cannot be mistaken for one that does — and so
-    every reason this returns is a fact about the asker's own week, which is why
-    these are the refusals allowed to say something specific.
-
-    * **A usable cell, a usable week, and two different cells.** Trading a slot
-      for itself is not a trade.
-    * **You must hold what you are offering.** ``mine`` is the requester's own
-      booked cells this week, handed in rather than derived, because occupancy
-      is :mod:`plan`'s business and this module has no store. Offering a slot
-      you do not have is a request to be given something for nothing — which is
-      a pester with extra steps, and it is also what makes the offer safe to put
-      in an anonymous DM: it is a real thing the recipient can take.
-    * **You have to be reachable yourself.** The answer comes back as a DM,
-      minutes or hours later, and it is the only way you ever find out. Somebody
-      who cannot receive it would be asking a question into a void — and worse,
-      would have spent one of the holder's DMs to do it.
-    * **One ask per slot per requester per week.**
-    * **A slot somebody was refused is closed for the week**, to everybody.
-    * **A cap on your outstanding asks.**
-    """
+    """The rules about the ask itself, checked before any holder is
+    considered. In order: usable, distinct want/offer cells and week; you
+    must hold what you're offering (``mine``, passed in since this module
+    has no store); you must be reachable for the reply; one ask per slot
+    per week; the slot isn't already refused; and your open-ask cap."""
     if habit.moment_ts(moment) is None:
         return REASON_MOMENT
     stamp = _week(week)
@@ -802,10 +537,7 @@ def check_request(
     if wanted is None:
         return REASON_BAD_CELL
     offered = plan.normalise_cell(offer)
-    # No offer at all reads as "you have nothing to put up", not as a garbled
-    # request: it is what somebody with no bookings of their own has, and
-    # telling them the bot couldn't parse their tap would send them looking for
-    # a bug instead of for a slot.
+    # No offer reads as "nothing to put up", not a parse failure.
     if offered is None:
         return REASON_NOT_YOURS
     if wanted == offered:
@@ -815,47 +547,26 @@ def check_request(
     held = [plan.normalise_cell(cell) for cell in mine or ()]
     if offered not in held:
         return REASON_NOT_YOURS
-    # :func:`_delivery_gate` and deliberately **not** :func:`reachable`: what is
-    # being checked here is whether the *answer to your own ask* can reach you,
-    # and the design's line is that 🔁 and quiet hours govern messages the bot or
-    # a housemate starts, never a reply to something you did. Somebody who
-    # switched swap requests off so nobody can ask *them* is still owed the
-    # answer to the one they sent, and somebody who asks at 23:00 has chosen to
-    # be awake at 23:00. Gating either here would also refuse them with
-    # :data:`REASON_NO_REPLY_PATH`, which tells them to go and check a setting
-    # that is already correct.
+    # _delivery_gate, not reachable: swaps-off and quiet hours govern
+    # messages started at you, not the reply to one you sent.
     if _delivery_gate(people_map, requester, moment) != REASON_OK:
         return REASON_NO_REPLY_PATH
     if asked_this_week(requests, requester, wanted, stamp):
         return REASON_ALREADY_ASKED
     if slot_refused(requests, wanted, stamp):
         return REASON_SLOT_REFUSED
-    # :func:`pending_from`, not :func:`open_from`: what this cap may depend on
-    # is how many asks *this person* has spent, and nothing about what happened
-    # to them at the other end.
+    # pending_from, not open_from: counts asks spent, not what happened to them.
     if len(pending_from(requests, requester, moment)) >= MAX_OPEN_PER_REQUESTER:
         return REASON_TOO_MANY_OPEN
     return REASON_OK
 
 
 def check_holder(people_map, requests, budgets, requester, holder, moment) -> str:
-    """The rules that are about the **person** who would get the DM.
-
-    Every one of these renders as the same sentence (:func:`refusal_text`), so
-    the requester — who cannot see who holds the cell — cannot learn from a
-    refusal that a particular housemate blocked them, has their DMs shut, or is
-    already fielding somebody else's ask.
-
-    * **You are not asking yourself.**
-    * **🚫 Don't ask me again**, permanently, for this pair.
-    * **They are reachable at all** (:func:`reachable`), which includes their
-      own 🔁 switch and their quiet hours — both of them in
-      :data:`HOLDER_REASONS`, so neither can be told apart from the rest.
-    * **They have nothing else waiting** — one ask at a time, per person.
-    * **Their daily DM budget has room.** :func:`habit.check_daily_cap`, not
-      :func:`habit.check_nudge`: see :func:`claim_request` for the argument
-      about which half of the budget a trade spends.
-    """
+    """The rules about the person who would get the DM. In order: not
+    yourself; not permanently blocked; reachable (:func:`reachable`);
+    nothing else waiting; daily DM budget has room
+    (:func:`habit.check_daily_cap`, not the weekly cap). Every reason
+    renders as the same sentence (:func:`refusal_text`)."""
     who = _id(requester)
     them = _id(holder)
     if who is None or them is None or who == them:
@@ -894,19 +605,10 @@ def pick_holder(
     *, mine=(),
 ) -> tuple[str | None, str]:
     """Who to ask, out of everybody holding the slot. ``(holder, reason)``.
-
-    A cell can be held by more than one person — bookings are information, not
-    permission (§8), so two people can both be down for Thursday evening — and
-    the ask must go to exactly **one** of them. Asking all of them would turn
-    one tap into a broadcast, which is the opposite of what this feature is.
-
-    The requester is skipped (you can already be booked into the cell you are
-    asking about, since tapping it books you alongside the holder), and the
-    first person the rules allow is chosen. When nobody qualifies, the reason
-    reported is the **first holder's**, and since every holder-side reason
-    renders identically that tells the requester exactly as much as it should:
-    not this one, and nothing about who.
-    """
+    The ask goes to exactly one holder (never all), skipping the
+    requester. When nobody qualifies, the first holder's reason is
+    reported, which (holder-side reasons all render alike) tells the
+    requester nothing."""
     verdict = check_request(
         people_map, requests, requester, want, offer, week, moment, mine=mine
     )
@@ -934,12 +636,9 @@ def pick_holder(
 
 # --- making one ---------------------------------------------------------------
 def add_request(requests, request) -> list[dict]:
-    """The list with this request in it, replacing any row of the same id.
-
-    The id is deterministic (:func:`request_id`), so "replacing" only ever
-    happens for a caller that skipped :func:`check_request` — which would have
-    refused it as an ask this person already made this week.
-    """
+    """The list with this request in it, replacing any row of the same
+    id. Ids are deterministic (:func:`request_id`), so a replacement only
+    happens if a caller skipped :func:`check_request`."""
     row = normalise_request(request)
     rows = normalise_requests(requests)
     if row is None:
@@ -953,21 +652,10 @@ def add_request(requests, request) -> list[dict]:
 
 
 def _lapsed_request(requester, holders, want, offer, week, moment) -> dict | None:
-    """The row a silently-refused ask leaves behind, or None if unbuildable.
-
-    Born already past its TTL, so :func:`state_of` reads it as expired the
-    moment it is written: it is never open, so it holds nobody's slot and
-    occupies no room in :data:`MAX_OPEN_PER_HOLDER`, and its state is not one of
-    :data:`REFUSED_STATES`, so it does not shut the slot to the rest of the
-    house on an answer nobody gave.
-
-    What it *does* do is cost its author exactly what a delivered ask costs
-    them: one of their :data:`MAX_OPEN_PER_REQUESTER` slots, via ``made``, which
-    is not aged — see :func:`pending_from` — and their one ask for that slot
-    this week, via :func:`asked_this_week`. Both halves are the point. The row
-    is inert towards everybody else and identical towards the person who wrote
-    it, which is what makes a probe cost exactly what a real ask costs.
-    """
+    """The row a silently-refused ask leaves behind, or None if
+    unbuildable. Born already past its TTL, so it's inert to everyone
+    else, but still costs its author one open-ask slot and this week's
+    ask for this slot, same as a delivered ask."""
     who = _id(requester)
     holder = next(
         (
@@ -987,64 +675,21 @@ def claim_request(
     people_map, requests, budgets, requester, holders, want, offer, week, moment,
     *, mine=(),
 ):
-    """Decide, pick a holder, spend the DM budget and write the row — in one call.
-
-    Returns ``(reason, request_or_None, new_requests, new_budgets)``. On a
-    request-side refusal the two collections come back normalised and otherwise
-    untouched, so a refusal that is about the asker's own week costs no store
-    write. A **holder-side** refusal is the one exception: it comes back as
-    :data:`REASON_SILENT` with an already-lapsed row to store and no DM to send
-    — see the comment in the body for why the caller must render that exactly
-    as it renders a successful send.
-
-    **Which half of the budget a trade spends, and why.** The daily cap
-    (:data:`habit.MAX_NUDGES_PER_DAY`, 1) is non-negotiable and is charged here:
-    whatever else is true, a person receives at most one unprompted DM a day
-    from this integration, trade requests included. The weekly cap
-    (:data:`habit.MAX_NUDGES_PER_WEEK`, 2) is deliberately **not** charged, and
-    that is a judgement call worth stating both ways.
-
-    *For charging it:* one counter is simpler, and it would guarantee that no
-    combination of features can put more than two unprompted DMs on somebody's
-    phone in a week.
-
-    *Against, which is what is implemented:* the weekly cap exists to bound how
-    often **the bot's own arithmetic** starts a conversation — the Sunday
-    check-in and the day-of nudge are the model deciding it has something to say
-    about you. A trade request is not the bot's idea; it is a housemate asking
-    about a slot you put on a shared board, and it carries an answer only you
-    can give. Charging it would mean one swap request silences, for the rest of
-    the week, the reminder somebody actually opted into — the guardrail doing
-    damage to the feature it is not even about. And the anti-pestering job the
-    weekly cap would do here is already done, and done better, by rules that
-    know what a trade *is*: one ask per slot per requester per week, a refused
-    slot closed to everybody for the week, a permanent per-pair block, one ask
-    in flight per person, and the daily cap on top. Those bound *who* may ask
-    and *how often* — which a shared counter cannot, because it cannot tell six
-    people asking once from one person asking six times.
-
-    The upper bound that remains is therefore: **at most one trade DM per person
-    per day**, and only from somebody who has not been refused that slot, is not
-    blocked, and has an ask to spare.
-    """
+    """Decide, pick a holder, spend the DM budget and write the row, in
+    one call. Returns ``(reason, request_or_None, new_requests,
+    new_budgets)``. A holder-side refusal returns :data:`REASON_SILENT`
+    with an already-lapsed row and no DM sent, rendered the same as a
+    successful send. Charges the daily DM cap but not the weekly nudge
+    cap: a trade is a housemate asking, not the bot's own arithmetic, and
+    it's already bounded by the per-slot, per-pair and per-holder rules
+    above."""
     holder, reason = pick_holder(
         people_map, requests, budgets, requester, holders, want, offer, week,
         moment, mine=mine,
     )
     if reason in HOLDER_REASONS and holder is None:
-        # A holder-side no still writes the ask, already lapsed, and still
-        # reports :func:`sent_text`. That is not politeness, it is the
-        # anonymity guarantee: if a refusal cost nothing, a requester could tap
-        # the same cell every day forever and read the refuse-vs-send outcome
-        # as an oracle. Several of these reasons never change — a 🚫 block is
-        # permanent, and 📬/🚫/#channel are standing preferences — so a cell
-        # that refuses on every probe while its neighbours go through
-        # identifies its holder as a member of a fixed set, and a single
-        # blocked requester could watch one housemate's whole week move about
-        # the grid. Flattening the *wording* cannot close that, because the
-        # leak is in the outcome. Writing the row makes a probe cost exactly
-        # what a real ask costs — one per slot per week — and the requester is
-        # told the truth about what happens next: nobody answers, and it lapses.
+        # Still writes a lapsed row and reports sent_text: a free refusal
+        # would let a requester probe who blocks or refuses them.
         silent = _lapsed_request(requester, holders, want, offer, week, moment)
         if silent is not None:
             return (
@@ -1068,10 +713,8 @@ def claim_request(
             normalise_requests(requests),
             habit.normalise_budgets(budgets),
         )
-    # The budget is claimed here rather than after a successful send, exactly as
-    # :func:`nudge.claim_plan_dm` does and for the same reason: a DM that
-    # bounces has still been attempted, and refunding it would retry somebody
-    # with closed DMs at every tap forever.
+    # Claimed before send succeeds, like nudge.claim_plan_dm: refunding a
+    # bounced DM would retry someone with closed DMs on every tap.
     allowed, updated_budgets = habit.claim_daily_nudge_for(budgets, holder, moment)
     if not allowed:
         return (
@@ -1085,17 +728,10 @@ def claim_request(
 
 # --- answering one -----------------------------------------------------------
 def answer(requests, ident, action, moment) -> tuple[str, dict | None, list[dict]]:
-    """Record an answer to one request. ``(reason, request, new_requests)``.
-
-    The request that comes back is the **answered** row, so the caller has the
-    two ids and the two cells it needs to reveal names and swap slots without
-    going looking for them again.
-
-    An expired request cannot be answered — :data:`REASON_MOMENT` — and neither
-    can one that already was. Both matter: a trade DM sits in an inbox
-    indefinitely, and a tap on a week-old one must not move a booking that has
-    long since stopped meaning anything.
-    """
+    """Record an answer to one request. ``(reason, request,
+    new_requests)``. The returned request is the answered row, with both
+    ids and cells the caller needs to reveal names and swap slots. An
+    expired or already-answered request cannot be answered again."""
     rows = normalise_requests(requests)
     row = find_request(rows, ident)
     if row is None or action not in ACTIONS:
@@ -1111,22 +747,10 @@ def answer(requests, ident, action, moment) -> tuple[str, dict | None, list[dict
 
 
 def withdraw(requests, ident, moment) -> list[dict]:
-    """Retire one ask without answering it — it lapses, here and now.
-
-    The row stays in the list, so it still counts as the one ask its author gets
-    for that slot this week **and still occupies one of their two outstanding
-    asks** (:func:`pending_from` reads ``made``, which this leaves alone); only
-    its liveness changes, by ageing ``ts`` past the TTL that :func:`state_of`
-    reads. Recording it as a *decline* would be a lie about the holder — it
-    would shut the slot to the whole house for the week on the strength of an
-    answer nobody gave.
-
-    The caller for this is a request DM that could not be delivered. Leaving it
-    open would block the holder and the slot for a week over a message nobody
-    ever saw — and refunding the *asker* would be the same leak the lapsed row
-    closes, since "the DM bounced" is a fact about the holder's privacy
-    settings and nothing else.
-    """
+    """Retire one ask without answering it: it lapses, here and now. Only
+    ``ts`` ages past the TTL; the row stays, still counting against the
+    asker's limits. Not recorded as a decline, which would wrongly close
+    the slot on an answer nobody gave."""
     rows = normalise_requests(requests)
     now = habit.moment_ts(moment)
     if now is None:
@@ -1142,11 +766,9 @@ def withdraw(requests, ident, moment) -> list[dict]:
 
 # --- the swap itself ---------------------------------------------------------
 def _ensure(people_map, overrides, week, cell, user_id, present: bool):
-    """Put one person on (or off) one cell, via :mod:`plan`'s own toggle.
-
-    Nothing here reimplements booking: :func:`plan.toggle_booking` is what the
-    grid writes with, so a swap and a tap produce byte-identical overrides.
-    """
+    """Put one person on (or off) one cell, via :func:`plan.toggle_booking`.
+    Reuses the grid's own toggle so a swap and a manual tap produce
+    identical overrides."""
     occupancy = plan.effective_week(people_map, overrides, week)
     held = plan.holders(occupancy, cell)
     if (str(user_id) in held) == bool(present):
@@ -1158,17 +780,10 @@ def _ensure(people_map, overrides, week, cell, user_id, present: bool):
 
 
 def apply_swap(people_map, overrides, request) -> dict:
-    """The overrides with the two slots actually exchanged.
-
-    Four moves, not two: the holder comes **off** the wanted cell and **on** to
-    the offered one, and the requester the other way round. Written as
-    "make sure this is true" rather than "toggle", because the requester may
-    already be booked into the wanted cell — tapping a taken slot books you in
-    alongside its holder (§8), and that is exactly the tap that offers the
-    trade, so it is the ordinary case rather than the odd one.
-
-    Idempotent, so a double-tap on an accept cannot swap the slots back.
-    """
+    """The overrides with the two slots actually exchanged. Four moves:
+    holder off the wanted cell and onto the offered one, the requester
+    the other way. Set-based, not toggled, so a double-tap can't swap
+    them back."""
     row = normalise_request(request)
     if row is None:
         return plan.normalise_overrides(overrides)
@@ -1183,13 +798,9 @@ def apply_swap(people_map, overrides, request) -> dict:
 
 # --- what any of it says -----------------------------------------------------
 def describe_cell(cell) -> str | None:
-    """``"Thursday Eve"`` for a cell key, or None.
-
-    The day in full and the slot in the grid's own short label, which is how §9
-    writes it. Deliberately not :func:`habit.describe_bucket` ("Thursday
-    evenings"): that phrase is about a *habit*, and this is about one specific
-    square of one specific week.
-    """
+    """``"Thursday Eve"`` for a cell key, or None. Not
+    :func:`habit.describe_bucket` ("Thursday evenings"): that phrase
+    describes a habit, this describes one specific square of one week."""
     parsed = plan.parse_cell(plan.normalise_cell(cell))
     if parsed is None:
         return None
@@ -1197,19 +808,14 @@ def describe_cell(cell) -> str | None:
     return f"{plan.DAY_NAMES[weekday]} {plan.SLOT_LABELS[slot]}"
 
 
-# The line the grid shows when a tap lands on somebody else's slot. It is a
-# question, not a notification: the ask only happens if they tap again.
+# Shown when a tap lands on somebody else's slot; the ask needs a second tap.
 ASK_PROMPT = "That one's spoken for. Want me to ask?"
 
 
 def ask_panel_text(want, offer=None) -> str | None:
-    """What the requester is shown before they commit to asking.
-
-    Says exactly what will be sent, because the whole feature rests on people
-    believing the DM is anonymous — and the way to believe that is to be shown
-    the words first. Takes no id and no name: there is nothing here to leak,
-    because whose slot it is was never known to this side either.
-    """
+    """What the requester is shown before they commit to asking. Shows
+    exactly what will be sent. Takes no id or name: this side never
+    knows whose slot it is either, so there's nothing to leak."""
     wanted = describe_cell(want)
     if wanted is None:
         return None
@@ -1230,15 +836,9 @@ def ask_panel_text(want, offer=None) -> str | None:
 
 
 def request_dm_text(want, offer) -> str | None:
-    """The DM the holder gets. **Never** takes a name or an id (§9 step 2).
-
-    This is the sentence the whole feature is built around, so it is worth
-    saying why it is shaped this way: it names two slots and no people, it says
-    what is being offered rather than what is being asked of them, and it does
-    not say why. A reason would be a name in disguise in a house of seven ("I've
-    got people coming Friday" is one person), and there is nothing to be
-    awkward about at breakfast if there was nothing to overhear.
-    """
+    """The DM the holder gets. Never takes a name or an id. Names two
+    slots and no people, and gives no reason: in a house of seven, a
+    reason ("people coming Friday") can itself identify someone."""
     wanted = describe_cell(want)
     offered = describe_cell(offer)
     if wanted is None or offered is None:
@@ -1265,11 +865,7 @@ def sent_text(want) -> str | None:
 
 
 def passed_text(want) -> str | None:
-    """What the requester is told when the answer is no. No name, no reason.
-
-    §9 step 4, verbatim in intent: *"Pass → requester hears 'they passed.' No
-    name, no reason. Nothing to be awkward about at breakfast."*
-    """
+    """What the requester is told when the answer is no. No name, no reason."""
     wanted = describe_cell(want)
     if wanted is None:
         return None
@@ -1298,14 +894,10 @@ def block_ack_text() -> str:
 
 
 def accepted_text_for_holder(requester_ref, want, offer) -> str | None:
-    """What the holder sees after ✅ Trade. **Names are allowed from here on.**
-
-    §9 step 3: an accept reveals both names to both parties, because at that
-    point they have to coordinate and they live together. This is one of exactly
-    two functions in this module that takes an identity, and it takes it as an
-    argument so that "is this string allowed a name" is answerable by reading
-    the signature.
-    """
+    """What the holder sees after accepting. Names are allowed from here
+    on. One of only two functions in this module that takes an identity,
+    so "is this string allowed a name" is answerable from the signature
+    alone."""
     wanted = describe_cell(want)
     offered = describe_cell(offer)
     if wanted is None or offered is None or not requester_ref:
@@ -1330,12 +922,8 @@ def accepted_text_for_requester(holder_ref, want, offer) -> str | None:
     )
 
 
-# What a refusal says. Several reasons deliberately share one sentence: the
-# requester cannot see who holds the cell, and must not be able to work out from
-# *how* the bot says no that a particular housemate blocked them, has their DMs
-# closed, has already been asked today or is fielding somebody else's ask. The
-# reason codes stay distinct so each guardrail is testable on its own; only the
-# rendering is flattened.
+# Several reasons share one sentence so the requester can't tell, from how
+# the bot says no, which one applied to a housemate they can't even name.
 _HOLDER_REFUSAL = (
     "I can't ask about that one right now. Nothing to read into it — try "
     "another slot, or ask again another day."
@@ -1364,9 +952,7 @@ _REFUSAL_TEXT = {
         f"You've got {MAX_OPEN_PER_REQUESTER} asks waiting already. Give those "
         "a chance to come back first."
     ),
-    # About the asker's own settings, so it is allowed to be specific — and it
-    # names both things that can cause it, because being told to turn on a
-    # setting that is already on is how somebody concludes the bot is broken.
+    # A fact about the asker, so this one is allowed to be specific.
     REASON_NO_REPLY_PATH: (
         "I'd have no way to tell you the answer — it comes back as a DM, and "
         "that's the only way you'd hear it. Check 📬 **DM me** is on in 🤖, and "
@@ -1377,9 +963,6 @@ _REFUSAL_TEXT = {
 
 def refusal_text(reason) -> str:
     """The one sentence a refused ask gets. Never varies by holder.
-
-    Anything not in the table — including every :data:`HOLDER_REASONS` entry —
-    falls through to the same flat sentence, so adding a new holder-side gate
-    later cannot accidentally invent a new way to leak one.
-    """
+    Anything not in the table, including every :data:`HOLDER_REASONS`
+    entry, falls through to the same flat sentence."""
     return _REFUSAL_TEXT.get(reason, _HOLDER_REFUSAL)

@@ -90,17 +90,14 @@ SUN_AM = "6-am"
 
 
 def _cell(held, standing=()) -> dict:
-    """One cell's entry in :func:`effective_week`'s output.
-
-    ``{"holders": [...], "recurring": [...]}`` — who has the cell, and which of
-    them have it *every* week. Written out here rather than inlined so the
-    shape appears once and the assertions stay about the reconciliation.
+    """One cell's entry in effective_week's output: holders and which of them
+    are recurring. Centralised so assertions read as reconciliation, not shape.
     """
     return {OCC_HOLDERS: list(held), OCC_RECURRING: list(standing)}
 
 
 def _person(*cells) -> dict:
-    """A stored person record holding recurring slots, as §12 shapes them."""
+    """A stored person record holding recurring slots."""
     return {"name": "x", "slots": [list(parse_cell(c)) for c in cells]}
 
 
@@ -116,8 +113,8 @@ def test_cell_keys_round_trip() -> None:
 
 
 def test_cell_keys_reject_nonsense() -> None:
-    # These come off disk and out of a select menu; a bad one must return None
-    # rather than raise inside a button callback.
+    # Bad input comes off disk and out of a select menu; it must return None,
+    # not raise inside a button callback.
     assert cell_key(7, SLOT_AM) is None  # only 0-6
     assert cell_key(-1, SLOT_AM) is None
     assert cell_key(True, SLOT_AM) is None  # a bool is not a weekday
@@ -132,8 +129,8 @@ def test_cell_keys_reject_nonsense() -> None:
 
 
 def test_normalise_cell_accepts_both_stored_forms() -> None:
-    # The UI works in cell keys; §12 stores recurring slots as pairs. Either
-    # must land on the same key.
+    # The UI uses cell keys; storage uses [weekday, slot] pairs. Either must
+    # land on the same key.
     assert normalise_cell(THU_EVE) == THU_EVE
     assert normalise_cell([3, "eve"]) == THU_EVE
     assert normalise_cell((3, "eve")) == THU_EVE
@@ -157,7 +154,7 @@ def test_slot_windows_cover_the_usable_day() -> None:
 
 
 def test_recurring_slots_normalise_to_the_stored_pair_form() -> None:
-    # §12 fixes the stored form; cell keys are accepted on the way in.
+    # The stored form is fixed; cell keys are accepted on the way in.
     assert normalise_slots([[3, "eve"], "6-am"]) == [[3, "eve"], [6, "am"]]
     # Deduped and ordered, so two equal weeks serialise identically.
     assert normalise_slots(["6-am", [3, "eve"], "3-eve"]) == [
@@ -176,9 +173,8 @@ def test_recurring_slots_normalise_to_the_stored_pair_form() -> None:
 
 
 def test_iso_week_key_uses_the_iso_year_not_the_calendar_year() -> None:
-    # The boundary that bites: 2027-01-01 is a Friday of ISO week 2026-W53.
-    # Keying it under 2027 would move that day's plans into a week that hasn't
-    # happened yet.
+    # 2027-01-01 is a Friday still in ISO week 2026-W53; keying it under 2027
+    # would move that day's plans into a week that hasn't happened yet.
     assert iso_week_key(datetime.date(2026, 12, 28)) == "2026-W53"  # Mon
     assert iso_week_key(datetime.date(2027, 1, 1)) == "2026-W53"  # Fri
     assert iso_week_key(datetime.date(2027, 1, 3)) == "2026-W53"  # Sun
@@ -189,8 +185,7 @@ def test_iso_week_key_uses_the_iso_year_not_the_calendar_year() -> None:
 
 
 def test_iso_week_keys_sort_chronologically_as_strings() -> None:
-    # prune_overrides is a string comparison; zero-padding is what makes that
-    # legal.
+    # prune_overrides compares these as strings; zero-padding makes that legal.
     assert iso_week_key(datetime.date(2026, 3, 2)) == "2026-W10"
     assert "2026-W09" < "2026-W10" < "2026-W53" < "2027-W01"
 
@@ -231,8 +226,8 @@ def test_an_override_replaces_the_cell_for_that_week_only() -> None:
 
 
 def test_an_empty_override_frees_a_recurring_cell_for_one_week() -> None:
-    # "I normally wash Thursday evening but not this week." The empty list is a
-    # tombstone, not an absence, which is why normalise_overrides keeps it.
+    # The empty list is a tombstone ("not this week"), not an absence - which
+    # is why normalise_overrides keeps it.
     people = {"1": _person(THU_EVE, SUN_AM)}
     overrides = {WEEK: {THU_EVE: []}}
     assert effective_week(people, overrides, WEEK) == {SUN_AM: _cell(["1"], ["1"])}
@@ -243,8 +238,8 @@ def test_an_empty_override_frees_a_recurring_cell_for_one_week() -> None:
 
 
 def test_the_single_holder_shape_from_the_design_doc_still_loads() -> None:
-    # §12 sketches "3-eve": "123"; the stored form is a list. A store written
-    # to the sketch must not vanish.
+    # An older sketch stored a bare string instead of a list; that shape must
+    # still load.
     assert normalise_holders("123") == ["123"]
     assert effective_week({}, {WEEK: {THU_EVE: "123"}}, WEEK) == {
         THU_EVE: _cell(["123"])
@@ -252,8 +247,8 @@ def test_the_single_holder_shape_from_the_design_doc_still_loads() -> None:
 
 
 def test_two_people_can_hold_the_same_cell() -> None:
-    # Nothing here can refuse a slot — it's information, not permission (§8) —
-    # so a shape that could only remember one of them would drop a plan.
+    # This is information, not permission, so the shape must remember
+    # everyone, not just one holder.
     people = {}
     overrides, booked = toggle_booking(people, {}, WEEK, THU_EVE, 1)
     assert booked is True
@@ -262,14 +257,12 @@ def test_two_people_can_hold_the_same_cell() -> None:
     assert effective_week(people, overrides, WEEK) == {THU_EVE: _cell(["1", "2"])}
 
 
-# --- provenance (live-use design §5) ----------------------------------------
+# --- provenance ---------------------------------------------------------------
 
 
 def test_a_standing_booking_is_told_apart_from_a_one_off() -> None:
-    # The whole reason the return shape changed. An override *replaces* a
-    # cell's holder list, so with a flat {cell: [ids]} a standing Thursday and
-    # a tap made two minutes ago were byte-identical downstream and ║ was not
-    # merely undrawn, it was unrecoverable.
+    # With a flat {cell: [ids]}, a standing Thursday and a two-minute-old tap
+    # were byte-identical downstream, so the recurring glyph was unrecoverable.
     people = {"1": _person(THU_EVE)}
     week = effective_week(people, {WEEK: {SUN_AM: ["2"]}}, WEEK)
     assert holders(week, THU_EVE) == ["1"]
@@ -284,36 +277,31 @@ def test_a_standing_booking_is_told_apart_from_a_one_off() -> None:
 
 
 def test_an_override_containing_a_standing_holder_keeps_their_cadence() -> None:
-    # The case that rules out a per-*cell* source flag. Somebody taps a cell
-    # another person stands on every week: the tap snapshots the whole holder
-    # list into an override, so a per-cell flag would demote the standing
-    # booking to a one-off and tell the house that the least movable slot on
-    # the grid is an easy swap. Provenance is per holder for exactly this.
+    # Rules out a per-cell source flag: tapping a cell someone else stands on
+    # snapshots the whole holder list, so a per-cell flag would wrongly demote
+    # their standing booking to a one-off. Provenance must be per holder.
     people = {"1": _person(THU_EVE)}
     overrides, booked = toggle_booking(people, {}, WEEK, THU_EVE, 2)
     assert booked is True
     week = effective_week(people, overrides, WEEK)
     assert week == {THU_EVE: _cell(["1", "2"], ["1"])}
     assert cell_char(week, THU_EVE, 9) == CELL_TAKEN_EVERY_WEEK
-    # And to the one-off holder it is still somebody else's standing slot, not
-    # theirs — ║ answers "whose cadence", █ answers "whose slot", and █ wins.
+    # To the one-off holder it's still somebody else's standing slot: ║
+    # answers "whose cadence", █ answers "whose slot", and █ wins.
     assert cell_char(week, THU_EVE, 2) == CELL_MINE
     assert is_recurring_for_me(week, THU_EVE, 2) is False
     assert is_recurring_for_me(week, THU_EVE, 1) is True
 
 
 def test_an_occupancy_with_no_provenance_reads_as_this_week_only() -> None:
-    # A bare {cell: [ids]} — a raw override store, or a literal — is still a
-    # legal input everywhere. It reports no standing holders, which is the
-    # honest answer for a mapping that never knew anybody's slots, and it
-    # degrades to ▒ rather than raising inside a button callback.
+    # A bare {cell: [ids]} is still legal input everywhere; it honestly reports
+    # no standing holders and degrades to the one-off glyph rather than raising.
     flat = {THU_EVE: ["1", "2"]}
     assert holders(flat, THU_EVE) == ["1", "2"]
     assert recurring_holders(flat, THU_EVE) == []
     assert cell_char(flat, THU_EVE, 9) == CELL_TAKEN
     assert is_recurring_for_other(flat, THU_EVE, 9) is False
-    # A "recurring" list that isn't a subset of the holders is ignored, not
-    # trusted: it can only have come from something that got the shape wrong.
+    # A "recurring" list not a subset of the holders is ignored, not trusted.
     assert recurring_holders({THU_EVE: _cell(["1"], ["1", "2"])}, THU_EVE) == ["1"]
     assert recurring_holders({THU_EVE: "junk"}, THU_EVE) == []
 
@@ -346,9 +334,8 @@ def test_past_weeks_are_pruned() -> None:
 
 
 def test_ids_still_match_after_a_json_round_trip() -> None:
-    # HA's Store serialises to JSON: object keys and our holder ids are written
-    # as strings, and the next tap arrives as interaction.user.id, an int. A
-    # mismatch here would show up as the grid quietly disowning your own cells.
+    # JSON round-trips ids and keys as strings, but a tap's id is an int; a
+    # mismatch would show up as the grid quietly disowning your own cells.
     overrides, _ = toggle_booking({}, {}, WEEK, THU_EVE, 12345)
     restored = json.loads(json.dumps(overrides))
     week = effective_week({}, restored, WEEK)
@@ -364,8 +351,7 @@ def test_ids_still_match_after_a_json_round_trip() -> None:
 
 
 def test_an_int_keyed_people_mapping_still_reconciles() -> None:
-    # A mapping that never round-tripped can be int-keyed, exactly as in
-    # people.py's own test.
+    # A mapping that never round-tripped can be int-keyed.
     people = {123: _person(THU_EVE)}
     week = effective_week(people, {}, WEEK)
     assert week == {THU_EVE: _cell(["123"], ["123"])}
@@ -390,8 +376,8 @@ def test_toggling_books_then_frees_the_same_cell() -> None:
     overrides, booked = toggle_booking({}, overrides, WEEK, THU_EVE, 1)
     assert booked is False
     assert effective_week({}, overrides, WEEK) == {}
-    # The cell is still written — as an empty list, the tombstone that can
-    # cancel a recurring slot.
+    # Still written as an empty list - the tombstone that can cancel a
+    # recurring slot.
     assert overrides[WEEK][THU_EVE] == []
 
 
@@ -409,8 +395,8 @@ def test_toggling_one_cell_leaves_the_other_holders_of_it_alone() -> None:
     people = {"1": _person(THU_EVE), "2": _person(THU_EVE)}
     overrides, booked = toggle_booking(people, {}, WEEK, THU_EVE, 1)
     assert booked is False
-    # "2" is still on it and still on it *every week*: dropping out for a week
-    # is one person's decision and must not rewrite anybody else's cadence.
+    # "2" is still on it every week: one person's drop-out must not rewrite
+    # anybody else's cadence.
     assert effective_week(people, overrides, WEEK) == {THU_EVE: _cell(["2"], ["2"])}
 
 
@@ -457,12 +443,10 @@ def test_taken_by_other_is_the_question_the_ui_asks() -> None:
 
 
 def test_the_grid_renders_exactly_this() -> None:
-    # Character for character, because alignment is the only reason to draw a
-    # grid in text and it breaks silently.
-    #
-    # Person "1"'s six cells are *standing* slots and the three Eve cells are
-    # this week's one-offs, so this is also the test that shows ║ and ▒ are
-    # actually different things on the block rather than two names for "taken".
+    # Character for character, since alignment is the only reason to draw a
+    # text grid and it breaks silently. Person 1's six cells are standing
+    # slots and the three Eve cells are one-offs, showing ║ and ▒ are genuinely
+    # different things, not two names for "taken".
     people = {"1": _person("2-am", "5-am", "3-mid", "0-pm", "3-pm", "6-pm")}
     overrides = {WEEK: {"1-eve": ["2"], "3-eve": ["7"], "5-eve": ["2"]}}
     week = effective_week(people, overrides, WEEK)
@@ -481,8 +465,7 @@ def test_the_grid_renders_exactly_this() -> None:
         "PM     ║  ·  ·  ║  ·  ·  ║\n"
         "Eve    ·  ▒  ·  █  ·  ▒  ·"
     )
-    # ...and seen by the person whose standing slots those are: their own
-    # cadence gets no glyph, because █ already says "yours".
+    # Seen by the standing holder: their own cadence gets no glyph.
     assert render_grid(week, 1) == (
         "      Mo Tu We Th Fr Sa Su\n"
         "AM     ·  ·  █  ·  ·  █  ·\n"
@@ -508,8 +491,7 @@ def test_every_rendered_line_fits_a_phone() -> None:
     for line in lines:
         assert len(line) == GRID_WIDTH
     assert GRID_WIDTH <= 30
-    # The day headers and the cells under them must actually line up — the one
-    # thing a text grid has to get right, and the one that breaks in silence.
+    # Day headers and the cells under them must actually line up.
     header = lines[0]
     for weekday in range(7):
         column = header.index(_plan.DAY_ABBRS[weekday]) + 1
@@ -520,7 +502,7 @@ def test_every_rendered_line_fits_a_phone() -> None:
 
 
 def test_the_grid_is_ascii_and_block_characters_only() -> None:
-    # Emoji inside a code block break monospace alignment (§6.3 / §13).
+    # Emoji inside a code block break monospace alignment.
     week = effective_week({"1": _person(THU_EVE)}, {WEEK: {SUN_AM: ["2"]}}, WEEK)
     allowed = set(" \n") | set(CELL_STATES.values())
     for char in render_grid(week, 1):
@@ -528,9 +510,8 @@ def test_the_grid_is_ascii_and_block_characters_only() -> None:
 
 
 def test_every_glyph_in_the_alphabet_fits_the_block() -> None:
-    # All six at once, including the two Phase 3 added and the one nothing
-    # produces yet. Width is the thing that breaks silently: a glyph one column
-    # wider than the rest doesn't error, it just shears the grid.
+    # All six glyphs at once; a glyph one column wider than the rest doesn't
+    # error, it just shears the grid.
     people = {"1": _person("0-am"), "2": _person("1-am")}
     week = effective_week(people, {WEEK: {"2-am": ["3"]}}, WEEK)
     rendered = render_grid(
@@ -556,7 +537,7 @@ def test_the_grid_is_deterministic() -> None:
     assert render_grid(week, 1) == render_grid(week, 1)
 
 
-# --- anonymity (design doc P5 / §11) ----------------------------------------
+# --- anonymity -------------------------------------------------------------
 
 
 def test_the_grid_never_renders_a_name_or_a_count() -> None:
@@ -575,9 +556,9 @@ def test_the_grid_never_renders_a_name_or_a_count() -> None:
 
 
 def test_the_shared_board_has_no_yours_state_at_all() -> None:
-    # One message, one rendering: a viewer-less render must never produce █,
-    # or the first person to look at the pinned board would see somebody
-    # else's cells as their own.
+    # A viewer-less render must never produce the "yours" glyph, or the first
+    # person to look at the pinned board would see somebody else's cells as
+    # their own.
     people = {"1": _person(THU_EVE), "2": _person(SUN_AM)}
     week = effective_week(people, {}, WEEK)
     assert CELL_MINE not in render_grid(week)
@@ -586,8 +567,8 @@ def test_the_shared_board_has_no_yours_state_at_all() -> None:
 
 
 def test_the_legend_does_not_promise_a_state_nothing_produces() -> None:
-    # ? only appears once the habit model has an opinion. Until something
-    # renders it, a legend entry for it is noise.
+    # The guess glyph only appears once the habit model has an opinion; until
+    # then, a legend entry for it is noise.
     people = {"1": _person(THU_EVE)}
     week = effective_week(people, {WEEK: {SUN_AM: ["2"]}}, WEEK)
     assert CELL_EXPECTED not in render_legend(personal=True)
@@ -596,12 +577,8 @@ def test_the_legend_does_not_promise_a_state_nothing_produces() -> None:
 
 
 def test_the_running_glyph_is_legended_only_when_it_is_on_the_block() -> None:
-    # * shipped defined-but-unlegended for exactly one release, while nothing
-    # produced it — the same discipline ? got ahead of the habit model. Now
-    # cells_between produces it, so it earns an entry: but on the same terms as
-    # every other optional glyph, which is that the caller has said it is
-    # actually drawn. A legend entry for a character that isn't there reads as
-    # a renderer bug just as loudly as a missing one.
+    # The running glyph must earn its legend entry the same way every optional
+    # glyph does: only once the caller says it is actually drawn.
     assert CELL_RUNNING == "*"
     for personal in (True, False):
         for expected in (True, False):
@@ -609,8 +586,8 @@ def test_the_running_glyph_is_legended_only_when_it_is_on_the_block() -> None:
                 assert CELL_RUNNING not in render_legend(
                     personal=personal, expected=expected, standing=standing
                 )
-                # Ungated by `personal`, unlike the guess: the washer being
-                # mid-load is a fact about the machine, not about a person.
+                # Ungated by personal, unlike the guess: this is a fact, not
+                # about a person.
                 assert CELL_RUNNING in render_legend(
                     personal=personal,
                     expected=expected,
@@ -620,10 +597,9 @@ def test_the_running_glyph_is_legended_only_when_it_is_on_the_block() -> None:
 
 
 def test_running_is_the_one_state_the_shared_board_may_show() -> None:
-    # Asymmetry with ?, on purpose: "the washer is on" is a fact about the
-    # machine that anybody in the utility room can see, so it is nobody's
-    # private information. A guess about somebody's habits is the opposite on
-    # both counts (§11), so it needs a viewer and this does not.
+    # Asymmetric with the guess glyph on purpose: the washer being on is a
+    # fact anybody can see, unlike a guess about somebody's habits, so this
+    # needs no viewer.
     assert running_cells([SUN_AM, [3, "eve"], "junk", None]) == [THU_EVE, SUN_AM]
     assert running_cells(None) == []
     assert running_cells("3-eve") == []  # a bare string is not a list
@@ -631,7 +607,7 @@ def test_running_is_the_one_state_the_shared_board_may_show() -> None:
     assert CELL_RUNNING in render_grid({}, running=[SUN_AM])
 
 
-# --- predictions (design doc §7 / §11) --------------------------------------
+# --- predictions -----------------------------------------------------------
 
 
 def test_a_prediction_draws_on_a_free_cell_for_its_own_viewer() -> None:
@@ -644,23 +620,20 @@ def test_a_prediction_draws_on_a_free_cell_for_its_own_viewer() -> None:
         "PM     ·  ·  ·  ·  ·  ·  ·\n"
         "Eve    ·  ·  ·  █  ·  ·  ·"
     )
-    # The stored pair form works too — a cell key is a cell key wherever it
-    # came from — and the block stays exactly as wide as it was.
+    # The stored pair form works too, and the block stays exactly as wide.
     for line in render_grid(week, 1, expected=[[6, "am"]]).split("\n"):
         assert len(line) == GRID_WIDTH
 
 
 def test_a_real_booking_always_beats_a_guess() -> None:
-    # The precedence rule, from both sides. A booking is something somebody
-    # said; a guess is arithmetic about their past. If the guess could cover
-    # the booking, the grid would answer "is Thursday evening spoken for?" with
-    # the bot's opinion instead of the house's plans.
+    # A booking is something somebody said; a guess is arithmetic about the
+    # past. If the guess could cover a booking, the grid would answer with the
+    # bot's opinion instead of the house's plans.
     people = {"1": _person(THU_EVE), "2": _person(SUN_AM)}
     week = effective_week(people, {}, WEEK)
     # Predicted onto a cell the viewer holds: still █, never ?.
     assert cell_char(week, THU_EVE, 1, [THU_EVE]) == CELL_MINE
-    # Predicted onto a cell somebody *else* holds: still theirs, at their own
-    # cadence. The guess loses, and the fact that it was made is not visible.
+    # Predicted onto somebody else's cell: still theirs, guess not visible.
     assert cell_char(week, SUN_AM, 1, [SUN_AM]) == CELL_TAKEN_EVERY_WEEK
     one_off = effective_week({}, {WEEK: {SUN_AM: ["2"]}}, WEEK)
     assert cell_char(one_off, SUN_AM, 1, [SUN_AM]) == CELL_TAKEN
@@ -671,9 +644,8 @@ def test_a_real_booking_always_beats_a_guess() -> None:
 
 
 def test_the_precedence_order_is_exactly_this() -> None:
-    # Highest wins: yours, somebody else's every week, somebody else's this
-    # week, running, guess, free. One rule, one implementation — cell_char and
-    # the grid's button styling both read it off cell_state.
+    # Highest wins: yours, other's-every-week, other's-this-week, running,
+    # guess, free. One rule; cell_char and the button styling both read cell_state.
     people = {"1": _person(SUN_AM), "2": _person(THU_EVE)}
     week = effective_week(people, {WEEK: {"0-am": ["3"]}}, WEEK)
     live = ["0-am", "1-am", "3-eve", "6-am"]
@@ -682,8 +654,7 @@ def test_the_precedence_order_is_exactly_this() -> None:
     assert cell_state(week, SUN_AM, 1, guess, live) == STATE_MINE
     # Somebody else's standing slot beats running and beats a guess.
     assert cell_state(week, THU_EVE, 1, guess, live) == STATE_TAKEN_EVERY_WEEK
-    # Somebody else's one-off likewise: a claim outlives the load, and there is
-    # nothing to ask of a drum that is spinning.
+    # Somebody else's one-off likewise: a claim outlives the load.
     assert cell_state(week, "0-am", 1, guess, live) == STATE_TAKEN
     # Running beats a guess — the guess never covers anything real.
     assert cell_state(week, "1-am", 1, guess, live) == STATE_RUNNING
@@ -694,9 +665,8 @@ def test_the_precedence_order_is_exactly_this() -> None:
 
 
 def test_a_prediction_is_never_rendered_for_anybody_but_its_viewer() -> None:
-    # §11: a guess is a statement about one person's habits, and leaking it is
-    # worse than leaking a booking. The anonymous board has no viewer, so it
-    # must have no ? — whatever it is handed.
+    # A guess is a statement about one person's habits, worse to leak than a
+    # booking; the anonymous board has no viewer, so it must show no guess at all.
     week = effective_week({"1": _person(THU_EVE)}, {}, WEEK)
     assert CELL_EXPECTED not in render_grid(week, None, expected=[SUN_AM])
     assert CELL_EXPECTED not in render_grid(week, expected=[SUN_AM])
@@ -725,13 +695,11 @@ def test_the_legend_gains_the_guess_only_when_one_is_on_the_grid() -> None:
         f"{CELL_MINE} yours  {CELL_TAKEN} taken  "
         f"{CELL_EXPECTED} expected  {CELL_FREE} free"
     )
-    # No guess in play: unchanged, because an entry for a character that isn't
-    # on the block reads as a bug in the renderer.
+    # No guess in play: unchanged, or an unused entry reads as a renderer bug.
     assert render_legend(personal=True, expected=False) == (
         f"{CELL_MINE} yours  {CELL_TAKEN} taken  {CELL_FREE} free"
     )
-    # The anonymous board can never show one, so it never says it can — even
-    # when a caller gets the flag wrong.
+    # The anonymous board can never show one, even if a caller gets it wrong.
     assert render_legend(personal=False, expected=True) == (
         f"{CELL_TAKEN} taken  {CELL_FREE} free"
     )
@@ -742,9 +710,8 @@ def test_the_legend_gains_the_cadence_glyph_only_when_one_is_on_the_grid() -> No
         f"{CELL_MINE} yours  {CELL_TAKEN} taken  "
         f"{CELL_TAKEN_EVERY_WEEK} taken, every week  {CELL_FREE} free"
     )
-    # Unlike ?, ║ has no viewer guard: a standing booking is a fact about a
-    # cell, with no name and no count on it, so the shared board draws it and
-    # the shared board's legend explains it.
+    # Unlike the guess glyph, the standing glyph has no viewer guard: it's a
+    # fact with no name or count on it, so the shared board draws it too.
     assert render_legend(personal=False, standing=True) == (
         f"{CELL_TAKEN} taken  {CELL_TAKEN_EVERY_WEEK} taken, every week  "
         f"{CELL_FREE} free"
@@ -754,10 +721,9 @@ def test_the_legend_gains_the_cadence_glyph_only_when_one_is_on_the_grid() -> No
 
 
 def test_render_week_reports_what_is_on_the_block_without_reading_it() -> None:
-    # The replacement for `CELL_EXPECTED in grid`. Sniffing the rendered string
-    # couples every caller to whichever character the renderer happens to use,
-    # and ? would have broken it outright the moment a "?" appeared in a label
-    # or a note. The renderer says what it drew.
+    # Replaces sniffing the rendered string, which couples every caller to
+    # whatever character the renderer happens to use. The renderer says what
+    # it drew.
     people = {"1": _person(THU_EVE), "2": _person(SUN_AM)}
     week = effective_week(people, {WEEK: {"0-am": ["3"]}}, WEEK)
     drawn = render_week(week, 1, expected=["2-pm"], running=["4-mid"])
@@ -768,9 +734,7 @@ def test_render_week_reports_what_is_on_the_block_without_reading_it() -> None:
     assert drawn.legend == render_legend(
         personal=True, expected=True, standing=True, running=True
     )
-    # A guess whose cells are all booked draws nothing, so it reports nothing —
-    # which is the case the old substring test got right and the only reason it
-    # survived as long as it did.
+    # A guess whose cells are all booked draws nothing, so it reports nothing.
     covered = render_week(week, 1, expected=[THU_EVE, SUN_AM])
     assert covered.guessed is False
     assert CELL_EXPECTED not in covered.legend
@@ -795,9 +759,8 @@ def test_a_predicted_grid_is_still_ascii_and_still_fits_a_phone() -> None:
 
 
 def test_your_own_cells_can_be_listed_back_to_you() -> None:
-    # Your own cadence is words here rather than a seventh glyph on the grid:
-    # █ already says "yours", another block weight would be a third thing to
-    # learn, and this is where you read back what you've committed to.
+    # Your own cadence is words, not a seventh glyph - █ already says "yours",
+    # and this is where you read back what you've committed to.
     people = {"1": _person(THU_EVE, SUN_AM), "2": _person("0-am")}
     week = effective_week(people, {}, WEEK)
     assert describe_cells(week, 1) == "Th Eve (every week) · Su AM (every week)"
@@ -807,8 +770,8 @@ def test_your_own_cells_can_be_listed_back_to_you() -> None:
     booked, _ = toggle_booking({}, {}, WEEK, "0-mid", 1)
     mixed = effective_week({"1": _person(THU_EVE)}, booked, WEEK)
     assert describe_cells(mixed, 1) == "Mo Mid · Th Eve (every week)"
-    # And "not this week" against a standing slot drops it from the line
-    # entirely rather than listing it with a cadence it isn't keeping.
+    # "Not this week" against a standing slot drops it entirely, rather than
+    # listing a cadence it isn't keeping.
     skipped = effective_week(
         {"1": _person(THU_EVE, SUN_AM)}, {WEEK: {THU_EVE: []}}, WEEK
     )
@@ -835,8 +798,7 @@ def test_the_effective_week_is_not_a_window_onto_the_store() -> None:
     people = {"1": _person(THU_EVE)}
     overrides = {WEEK: {THU_EVE: ["1", "2"]}}
     week = effective_week(people, overrides, WEEK)
-    # Both lists in a cell's entry, not just the holders — the provenance list
-    # is new and would be a new way to reach back into the store.
+    # Both lists, not just holders - provenance is a new path into the store.
     week[THU_EVE][OCC_HOLDERS].append("999")
     week[THU_EVE][OCC_RECURRING].append("999")
     week["0-am"] = _cell(["999"])
@@ -847,13 +809,12 @@ def test_the_effective_week_is_not_a_window_onto_the_store() -> None:
     assert recurring_cells(people["1"]) == [THU_EVE]
 
 
-# --- the recurring writer (Phase 4) -----------------------------------------
+# --- the recurring writer ---------------------------------------------------
 
 
 def test_a_cell_can_be_promoted_to_every_week_and_back() -> None:
-    # The writer person["slots"] never had. It was defaulted, normalised, read
-    # and reconciled since the planner shipped; nothing could set it, so "every
-    # week" was a shape the store understood and no button could produce.
+    # The first writer for person["slots"]; "every week" was a shape the store
+    # understood but no button could produce.
     slots, standing = toggle_recurring([], THU_EVE)
     assert (slots, standing) == ([[3, "eve"]], True)
     back, standing = toggle_recurring(slots, THU_EVE)
@@ -861,8 +822,8 @@ def test_a_cell_can_be_promoted_to_every_week_and_back() -> None:
 
 
 def test_promoting_stores_the_pair_form_and_keeps_it_ordered() -> None:
-    # §12 fixes the stored form as [weekday, slot] pairs, and two equal weeks
-    # must serialise identically or the store churns on every write.
+    # The stored form is [weekday, slot] pairs; two equal weeks must serialise
+    # identically or the store churns.
     slots, _ = toggle_recurring([[6, "am"]], THU_EVE)
     assert slots == [[3, "eve"], [6, "am"]]
     assert json.loads(json.dumps(slots)) == slots
@@ -881,10 +842,8 @@ def test_promoting_never_mutates_and_survives_junk() -> None:
 
 
 def test_promoting_a_cell_does_not_touch_this_weeks_overrides() -> None:
-    # The two layers answer different questions, and effective_week already
-    # lays one over the other. Writing both from one tap would make "every
-    # week" mean "every week except where somebody edited that week" — the bug
-    # the two-layer model exists to avoid.
+    # The two layers answer different questions; writing both from one tap
+    # would make "every week" mean "except where somebody edited that week".
     overrides = {WEEK: {THU_EVE: ["1"]}}
     before = json.dumps(overrides, sort_keys=True)
     toggle_recurring([], THU_EVE)
@@ -892,8 +851,8 @@ def test_promoting_a_cell_does_not_touch_this_weeks_overrides() -> None:
 
 
 def test_a_promoted_cell_shows_as_standing_to_everybody_else() -> None:
-    # The round trip that matters: the writer's output, read back through the
-    # reconciler, has to reach ║ — that is the whole point of both.
+    # The round trip that matters: the writer's output must reach the
+    # standing glyph through the reconciler.
     slots, _ = toggle_recurring([], THU_EVE)
     week = effective_week({"1": {"slots": slots}}, {}, WEEK)
     assert cell_char(week, THU_EVE, 9) == CELL_TAKEN_EVERY_WEEK
@@ -901,7 +860,7 @@ def test_a_promoted_cell_shows_as_standing_to_everybody_else() -> None:
     assert describe_cells(week, 1) == "Th Eve (every week)"
 
 
-# --- live occupancy (Phase 4) ------------------------------------------------
+# --- live occupancy ----------------------------------------------------------
 
 
 def test_a_running_load_lights_the_cells_it_actually_covers() -> None:
@@ -914,25 +873,23 @@ def test_a_running_load_lights_the_cells_it_actually_covers() -> None:
 
 
 def test_a_load_finishing_exactly_on_a_boundary_does_not_light_the_next_slot():
-    # Half-open, matching SLOT_WINDOWS: a load ending at 16:00 occupied PM for
-    # no time at all.
+    # Half-open like SLOT_WINDOWS: 16:00 occupied PM for no time at all.
     assert cells_between(
         datetime.datetime(2026, 8, 8, 13, 0), datetime.datetime(2026, 8, 8, 16, 0)
     ) == ["5-mid"]
 
 
 def test_an_overnight_load_skips_the_hours_no_slot_covers() -> None:
-    # 00:00-06:00 belongs to no slot on purpose, so an overnight dry lights
-    # Saturday Eve then Sunday AM with the dead hours simply absent — which is
-    # what the machine was actually doing.
+    # 00:00-06:00 has no slot on purpose, so an overnight dry lights Sat Eve
+    # then Sun AM with the dead hours simply absent.
     assert cells_between(
         datetime.datetime(2026, 8, 8, 22, 0), datetime.datetime(2026, 8, 9, 9, 0)
     ) == ["5-eve", "6-am"]
 
 
 def test_a_load_with_no_eta_lights_only_where_it_started() -> None:
-    # "The washer is on now" is the fact worth drawing; how long it will run is
-    # exactly the guess this glyph must not make.
+    # "The washer is on now" is worth drawing; how long it runs is the guess
+    # this glyph must not make.
     start = datetime.datetime(2026, 8, 8, 18, 0)
     assert cells_between(start, None) == ["5-pm"]
     assert cells_between(start, "junk") == ["5-pm"]
@@ -942,9 +899,8 @@ def test_a_load_with_no_eta_lights_only_where_it_started() -> None:
 
 
 def test_a_load_starting_in_the_dead_hours_lights_nothing() -> None:
-    # Nothing *while it is still in them*, and nothing at all when there is no
-    # ETA to say it will leave them — how long a load runs is the guess this
-    # glyph must not make.
+    # Nothing while still in the dead hours, and nothing with no ETA to say it
+    # has left them - how long a load runs is the guess this glyph must not make.
     assert cells_between(datetime.datetime(2026, 8, 8, 3, 0), None) == []
     assert cells_between(
         datetime.datetime(2026, 8, 8, 2, 0), datetime.datetime(2026, 8, 8, 5, 0)
@@ -954,14 +910,9 @@ def test_a_load_starting_in_the_dead_hours_lights_nothing() -> None:
 
 
 def test_a_load_that_starts_before_dawn_still_lights_the_morning() -> None:
-    # REGRESSION: the scan bailed out entirely the moment the *starting* hour
-    # fell in the 00:00-06:00 gap, so a wash put on at 05:00 with a 09:00 ETA
-    # drew nothing for its whole life — at 08:00 the machine was unambiguously
-    # mid-load in the AM slot and the grid still said `·`. The identical load
-    # started at 07:00 drew `*` correctly, which made the six hours where the
-    # reason is invisible the only six where it was wrong. The same function
-    # already documents dead hours *inside* a load as "simply absent"; a start
-    # inside them is the same case.
+    # The scan used to bail out entirely when the START hour fell in the dead
+    # gap, drawing nothing for the load's whole life even once it was clearly
+    # mid-slot.
     assert cells_between(
         datetime.datetime(2026, 8, 6, 5, 0), datetime.datetime(2026, 8, 6, 9, 0)
     ) == ["3-am"]
@@ -974,11 +925,9 @@ def test_a_load_that_starts_before_dawn_still_lights_the_morning() -> None:
 
 
 def test_a_wedged_session_cannot_black_out_the_grid() -> None:
-    # The failure mode that matters. A stuck tracker would paint * across days
-    # of everybody's grid, and * is the one glyph that claims something about
-    # *right now* — unfalsifiable from the outside. Phase 1 fixed the 12-hour
-    # hang that made this likely; the cap stops the next such bug reaching the
-    # display. Clamped, not dropped: a real load still shows its first slots.
+    # A stuck tracker would paint the running glyph across days - unfalsifiable
+    # from the outside - so the count is capped. Clamped, not dropped: a real
+    # load still shows its first slots.
     cells = cells_between(
         datetime.datetime(2026, 8, 8, 7, 0), datetime.datetime(2026, 8, 11, 7, 0)
     )
@@ -987,19 +936,17 @@ def test_a_wedged_session_cannot_black_out_the_grid() -> None:
 
 
 def test_live_occupancy_never_outranks_a_booking() -> None:
-    # You cannot trade a slot the machine is using, and a booking outlives the
-    # load — so the claim is what the cell draws, not the noise.
+    # A booking outlives the load, so the claim is what the cell draws.
     week = effective_week({"1": {"slots": [THU_EVE]}}, {WEEK: {SUN_AM: ["2"]}}, WEEK)
     assert cell_char(week, THU_EVE, 1, None, [THU_EVE]) == CELL_MINE
     assert cell_char(week, THU_EVE, 9, None, [THU_EVE]) == CELL_TAKEN_EVERY_WEEK
     assert cell_char(week, SUN_AM, 9, None, [SUN_AM]) == CELL_TAKEN
     assert is_taken_by_other(week, "0-am", 9) is False  # a running cell is not taken
-    # ...but it does outrank a guess, which is the same rule: nothing that is
-    # merely predicted covers something real.
+    # But it does outrank a guess: nothing merely predicted covers something real.
     assert cell_char(week, "0-am", 1, ["0-am"], ["0-am"]) == CELL_RUNNING
 
 
-# --- the time axis (Phase 4) -------------------------------------------------
+# --- the time axis -----------------------------------------------------------
 
 
 def test_today_gets_a_marker_that_costs_no_width() -> None:
@@ -1009,9 +956,8 @@ def test_today_gets_a_marker_that_costs_no_width() -> None:
     assert plain.count("\n") + 1 == marked.count("\n")  # exactly one row added
     for line in marked.split("\n"):
         assert len(line) == GRID_WIDTH
-    # Over the second letter of the abbreviation, which is the column the cells
-    # below line up on — a marker over the first letter points convincingly at
-    # the gap between two days.
+    # Over the second letter of the abbreviation - the column the cells line
+    # up on - or the marker would point at the gap between two days.
     rows = marked.split("\n")
     column = rows[0].index("▾")
     assert rows[1][column] == "h"  # the 'h' of 'Th'
@@ -1029,9 +975,8 @@ def test_the_marker_lands_on_every_day_of_the_week() -> None:
 
 
 def test_days_ahead_counts_forward_not_backward() -> None:
-    # The grid repeats weekly, so every cell is always coming up — the only
-    # question is how soon. A cell earlier in the week than today is next
-    # week's, which is why this is modular rather than a subtraction.
+    # The grid repeats weekly, so a cell earlier than today is next week's -
+    # modular arithmetic, not a subtraction.
     assert days_ahead(THU_EVE, 3) == 0
     assert days_ahead(THU_EVE, 4) == 6
     assert days_ahead(THU_EVE, 2) == 1
@@ -1040,27 +985,25 @@ def test_days_ahead_counts_forward_not_backward() -> None:
 
 
 def test_a_slot_that_already_ended_today_sorts_round_to_next_week() -> None:
-    # Today's AM slot at 21:00 has gone. Calling it "today" would sort a slot
-    # nobody can still use above tomorrow's.
+    # Today's AM slot at 21:00 has gone; calling it "today" would rank an
+    # unusable slot above tomorrow's.
     assert days_ahead("3-am", 3, 7) == 0  # 06:00-12:00, still open at 07:00
     assert days_ahead("3-am", 3, 12) == 7  # ...closed at 12:00
     assert days_ahead("3-eve", 3, 21) == 0  # 20:00-24:00, open at 21:00
-    # Only ever applied to *today*; other days are unaffected by the hour.
+    # Only ever applied to today; other days are unaffected by the hour.
     assert days_ahead("4-am", 3, 23) == 1
     assert days_ahead("3-am", 3, "junk") == 0
 
 
 def test_your_cells_read_back_soonest_first_when_the_clock_is_known() -> None:
-    # On a Friday the old Monday-first order opened with a slot four days gone
-    # and buried tonight's at the end — the one entry still actionable was the
-    # hardest to find.
+    # Monday-first order would open with a slot four days gone and bury
+    # tonight's at the end - the one actionable entry, hardest to find.
     week = effective_week(
         {}, {WEEK: {"0-am": ["1"], "4-eve": ["1"], "6-pm": ["1"]}}, WEEK
     )
     assert describe_cells(week, 1) == "Mo AM · Fr Eve · Su PM"
     assert describe_cells(week, 1, today=4) == "Fr Eve · Su PM · Mo AM"
-    # ...and on Friday at 22:00 Friday Eve is still on; at 06:00 Saturday it is
-    # not, so it goes to the back rather than leading with yesterday.
+    # At 22:00 Friday Eve is still on; by 06:00 Saturday it moves to the back.
     assert describe_cells(week, 1, today=4, hour=22) == "Fr Eve · Su PM · Mo AM"
     assert describe_cells(week, 1, today=5, hour=6) == "Su PM · Mo AM · Fr Eve"
 

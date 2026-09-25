@@ -47,7 +47,7 @@ def _poll_flat(det, start_ts, energy, *, until, every=300, **kw):
     return ev
 
 
-# --- real online load (Jun 12 14:06->15:51, 11.0->11.9, then flat) ---------
+# --- real online load, then flat --------------------------------------------
 ONLINE_TRACE = [
     (0 * M, 11.0),
     (2 * M, 11.1),
@@ -62,14 +62,13 @@ ONLINE_TRACE = [
 
 def test_online_load_starts_on_accelerant_then_finishes_on_flat() -> None:
     det = EnergyDetector(idle_timeout=IDLE)
-    # job_state shows weight_sensing while the meter still reads the prior
-    # value (the real lag) — must START immediately via the accelerant.
+    # Meter still reads the prior value (real lag); must START immediately
+    # via the accelerant.
     assert det.observe(-30, 11.0, job_is_early=True) == EV_STARTED
     assert det.phase == RUN_ACTIVE
-    # Replay the rising meter: no further events while it climbs.
     for ts, e in ONLINE_TRACE:
         assert det.observe(ts, e) is None
-    # Flat after the last rise (8*M); finishes once flat exceeds idle_timeout.
+    # Finishes once flat exceeds idle_timeout past the last rise.
     last_rise = 8 * M
     assert _poll_flat(det, last_rise + 300, 11.9, until=last_rise + IDLE - 300) is None
     assert det.observe(last_rise + IDLE, 11.9) == EV_FINISHED
@@ -77,7 +76,6 @@ def test_online_load_starts_on_accelerant_then_finishes_on_flat() -> None:
 
 
 def test_offline_batch_starts_then_finishes() -> None:
-    # Job dark all cycle; the meter sat at 11.9, then the cloud dumps 12.8.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 11.9) is None  # first sample: just baselines
     assert det.observe(M, 11.9) is None
@@ -86,34 +84,30 @@ def test_offline_batch_starts_then_finishes() -> None:
 
 
 def test_back_to_back_loads() -> None:
-    # The case the old completion-energy guard broke: load 2 right after load 1.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 14.8, job_is_early=True) == EV_STARTED
     assert det.observe(M, 15.7) is None  # load 1 runs
     assert det.observe(M + IDLE, 15.7) == EV_FINISHED  # load 1 done
-    # Load 2 begins moments later — energy still at load 1's completion value.
+    # Same energy as load 1's completion, but must still START via the accelerant.
     assert det.observe(M + IDLE + 60, 15.7, job_is_early=True) == EV_STARTED
     assert det.phase == RUN_ACTIVE
 
 
 def test_removed_early_finishes_on_flat() -> None:
-    # Someone pulls the load mid-cycle: energy just stops. Finishes on timeout.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
     assert det.observe(M, 20.2) is None  # a little ran
-    # ...then removed; meter flat from 1*M onward.
     assert _poll_flat(det, M + 300, 20.2, until=M + IDLE - 300) is None
     assert det.observe(M + IDLE, 20.2) == EV_FINISHED
 
 
 def test_pause_to_add_a_sock_does_not_false_finish() -> None:
-    # Open door / pause < idle_timeout, then resume — must NOT finish early.
+    # Pause < idle_timeout: must NOT finish early.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 30.0, job_is_early=True) == EV_STARTED
     assert det.observe(M, 30.2) is None
     # Paused for 50 min (< 60 min timeout): flat polls, no finish.
     assert _poll_flat(det, M + 300, 30.2, until=M + 3000) is None
-    # Resume: meter climbs again, re-arming the timer.
     assert det.observe(M + 3300, 30.4) is None
     assert det.phase == RUN_ACTIVE
 
@@ -127,8 +121,7 @@ def test_job_finish_completes_immediately() -> None:
 
 
 def test_wrinkle_creep_while_idle_never_starts() -> None:
-    # Post-cycle tumbling nudges the meter 0.1 at a time; no single jump, and
-    # no early phase => never a false start.
+    # No single step reaches the jump threshold, and no early phase either.
     det = EnergyDetector(idle_timeout=IDLE)
     det.observe(0, 12.8)
     for i, e in enumerate([12.9, 13.0, 13.1, 13.2, 13.3], start=1):
@@ -141,8 +134,8 @@ def test_wrinkle_active_does_not_keep_finished_load_alive() -> None:
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 50.0, job_is_early=True) == EV_STARTED
     assert det.observe(M, 50.9) is None  # real load energy
-    # Cycle ends; wrinkle-prevent tumbles, nudging energy every 30 min but
-    # flagged active — must still finish on the real-energy idle timeout.
+    # Cycle ends; wrinkle-prevent tumbles energy every 30 min but flagged
+    # active, so the real-energy idle timeout still fires.
     t = M
     fin = None
     for _ in range(6):
@@ -156,7 +149,7 @@ def test_meter_reset_is_safe() -> None:
     assert det.observe(0, 60.0, job_is_early=True) == EV_STARTED
     assert det.observe(M, 0.0) is None  # meter reset mid-load: no false finish
     assert det.phase == RUN_ACTIVE
-    # Back to idle, then a reset-from-high while idle must not start anything.
+    # A reset-from-high while idle must not start anything either.
     det2 = EnergyDetector(idle_timeout=IDLE)
     det2.observe(0, 60.0)
     assert det2.observe(M, 0.0) is None
@@ -164,8 +157,7 @@ def test_meter_reset_is_safe() -> None:
 
 
 def test_midcycle_catchup_when_energy_moved() -> None:
-    # Only a late phase ever appears (early phases were dark). It counts as a
-    # catch-up because the meter has risen since we went idle.
+    # Only a late phase appears; still counts as catch-up since the meter rose since idle.
     det = EnergyDetector(idle_timeout=IDLE)
     det.observe(0, 18.0)  # baseline
     det.reset()  # idle_energy = 18.0
@@ -173,8 +165,8 @@ def test_midcycle_catchup_when_energy_moved() -> None:
 
 
 def test_frozen_late_phase_after_finish_does_not_restart() -> None:
-    # job_state stuck at a late phase after completion, meter flat at the
-    # completion reading => stale leftover, must NOT restart.
+    # job_state stuck at a late phase post-completion with a flat meter is a
+    # stale leftover, not a restart.
     det = EnergyDetector(idle_timeout=IDLE)
     det.observe(0, 20.0, job_is_early=True)  # a load
     det.observe(M, 20.9)
@@ -189,8 +181,6 @@ EG = 1200  # default eta_grace used in these tests (20 min settle)
 
 
 def test_eta_gate_completes_when_estimate_passed_and_meter_settled() -> None:
-    # Normal online completion: the washer's estimate has passed and the meter
-    # has been flat for eta_grace -> done.
     det = EnergyDetector(idle_timeout=IDLE)  # eta_grace defaults to EG
     assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
     assert det.observe(M, 20.5) is None  # last real rise at 1*M
@@ -206,10 +196,8 @@ def test_eta_gate_completes_when_estimate_passed_and_meter_settled() -> None:
 
 
 def test_eta_gate_blocks_completion_until_estimate_passes() -> None:
-    # THE false-done fix. The meter is dead-flat from the start (it froze/read
-    # flat for a whole load on a real capture) AND job_state is stuck — but the
-    # washer's estimate is still in the future, so the load must NOT finish, even
-    # after the meter has been flat far longer than idle_timeout.
+    # A dead-flat meter plus a stuck job_state must NOT finish while the
+    # washer's own estimate is still in the future, however long it's been flat.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 14.8, job_is_early=True) == EV_STARTED
     assert _poll_flat(
@@ -222,8 +210,6 @@ def test_eta_gate_blocks_completion_until_estimate_passes() -> None:
 
 
 def test_offline_load_uses_idle_timeout_when_no_estimate() -> None:
-    # No washer estimate (has_eta False) => the flat-energy idle-timeout backstop
-    # closes a genuinely offline load.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 11.9) is None
     assert det.observe(M, 12.8) == EV_STARTED  # offline batch jump
@@ -233,8 +219,8 @@ def test_offline_load_uses_idle_timeout_when_no_estimate() -> None:
 
 
 def test_energy_jump_while_idle_does_not_start() -> None:
-    # Reconnect after an outage: the meter catches up in one big step (18.0->19.1)
-    # while the washer reports stopped/idle. That is NOT a load — must not start.
+    # A reconnect catch-up jump while the washer reports idle is not a load;
+    # must not start.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 18.0) is None  # recovered value, baselines
     assert det.observe(8, 19.1, machine_idle=True) is None  # +1.1 jump but idle
@@ -249,9 +235,8 @@ def test_energy_jump_while_idle_does_not_start() -> None:
 
 
 def test_no_meter_data_does_not_idle_complete() -> None:
-    # Device unavailable mid-load: energy reads None (no data). The idle-timeout
-    # backstop must NOT guess a finish — the coordinator's offline-aware path owns
-    # that. (A real offline-batch load reports a number and still completes.)
+    # energy=None (unavailable) must not let the idle-timeout backstop guess a
+    # finish; that's the coordinator's offline-aware path's job.
     det = EnergyDetector(idle_timeout=IDLE)
     assert det.observe(0, 20.0, job_is_early=True) == EV_STARTED
     assert _poll_flat(det, 300, None, until=3 * IDLE) is None  # None = unavailable

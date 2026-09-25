@@ -1,27 +1,11 @@
-"""Pure, dependency-free health checks for the ``diagnostics`` action.
+"""Pure health checks for the ``diagnostics`` action.
 
-Kept free of Home Assistant / discord imports so every verdict below is unit
-testable against handmade state, the same discipline that made :mod:`detect`
-and :mod:`nudge` reliable. The caller gathers the facts and owns the clock;
-this module only judges them.
+No Home Assistant / discord imports, so every check is unit-testable against
+handmade state. The caller gathers the facts and the clock; this module only
+judges them.
 
-**Why this exists.** The integration logs everything at ``debug`` so a quiet
-household produces no log traffic. The cost of that showed up the first time
-something actually went wrong: the bot misbehaved six times in one morning and
-left nothing at the default log level, and the only way to find out what had
-happened was to read a storage file by hand and do arithmetic on epoch
-timestamps. The facts were all there — they simply were not reachable from
-inside Home Assistant.
-
-So the same arithmetic lives here instead, and an action returns it. Every
-check is written to answer one question a person actually asks about this bot:
-*is it stuck, is it lying, and is it about to say something wrong?*
-
-**Severity is about action, not alarm.** ``problem`` means something is wrong
-now and will not fix itself. ``warning`` means something is wrong now and a
-safety net will eventually clear it — worth knowing, because "eventually" is up
-to twelve hours. ``note`` is context that is not a fault but changes how the
-rest reads.
+Severity is about action, not alarm: ``problem`` won't fix itself, ``warning``
+will (a safety net clears it, eventually), ``note`` is context, not a fault.
 """
 
 from __future__ import annotations
@@ -32,42 +16,34 @@ PROBLEM = "problem"
 WARNING = "warning"
 NOTE = "note"
 
-# Stages in which the integration believes the machine is busy. A check that
-# says "the bot thinks a load is running" means one of these.
+# Stages the integration considers the machine busy.
 TRACKED_STAGES = ("washing", "drying", "self_clean")
 
-# A load whose meter has not moved at all by this point is not a load. Well
-# past the 15-45 minute lag this washer's meter is documented to have, so a
-# genuinely slow reporter is not accused.
+# Past this with no movement, it's not a load. Comfortably past the washer's
+# documented 15-45 min meter lag, so a slow reporter isn't accused.
 METER_SILENT_MINUTES = 75
 
-# Past this, a session with no completion estimate has almost certainly not got
-# one coming: the washer publishes its estimate early in a real cycle.
+# Past this with no ETA, one isn't coming — the washer publishes its
+# estimate early in a real cycle.
 NO_ETA_MINUTES = 45
 
-# A phantom session is minted `confirm_delay` after a reconnect, so a start
-# landing within this of a recorded drop is the signature rather than a
-# coincidence. Generous against the default 30s debounce.
+# A phantom session starts `confirm_delay` after a reconnect, so landing
+# within this of a recorded drop is the signature, not coincidence.
+# Generous against the default 30s debounce.
 FLAP_PROXIMITY_SECONDS = 120
 
-# The phases a *fresh* cycle begins at. The distinction is load-bearing and is
-# the same one `detect.load_is_active` rests on: this washer freezes on the
-# mid/late phase it ended on, so a stale `drying` sitting there while the bot
-# is idle is the documented freeze and says nothing. An *early* phase is not a
-# shape the machine gets stuck in -- somebody started a wash.
+# Phases a fresh cycle begins at. This washer freezes on whatever phase it
+# ended on, so a stale late phase while idle means nothing — only an early
+# phase means somebody actually started a wash.
 EARLY_PHASES = ("weight_sensing", "wash")
 
 
 def _num(value):
-    """A finite float, or None — every field here comes off disk or an entity.
+    """A finite float, or None.
 
-    Finite, not merely parseable: HA's store loader refuses a bare NaN token,
-    but the *string* "nan" sails through json and float() alike, and one such
-    value in flap_times walked far enough to raise at int(median // 60) —
-    in the module whose whole contract is that it never raises, because it
-    runs precisely when something is already wrong. Infinity is refused for
-    the same reason: energy_start=inf would fire the phantom check on
-    arithmetic nobody performed.
+    Rejects NaN-as-string and infinity too, not just unparseable values:
+    this module must never raise, since it runs precisely when something's
+    already wrong.
     """
     if value is None or isinstance(value, bool):
         return None
@@ -97,14 +73,11 @@ def _finding(severity, code, headline, detail, evidence=None):
 
 
 def flap_cadence(flap_times):
-    """``(count, median_gap_seconds, regular)`` for the recorded drops.
+    """`(count, median_gap_seconds, regular)` for the recorded drops.
 
-    ``regular`` is the interesting one. An unreliable network drops at random
-    intervals; a token refresh or a polling cycle drops at *the same* interval
-    every time, and this washer's did — nineteen drops spaced within a few
-    seconds of 3087. Telling those apart matters because it decides whether the
-    fix is "improve the wifi" or "look at the integration doing the polling",
-    and nothing else in the system reports it.
+    `regular` distinguishes a flaky network (random intervals) from a timer
+    — a token refresh or polling cycle — repeating at the same interval.
+    Decides whether the fix is the wifi or the integration doing the polling.
     """
     stamps = sorted(t for t in (_num(x) for x in (flap_times or ())) if t is not None)
     if len(stamps) < 2:
@@ -112,14 +85,9 @@ def flap_cadence(flap_times):
     gaps = sorted(b - a for a, b in zip(stamps, stamps[1:]))
     mid = len(gaps) // 2
     median = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
-    # Regular = at least 80% of gaps within 10% of the median, and at least
-    # three gaps to say so. The first version demanded ALL gaps conform, which
-    # failed in both directions at once: one drop the recorder missed merged
-    # two 3087s gaps into ~6174s and flipped the incident's own metronome to
-    # "ordinary unreliable link" — active misdirection, pointing the owner at
-    # the wifi when the evidence said timer — while any two drops produced a
-    # single gap that conformed to itself, so a coincidence was declared a
-    # cadence. A real timer survives a missed sample; one gap is not a rhythm.
+    # 80% of gaps within 10% of median, with >=3 gaps required: a missed
+    # sample would otherwise merge two gaps into one that still "conforms",
+    # and two gaps alone can look regular by coincidence.
     conforming = sum(1 for g in gaps if abs(g - median) <= median * 0.10)
     regular = (
         median > 0 and len(gaps) >= 3 and conforming >= math.ceil(len(gaps) * 0.8)
@@ -128,13 +96,11 @@ def flap_cadence(flap_times):
 
 
 def check(session, now, *, watched=None, max_session_minutes=720):
-    """Every verdict, worst first. ``session`` is the stored session dict.
+    """Every verdict, worst first. `session` is the stored session dict.
 
-    ``watched`` is what the washer's own entities currently say, as
-    ``{"running": ..., "machine_state": ..., "energy": ..., "job_state": ...}``
-    — strings straight from the state machine, or None when not configured. It
-    is what lets the checks contradict the bot with the machine's own account
-    of itself, which is the only external truth available.
+    `watched` is the washer's own entity state, as `{"running",
+    "machine_state", "energy", "job_state"}` (or None if unconfigured) — the
+    one external source the checks can contradict the bot with.
     """
     data = session if isinstance(session, dict) else {}
     watched = watched if isinstance(watched, dict) else {}
@@ -142,11 +108,8 @@ def check(session, now, *, watched=None, max_session_minutes=720):
 
     stage = data.get("stage")
     tracked = stage in TRACKED_STAGES
-    # The washer being offline changes what every meter-shaped fact means:
-    # no readings arrive, so a frozen meter is an outage, not a phantom. The
-    # first release never read this field — it sat unread in the very dict the
-    # checks were handed — and the phantom check duly accused a real load whose
-    # cloud dropped early, with advice to reset it. The opposite of help.
+    # Offline changes what a frozen meter means: no readings arrive, so it's
+    # an outage, not a phantom load.
     offline_since = _num(data.get("offline_since"))
     offline = offline_since is not None
     detector = data.get("detector") if isinstance(data.get("detector"), dict) else {}
@@ -154,10 +117,8 @@ def check(session, now, *, watched=None, max_session_minutes=720):
     age = _minutes_since(started, now) if started is not None else None
 
     # --- the wedge: the two halves of the state machine disagree -------------
-    # Neither half can end a load the other is not in: the detector only emits
-    # a finish while ACTIVE, and the session only completes from a tracked
-    # stage. So a mismatch is not a transient, it is a machine that has stopped
-    # being able to move, and only reset_session gets out of it.
+    # Neither half can end a load the other isn't in, so a mismatch isn't
+    # transient — only reset_session gets out of it.
     phase = detector.get("phase")
     if tracked and phase == "idle":
         found.append(_finding(
@@ -223,11 +184,9 @@ def check(session, now, *, watched=None, max_session_minutes=720):
     # --- started right after a drop: the reconnect signature -----------------
     count, median, regular = flap_cadence(data.get("flap_times"))
     stamps = sorted(t for t in (_num(x) for x in (data.get("flap_times") or ())) if t is not None)
-    # Only ever offered as corroboration on a load the meter already suspects.
-    # On this washer the cloud drops every ~51 minutes around the clock, so
-    # bare proximity would flag ~8% of perfectly healthy loads (240s window /
-    # 3087s cadence) — one real wash in thirteen accused by coincidence. Tied
-    # to the silent meter, the pair of findings reads as one diagnosis.
+    # Corroboration only, gated on meter_silent: bare proximity alone would
+    # flag many healthy loads, since this washer's cloud reconnects on a
+    # regular cadence.
     if meter_silent and not offline and started is not None and stamps:
         gap = min(abs(started - t) for t in stamps)
         if gap <= FLAP_PROXIMITY_SECONDS:
@@ -242,9 +201,8 @@ def check(session, now, *, watched=None, max_session_minutes=720):
             ))
 
     # --- no estimate: the ETA gate can never fire ---------------------------
-    # Not for a self-clean (drum cleans never publish an estimate, so its
-    # absence says nothing) and not while offline (an unreachable washer
-    # cannot publish anything, and the outage is already reported below).
+    # Excludes self-clean (never publishes an estimate) and offline (can't
+    # publish anything; reported separately below).
     if (
         tracked
         and stage != "self_clean"
@@ -263,12 +221,9 @@ def check(session, now, *, watched=None, max_session_minutes=720):
 
     # --- the machine's own account contradicts the bot -----------------------
     running, machine = watched.get("running"), watched.get("machine_state")
-    # WARNING rather than PROBLEM, deliberately: every load ends through a
-    # short window where the machine already says stopped while the bot is
-    # still settling its stop-debounce, and a duration-less PROBLEM would cry
-    # "action needed" at the tail of every healthy cycle. The honest gate is
-    # persistence, which one snapshot cannot measure — so the wording asks for
-    # the one thing that does: a second run.
+    # WARNING not PROBLEM: every load ends through a brief window where the
+    # machine already looks stopped while the bot's debounce is still
+    # settling. One snapshot can't tell that apart from a real mismatch.
     if tracked and running in ("off", False) and machine not in ("run", "pause"):
         found.append(_finding(
             WARNING, "machine_says_idle",
@@ -281,24 +236,15 @@ def check(session, now, *, watched=None, max_session_minutes=720):
             {"stage": stage, "running": running, "machine_state": machine},
         ))
 
-    # --- ...and the mirror: the washer is washing and the bot has not noticed
-    # This is the failure the household actually feels, and until now it was
-    # the one thing the health check could not see. Every check above asks
-    # whether a *tracked* load is real; none asked the opposite question, so on
-    # 2026-09-12 the bot sat at `done` while the washer ran a full cycle and
-    # the health sensor reported "healthy -- nothing to report". A diagnostic
-    # that is blind to the complaint that prompted it is not a diagnostic.
-    #
-    # Gated on an EARLY phase rather than on `running`/`machine_state`, which
-    # is the whole trick. Those two stay asserted for hours after the drum
-    # stops (field notes 1.1), so either of them alone would cry wolf daily.
-    # An early phase does not stick.
+    # --- ...and the mirror: the washer runs and the bot hasn't noticed -------
+    # The opposite of every check above: is an *untracked* load real. Gated
+    # on an early phase, not `running`/`machine_state` — those stay asserted
+    # for hours after the drum stops, so either alone would cry wolf daily.
     job = watched.get("job_state")
     if not tracked and job in EARLY_PHASES:
-        # Has anything been consumed since the last completion? `idle_energy`
-        # is the meter reading captured when the detector went idle, so this
-        # asks the one question that separates the two ways to arrive here --
-        # and it needs no sensor that has not already earned its place.
+        # `idle_energy` is the meter reading when the detector went idle, so
+        # this is the one question that tells a real wash from a stale phase
+        # replay.
         meter_moved = (
             last_energy is not None
             and idle_energy is not None
@@ -384,13 +330,10 @@ def check(session, now, *, watched=None, max_session_minutes=720):
         ))
 
     # --- the impossible pair -------------------------------------------------
-    # A load cannot both have an owner and be up for grabs. No single-threaded
-    # path produces it, which is what makes it worth checking: seeing it is
-    # proof that a button tap landed *inside* a completion, which holds the
-    # session lock across Discord round trips while the button handlers take
-    # no lock at all. The completion read "unclaimed" before that window
-    # opened, announced the load as up for grabs and handed it to the queue —
-    # for a load that had acquired an owner in the meantime.
+    # No single-threaded path produces both an owner and "up for grabs" at
+    # once. Seeing it means a button tap landed inside a completion, which
+    # holds the session lock across Discord round trips while button
+    # handlers take none.
     if (
         claimed_by not in (None, "", "Unclaimed")
         and claimed_id is not None
@@ -443,14 +386,7 @@ def check(session, now, *, watched=None, max_session_minutes=720):
 
 
 def summarise_entries(entries):
-    """The one-line header for a multi-entry response.
-
-    A pure function because its first inline version shipped a units error:
-    it computed the worst PROBLEM count *within* one entry and rendered it as
-    the number of entries *with* problems — "2 entries, 4 with problems" from
-    a two-entry install. Counting the right thing is one line; being testable
-    is why it lives here.
-    """
+    """One-line header summarizing multiple entries."""
     rows = entries if isinstance(entries, list) else []
     troubled = sum(
         1 for e in rows
@@ -464,12 +400,11 @@ def summarise_entries(entries):
 
 
 def worst_severity(findings):
-    """The most serious severity present, or ``"ok"`` when nothing was found.
+    """The most serious severity present, or "ok" if none.
 
-    A short, low-cardinality value, because this is what an entity's *state*
-    becomes: the recorder writes a row on every change, and a state that is a
-    whole sentence changes whenever the wording does. The sentence lives in an
-    attribute, where it belongs.
+    Short and low-cardinality on purpose: this becomes an entity's state,
+    and the recorder writes a new row on every change. The full text
+    belongs in an attribute instead.
     """
     rows = findings if isinstance(findings, list) else []
     for severity in (PROBLEM, WARNING, NOTE):

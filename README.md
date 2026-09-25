@@ -25,7 +25,7 @@ moves (paused, drying, offline, done). Edits never notify anyone.
 | 🧺 **Claim** / **Unclaim** | Call dibs from the moment the wash starts. The claimant gets the one "done" ping. Unclaimed loads finish with no ping. |
 | 🌙 **Quiet** | The claimant is named at completion but not pinged (for when they're asleep). |
 | 🔜 **I'm next** | Join or leave the line. The next person is pinged when the washer is actually *free*, not merely finished. |
-| ✅ **Emptied it** | The claimant says the drum is clear, which hands the washer to the next person. If nobody taps it, the next person gets a hedged ping after the handoff backstop (25 min by default). |
+| ✅ **Emptied it** | Appears on a claimed load once it finishes. Tapping it says the drum is clear and hands the washer to the next person. If nobody taps it, the next person gets a hedged ping after the handoff backstop (25 min by default). |
 | 🤖 | Opens a private panel (only you can see it): a first-time explainer, and your own settings. |
 
 **The 🤖 panel** lets each person choose where pings about *them* go (an @mention

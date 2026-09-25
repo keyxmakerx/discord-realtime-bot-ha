@@ -27,8 +27,7 @@ load_is_active = _detect.load_is_active
 session_too_long = _detect.session_too_long
 offline_completion_due = _detect.offline_completion_due
 
-# Load const by path too (no Home Assistant imports) so the phase sets the test
-# uses stay in lockstep with the integration.
+# Loaded by path too, so the phase sets stay in lockstep with the integration.
 _CONST_PATH = os.path.join(os.path.dirname(_DETECT_PATH), "const.py")
 _cspec = importlib.util.spec_from_file_location("ld_const", _CONST_PATH)
 _const = importlib.util.module_from_spec(_cspec)
@@ -45,11 +44,8 @@ def _active(phase, energy, completion):
 
 
 def _feed(samples: list[float | None], threshold: float = THRESHOLD) -> list[int]:
-    """Replay a meter stream through the coordinator's baseline-advance rule.
-
-    Mirrors ``_evaluate_energy_start``: skip ``None`` (unavailable) and flat
-    samples, advance the baseline on every change (so a decrease rebaselines),
-    and flag the indices where a single-sample jump trips the threshold.
+    """Mirrors ``_evaluate_energy_start``: skips None/flat samples, rebaselines
+    on every change, and flags indices where a jump trips the threshold.
     """
     last: float | None = None
     triggers: list[int] = []
@@ -75,35 +71,30 @@ def test_jump_primitive() -> None:
 
 
 def test_offline_batch_triggers_once() -> None:
-    # Flat all day, an unavailable flap, then the cloud dumps the load at once.
     assert _feed([11.9, 11.9, None, 11.9, 12.8]) == [4]
 
 
 def test_small_steps_never_trigger() -> None:
-    # A meter reported in <=0.2 kWh steps never trips on step size alone. (A
-    # coarse high-power online sample *can* exceed 0.3 — that live case is
-    # handled by the job-dark gate in the coordinator, not by this math.)
+    # <=0.2 kWh steps never trip alone; a coarse online sample that does is
+    # handled by the job-dark gate, not this math.
     assert _feed([11.0, 11.1, 11.2, 11.4, 11.6, 11.8]) == []
 
 
 def test_wrinkle_prevent_creep_never_triggers() -> None:
-    # Post-cycle tumbling nudges the meter 0.1 at a time for hours; cumulative
-    # rise is 0.5 kWh but no *single* step reaches 0.3 — must not false-fire.
+    # Tumbling nudges the meter 0.1 at a time; cumulative rise is 0.5 but no
+    # single step reaches 0.3.
     assert _feed([11.9, 12.0, 12.1, 12.2, 12.3, 12.4]) == []
 
 
 def test_meter_reset_rebaselines_and_still_detects() -> None:
-    # total_increasing meter resets mid-stream; the decrease must rebaseline (no
-    # trigger) and a later real load must STILL be caught — not made invisible.
+    # A meter reset must rebaseline (no trigger) without hiding a later real load.
     assert _feed([12.8, 5.0, 5.0, 5.9]) == [3]
 
 
 def test_fresh_early_phase_starts_despite_flat_meter() -> None:
-    # THE REGRESSION: a new load's job goes weight_sensing/wash while the energy
-    # meter still reads the previous completion (it lags 15-45 min). Must START.
+    # The meter lags 15-45 min behind a new load's early phase; must START anyway.
     assert _active("weight_sensing", energy=14.8, completion=14.8) is True
     assert _active("wash", energy=14.8, completion=14.8) is True
-    # ...and obviously when the meter has nothing to compare against.
     assert _active("weight_sensing", energy=None, completion=None) is True
 
 
@@ -128,8 +119,8 @@ MAXS = 720 * 60     # max_session safety net (s)
 
 
 def test_session_too_long_is_the_final_safety_net() -> None:
-    # Force-finish a load that has run max_session (e.g. estimate frozen in the
-    # future, no 'finish'): not before, yes at/after the cap.
+    # Force-finishes a load stuck past max_session (e.g. a frozen estimate);
+    # not before the cap, yes at/after it.
     assert session_too_long(0, MAXS - 1, MAXS) is False
     assert session_too_long(0, MAXS, MAXS) is True
     assert session_too_long(0, MAXS + 10_000, MAXS) is True

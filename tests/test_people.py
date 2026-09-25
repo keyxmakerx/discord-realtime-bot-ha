@@ -59,8 +59,7 @@ wants_kind = _people.wants_kind
 
 def test_unknown_person_gets_usable_defaults() -> None:
     person = get_person({}, 123)
-    # Channel, not DM: identical to how the bot behaved before the panel
-    # existed, so an upgrade changes nobody's notifications.
+    # Channel, not DM: matches pre-panel behavior, so upgrading changes nobody's notifications.
     assert person["reminders"] == REMIND_CHANNEL
     assert person["dm_ok"] is None  # untested, not "refused"
     assert person["onboarded"] is False
@@ -77,14 +76,12 @@ def test_unknown_person_is_not_known_or_onboarded() -> None:
     assert is_known({}, 123) is False
     assert is_known(None, 123) is False
     assert is_onboarded({}, 123) is False
-    # A record exists as soon as they answer, and answering onboards them.
     people = set_reminders({}, 123, REMIND_OFF)
     assert is_known(people, 123) is True
     assert is_onboarded(people, 123) is True
 
 
 def test_defaults_are_not_shared_between_people() -> None:
-    # A caller poking at one record must not redefine "default" for the house.
     a = get_person({}, 1)
     a["slots"].append([3, "eve"])
     a["reminders"] = REMIND_DM
@@ -96,24 +93,22 @@ def test_defaults_are_not_shared_between_people() -> None:
 
 
 def test_ids_still_match_after_a_json_round_trip() -> None:
-    # HA's Store serialises to JSON, and JSON object keys are ALWAYS strings.
-    # A tap arrives as interaction.user.id, an int — it must find the record
-    # written before the restart rather than silently creating a second one.
+    # JSON keys are always strings; an int id from a tap must still find the
+    # record written before the restart.
     people = set_reminders({}, 12345, REMIND_DM, name="Sam")
     restored = json.loads(json.dumps(people))
     assert list(restored) == ["12345"]
     assert is_known(restored, 12345) is True
     assert get_person(restored, 12345)["reminders"] == REMIND_DM
     assert get_person(restored, "12345")["name"] == "Sam"
-    # ...and writing again updates that record instead of adding another.
     updated = set_monitor(restored, 12345, False)
     assert list(updated) == ["12345"]
     assert get_person(updated, 12345)["monitor"] is False
 
 
 def test_an_int_keyed_mapping_is_collapsed_not_duplicated() -> None:
-    # An in-memory mapping that never round-tripped can be int-keyed. Reading
-    # must find it, and writing must leave exactly one record behind.
+    # An in-memory mapping (never round-tripped) can be int-keyed; it must
+    # still read and collapse to one record.
     people = {123: {"reminders": REMIND_DM, "onboarded": True}}
     assert is_known(people, 123) is True
     assert get_person(people, "123")["reminders"] == REMIND_DM
@@ -132,8 +127,7 @@ def test_person_key_is_always_the_string_form() -> None:
 
 
 def test_normalise_fills_in_a_record_from_an_older_version() -> None:
-    # Written before dm_notice_pending / monitor existed: no KeyError, and the
-    # fields it *did* have survive.
+    # An older record missing newer fields must not KeyError; existing fields survive.
     person = normalise_person({"name": "Alex", "reminders": REMIND_DM})
     assert person["name"] == "Alex"
     assert person["reminders"] == REMIND_DM
@@ -176,15 +170,12 @@ def test_normalise_keeps_a_real_paused_until() -> None:
     )
 
 
-# --- 🔔 what the bot may send you -------------------------------------------
+# --- what the bot may send you -----------------------------------------------
 
 
 def test_every_dm_kind_starts_on_and_no_quiet_hours_are_set() -> None:
-    # THE regression this whole feature must not cause: somebody who upgrades
-    # gets exactly the messages they got yesterday. Every default here is
-    # "carry on", so the settings can only ever subtract from what 📬 already
-    # opted them into — a default of False would silence a house on upgrade,
-    # and nobody would report it, because the symptom is silence.
+    # Every default is "carry on": an upgrade must not silently change what
+    # somebody already gets messaged about.
     person = get_person({}, 123)
     assert person["dm_checkin"] is True
     assert person["dm_headsup"] is True
@@ -193,17 +184,12 @@ def test_every_dm_kind_starts_on_and_no_quiet_hours_are_set() -> None:
     assert person["quiet_start"] is None
     assert person["quiet_end"] is None
     assert quiet_hours(person) is None
-    # ...and asked the way the two callers ask it.
     assert [wants_kind(person, kind) for kind in KINDS] == [True] * 4
-    # Every kind names a field that actually exists on the record, so a kind
-    # cannot be added to the table without a default to read.
+    # Every kind must name a field that actually exists on the record.
     assert set(KIND_FIELDS.values()) <= set(person)
 
 
 def test_one_kind_switched_off_leaves_the_other_three_alone() -> None:
-    # The whole point of four switches instead of one: the unit somebody opts
-    # out of is the message that annoyed them, not the feature it arrived in.
-    # A setter that wrote all four would be the single 📬 switch again.
     people = set_reminders({}, 1, REMIND_DM, name="Sam")
     people = set_dm_kind(people, 1, KIND_OPPORTUNITY, False)
     person = get_person(people, 1)
@@ -212,16 +198,13 @@ def test_one_kind_switched_off_leaves_the_other_three_alone() -> None:
     assert [person[KIND_FIELDS[k]] for k in (
         KIND_CHECKIN, KIND_SLOT, KIND_TRADES
     )] == [True, True, True]
-    # It is a toggle, not a one-way door (P7).
     people = set_dm_kind(people, 1, KIND_OPPORTUNITY, True)
     assert get_person(people, 1)["dm_opportunity"] is True
 
 
 def test_an_unknown_kind_is_never_written_and_never_gates() -> None:
-    # Two failures, opposite directions. A setter that wrote dm_typo would look
-    # like it had saved the setting while the person went on being messaged;
-    # and a reader that treated an unrecognised kind as "off" would silently
-    # mute somebody over a typo, which is the failure nobody finds.
+    # Two failure directions: writing an unknown kind must not look saved, and
+    # reading one must not silently mute somebody.
     people = set_reminders({}, 1, REMIND_DM)
     after = set_dm_kind(people, 1, "dm_nonsense", False)
     assert after is people  # untouched, so a bad id costs no store write
@@ -233,34 +216,29 @@ def test_an_unknown_kind_is_never_written_and_never_gates() -> None:
 
 
 def test_a_half_set_quiet_pair_is_not_a_window() -> None:
-    # A store write interrupted between the two keys, or a hand-edited options
-    # file. "Quiet from 22:00" with no morning to switch back on would silence
-    # somebody permanently, so half a pair reads as no pair at all.
+    # A half-written pair (interrupted write or hand-edited file) must not
+    # silence somebody permanently, so it reads as no window.
     assert normalise_person({"quiet_start": 22})["quiet_start"] is None
     assert normalise_person({"quiet_start": 22})["quiet_end"] is None
     assert normalise_person({"quiet_end": 8})["quiet_end"] is None
     assert quiet_hours({"quiet_start": 22, "quiet_end": None}) is None
-    # Same hour at both ends is no window either, not a 24-hour one: no single
-    # tap is allowed to collapse into total silence.
+    # Same hour at both ends is no window, not a 24-hour one.
     assert quiet_hours({"quiet_start": 22, "quiet_end": 22}) is None
     same = normalise_person({"quiet_start": 22, "quiet_end": 22})
     assert (same["quiet_start"], same["quiet_end"]) == (None, None)
 
 
 def test_quiet_hours_refuse_anything_that_is_not_an_hour() -> None:
-    # isinstance(True, int) is True in Python, so a stored bool would read as
-    # 01:00 — a quiet window nobody chose, eating messages they asked for.
+    # isinstance(True, int) is True in Python; a stored bool must not read as hour 1.
     assert quiet_hours({"quiet_start": True, "quiet_end": 8}) is None
     assert quiet_hours({"quiet_start": 22, "quiet_end": False}) is None
-    # ...and an hour that cannot exist came from a hand-edited file. Guessing
-    # what it meant is worse than having no window.
+    # An impossible hour (hand-edited file) is rejected rather than guessed at.
     assert quiet_hours({"quiet_start": 24, "quiet_end": 8}) is None
     assert quiet_hours({"quiet_start": -1, "quiet_end": 8}) is None
     assert quiet_hours({"quiet_start": "10pm", "quiet_end": 8}) is None
     assert quiet_hours({"quiet_start": None, "quiet_end": None}) is None
     assert quiet_hours("junk") is None
-    # The forms JSON actually hands back are kept: a whole-number float and the
-    # string an options flow can store are both a real hour.
+    # JSON's actual forms (whole-number float, numeric string) both count.
     assert quiet_hours({"quiet_start": 22.0, "quiet_end": "8"}) == (22, 8)
     assert quiet_hours({"quiet_start": 0, "quiet_end": 7}) == (0, 7)  # midnight
 
@@ -268,7 +246,6 @@ def test_quiet_hours_refuse_anything_that_is_not_an_hour() -> None:
 def test_setting_quiet_hours_stores_both_ends_or_neither() -> None:
     people = set_quiet_hours(set_reminders({}, 1, REMIND_DM), 1, 23, 9)
     assert quiet_hours(get_person(people, 1)) == (23, 9)
-    # "No quiet hours" is the same setter, and it clears both ends.
     cleared = set_quiet_hours(people, 1, None, None)
     assert quiet_hours(get_person(cleared, 1)) is None
     # An unusable end clears the window rather than leaving half of one behind.
@@ -276,9 +253,6 @@ def test_setting_quiet_hours_stores_both_ends_or_neither() -> None:
 
 
 def test_the_dm_settings_survive_the_json_round_trip() -> None:
-    # HA's Store is JSON, so these read back through it on every restart: the
-    # booleans must not come back as strings, the hours must not come back as
-    # None, and the int id must still find the record (see the module docstring).
     people = set_reminders({}, 12345, REMIND_DM, name="Sam")
     people = set_dm_kind(people, 12345, KIND_SLOT, False)
     people = set_quiet_hours(people, 12345, 22, 8)
@@ -287,17 +261,14 @@ def test_the_dm_settings_survive_the_json_round_trip() -> None:
     assert wants_kind(person, KIND_SLOT) is False
     assert wants_kind(person, KIND_CHECKIN) is True
     assert quiet_hours(person) == (22, 8)
-    # ...and a later write through the string key keeps them.
     updated = set_monitor(restored, "12345", False)
     assert quiet_hours(get_person(updated, 12345)) == (22, 8)
     assert get_person(updated, 12345)["dm_headsup"] is False
 
 
 def test_a_junk_record_reads_as_every_message_on_and_no_quiet_hours() -> None:
-    # §12: a half-written or hand-edited record must never raise inside a
-    # button callback, and must never *invent* a refusal either. A stored
-    # "false" is truthy, so reading these with bool() would flip three consents
-    # the person still has switched on.
+    # A half-written or hand-edited record must never raise, or invent a
+    # refusal via bool("false") being truthy.
     person = normalise_person(
         {
             "dm_checkin": "false",  # truthy string must NOT read as True...
@@ -328,8 +299,8 @@ def test_dm_failure_records_the_refusal_and_owes_a_notice() -> None:
     assert person["dm_ok"] is False
     assert person["dm_notice_pending"] is True
     assert person["name"] == "Kim"  # the refusal doesn't wipe the record
-    # Their stated preference is untouched — but delivery routes to the channel
-    # so the reminder isn't silently lost.
+    # The stated preference is untouched, but delivery() routes to the channel
+    # so the reminder isn't lost.
     assert person["reminders"] == REMIND_DM
     assert delivery(people, 1) == REMIND_CHANNEL
     assert wants_dm(people, 1) is False
@@ -345,8 +316,7 @@ def test_a_successful_dm_clears_the_refusal_and_the_notice() -> None:
 
 
 def test_choosing_dm_again_re_arms_a_refused_dm() -> None:
-    # The self-heal: without this a single Forbidden would pin somebody to the
-    # channel forever, even after they fix their privacy settings.
+    # Self-heal: without this, one Forbidden would pin somebody to the channel forever.
     people = mark_dm_failed(set_reminders({}, 1, REMIND_DM), 1)
     assert delivery(people, 1) == REMIND_CHANNEL
     people = set_reminders(people, 1, REMIND_DM)
@@ -396,23 +366,20 @@ def test_a_second_refusal_re_arms_the_notice() -> None:
 
 
 def test_a_refused_dm_cannot_re_arm_its_own_notice() -> None:
-    # Why the assistant may only clear the flag once the panel has *landed*:
-    # after a refusal, delivery() routes this person to the channel, so no
-    # further DM is attempted and mark_dm_failed can never fire again on its
-    # own. A notice cleared before it was seen is therefore gone for good.
+    # The flag can only be cleared once the panel has shown it: after a
+    # refusal, delivery() routes to the channel, so mark_dm_failed can't fire
+    # again to re-arm it on its own.
     people = set_reminders({}, 1, REMIND_DM)
     people = mark_dm_failed(people, 1)
     assert delivery(people, 1) == REMIND_CHANNEL
     assert wants_dm(people, 1) is False
-    # Only an explicit "DM me" re-arms the route (and it is the panel that
-    # offers that button — the very thing they'd never have seen).
     people = set_reminders(people, 1, REMIND_DM)
     assert wants_dm(people, 1) is True
 
 
 def test_reading_the_pending_flag_does_not_clear_it() -> None:
-    # The read and the clear are separate on purpose: the panel renders from
-    # the flag, and only a confirmed delivery is allowed to retire it.
+    # Read and clear are separate: the panel renders from the flag; only a
+    # confirmed delivery retires it.
     people = mark_dm_failed({}, 1)
     assert get_person(people, 1)["dm_notice_pending"] is True
     assert get_person(people, 1)["dm_notice_pending"] is True  # still owed
@@ -422,10 +389,8 @@ def test_reading_the_pending_flag_does_not_clear_it() -> None:
 
 
 def test_a_null_id_still_routes_to_the_channel() -> None:
-    # queue.py tolerates an entry whose id never persisted ({"id": None}), and
-    # select_handoff can hand one back as the head. There is nobody to DM, but
-    # the entry has already been popped off the line, so the handoff must still
-    # reach the channel rather than being swallowed.
+    # An entry can have id=None (never persisted); there's nobody to DM, but
+    # the handoff must still reach the channel.
     people = set_reminders({}, 1, REMIND_DM)
     assert delivery(people, None) == REMIND_CHANNEL
     assert wants_dm(people, None) is False
@@ -435,8 +400,6 @@ def test_a_null_id_still_routes_to_the_channel() -> None:
 
 
 def test_writers_never_mutate_the_mapping_they_are_given() -> None:
-    # The assistant assigns the result; a failed save must not have already
-    # changed the in-memory prefs.
     people = set_reminders({}, 1, REMIND_DM, name="Sam")
     snapshot = json.dumps(people, sort_keys=True)
     set_reminders(people, 1, REMIND_OFF)

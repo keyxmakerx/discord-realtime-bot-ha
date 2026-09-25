@@ -1,19 +1,8 @@
-"""Tests for the reminder *loop* — the scheduling half of design doc §10.
+"""Tests for the reminder loop: which trigger fired, what the coordinator was
+doing, which config entry owns the loop, and what a DM reply acts on.
 
-``tests/test_reminders.py`` covers the decision (may this person be messaged
-about this slot right now?), which is pure and needs nothing. This file covers
-the half that decision cannot see: which trigger fired, what the coordinator had
-just done when it fired, which config entry is running the loop at all, and what
-a tap on a DM that has been sitting in an inbox actually acts on.
-
-Every one of those is a way an **unwanted DM** gets sent, and none of them is
-reachable from pure functions — so ``reminders.py`` is imported for real, with
-the two things it imports from the outside world (``homeassistant`` and
-``discord``) replaced by the smallest stubs that make the module's own code run.
-Nothing in the module under test is reimplemented here; ``const``, ``habit``,
-``nudge`` and ``plan`` are the real ones, loaded as a package so the relative
-imports inside ``reminders.py`` resolve exactly as they do in Home Assistant.
-
+``reminders.py`` is imported for real with ``homeassistant`` and ``discord``
+stubbed out; ``const``, ``habit``, ``nudge`` and ``plan`` are the real modules.
 Runnable with plain ``python3 tests/test_reminder_loop.py``.
 """
 
@@ -34,11 +23,8 @@ PKG_DIR = os.path.join(HERE, "..", "custom_components", "laundry_discord")
 def _install_stubs() -> None:
     """Enough of ``homeassistant`` and ``discord`` for reminders.py to import.
 
-    Deliberately tiny and deliberately dumb: anything with behaviour in it is a
-    second implementation of something, and a test that passes against a clever
-    fake is a test of the fake. The trigger registrars just record what they
-    were asked for, which is precisely what the "with the flag off, nothing is
-    scheduled" assertions need to read.
+    Deliberately minimal: the trigger registrars just record what they were
+    asked for.
     """
     ha = types.ModuleType("homeassistant")
     ha.__path__ = []
@@ -152,9 +138,8 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 _install_stubs()
 
-# A synthetic package pointing at the real integration directory, so the
-# relative imports inside reminders.py (`from . import habit`, `from .const
-# import ...`) resolve to the real modules — no copies, no shims.
+# A synthetic 'ld' package pointing at the real integration dir, so
+# reminders.py's relative imports resolve to the real modules.
 _pkg = types.ModuleType("ld")
 _pkg.__path__ = [os.path.abspath(PKG_DIR)]
 sys.modules["ld"] = _pkg
@@ -177,26 +162,14 @@ plan = sys.modules["ld.plan"]
 people = sys.modules["ld.people"]
 
 THU_EVE = "3-eve"
-# A Thursday, half an hour before the Eve slot opens at 20:00 — which is when a
-# message about that slot is now sent. The retired day-of nudge fired *inside*
-# the window, which was too late to put a load on.
+# Half an hour before the Eve slot opens at 20:00, when the heads-up sends.
 THU = datetime.datetime(2026, 8, 6, 19, 30, tzinfo=TZ)
 
 
 # --- the household, faked ----------------------------------------------------
 class FakeTask:
-    """Enough of ``asyncio.Task`` for the loop's own bookkeeping.
-
-    ``LaundryReminders._create_task`` keeps what it schedules so ``shutdown``
-    can end it, so the fake hass has to hand back something with a task's
-    relevant manners: whether it has finished, whether it was cancelled, what it
-    raised, and telling whoever holds it when it is done. A bare coroutine —
-    which is what this used to return — has none of them.
-
-    ``cancelled()`` and ``exception()`` are *methods*, matching a real
-    ``asyncio.Task``. Modelling either differently would let the done-callback's
-    log-noise regression pass here while the integration still logged a stack
-    trace every time the gateway was down at 05:00.
+    """A minimal ``asyncio.Task`` stand-in: done/cancelled/exception plus
+    done-callbacks, since ``shutdown()`` needs those, not a bare coroutine.
     """
 
     def __init__(self, coro) -> None:
@@ -321,8 +294,7 @@ class FakeAssistant:
         return self.gap.get(str(user_id))
 
     async def async_note_nudge_cell(self, user_id, cell, message_id):
-        # Keyed by the message, exactly as the real one is: a per-person note
-        # is what let a tap on Monday's DM act on Tuesday's cell.
+        # Keyed by message id, matching the real implementation.
         if cell is None or message_id is None:
             return
         self.nudge_cells[str(user_id)] = {
@@ -391,12 +363,8 @@ def test_with_the_option_off_nothing_at_all_is_registered() -> None:
 
 
 def test_the_nudge_never_runs_without_the_guard_that_protects_it() -> None:
-    # The day-of nudge's "have they already washed today" check is fed from the
-    # load history, and the load history is written only when the house has
-    # day-learning on. With learning off that guard is dead while the nudge is
-    # alive — so the washer freeing at 21:40 because somebody just emptied it
-    # would DM that same person "you're down for tonight, and the washer's free
-    # right now". The option description already promises both are needed.
+    # The already-washed guard needs load history, which is only written with
+    # day-learning on; the nudge must not run without it either.
     hass = FakeHass()
     assistant = FakeAssistant(learn_habits=False)
     loop, hass, _a = _loop(hass=hass, assistant=assistant)
@@ -408,11 +376,8 @@ def test_the_nudge_never_runs_without_the_guard_that_protects_it() -> None:
 
 
 def test_only_one_config_entry_ever_runs_the_loop() -> None:
-    # The planner Store key is global — one household, one set of people, one
-    # nudge budget — but the config flow keys entries on the channel, so a house
-    # with two washers has two entries. Two loops means two in-memory copies of
-    # the budget, both of which allow the same DM, so everybody is messaged
-    # twice at double the intended cap.
+    # The budget store is global but entries are per-channel; two loops would
+    # double-send at double the intended cap.
     hass = FakeHass()
     first, _h, _a = _loop(hass=hass, entry=FakeEntry("entry-a"))
     second, _h, _a2 = _loop(hass=hass, entry=FakeEntry("entry-b"))
@@ -422,12 +387,12 @@ def test_only_one_config_entry_ever_runs_the_loop() -> None:
     _run(second.async_setup())
     assert len(hass.time_triggers) == registered  # the second added nothing
     assert len(hass.signals[const.SIGNAL_WASHER_FREE]) == 1
-    # Unloading the passenger leaves the owner running...
+    # Unloading the passenger (non-owner) leaves the owner running...
     _run(second.shutdown())
     assert hass.data[const.DATA_REMINDER_OWNER] == "entry-a"
     assert len(hass.signals[const.SIGNAL_WASHER_FREE]) == 1
-    # ...and unloading the owner hands the loop back, so a reload of the owning
-    # entry doesn't leave the household with no reminders at all.
+    # ...and unloading the owner hands the loop to the passenger, so a reload
+    # doesn't leave the household with no reminders.
     _run(first.shutdown())
     assert const.DATA_REMINDER_OWNER not in hass.data
     _run(second.async_setup())
@@ -435,20 +400,15 @@ def test_only_one_config_entry_ever_runs_the_loop() -> None:
 
 
 def test_unloading_the_entry_stops_a_pass_that_is_already_running() -> None:
-    # REGRESSION: shutdown() dropped the triggers and nothing else, and the
-    # passes were created with hass.async_create_task, which ties a task to
-    # nothing. Dropping a trigger only stops the *next* pass; one already
-    # running holds this entry's people map, budgets and assistant and can sit
-    # for the full _SEND_TIMEOUT on every person — so an options change, which
-    # reloads the entry, could have DMs going out under settings the user had
-    # just replaced, from an object the new entry has already superseded.
+    # shutdown() must cancel an in-flight send pass, not just stop future ones,
+    # or an options reload could leave a stale pass sending under old settings.
     loop, hass, assistant = _loop()
     _run(loop.async_setup())
     assistant.dm_delay = 30  # a gateway that is reconnecting
 
     async def _scenario():
-        # A real task, not the recorder the rest of this file uses: a pass that
-        # never started cannot demonstrate being stopped mid-flight.
+        # A real task: one that never started can't demonstrate being
+        # stopped mid-flight.
         hass.async_create_task = asyncio.ensure_future
         loop._create_task(loop._async_send_nudges(released=True))
         assert len(loop._tasks) == 1
@@ -473,16 +433,12 @@ def _fire_washer_free(loop, hass, payload):
 
 
 def test_a_washer_handed_to_the_queue_is_not_a_free_washer() -> None:
-    # The 🔜 line and the reminder loop must not tell two people the same
-    # machine is theirs. The signal now carries the handoff's outcome, so the
-    # nudge is not even scheduled when somebody in the line just got it.
     loop, hass, assistant = _loop()
     _run(loop.async_setup())
     _fire_washer_free(
         loop, hass, {"handed_off": True, "hedged": False, "claimant_id": None}
     )
     assert assistant.sent == []
-    # Nobody waiting: the same moment, and now it really is free.
     _fire_washer_free(
         loop, hass, {"handed_off": False, "hedged": False, "claimant_id": None}
     )
@@ -490,12 +446,8 @@ def test_a_washer_handed_to_the_queue_is_not_a_free_washer() -> None:
 
 
 def test_the_hedged_backstop_does_not_assert_the_drum_is_empty() -> None:
-    # The handoff backstop fires when the claimant never confirmed anything, and
-    # the queue is deliberately told "probably free, worth a look". The nudge
-    # says "the washer's free right now" as flat fact, so it gets the same
-    # stricter test a clock trigger gets against the identical state — a
-    # finished load with Dan's clothes still in the drum is not a free washer at
-    # 19:45 any more than it was at 19:00.
+    # "Hedged" only means probably free; the nudge states free as fact, so it
+    # needs the same strict check the clock trigger gets.
     assistant = FakeAssistant()
     coordinator = FakeCoordinator(assistant, emptied=False, claimed_by="Dan")
     loop, hass, assistant = _loop(assistant=assistant, coordinator=coordinator)
@@ -507,8 +459,7 @@ def test_the_hedged_backstop_does_not_assert_the_drum_is_empty() -> None:
     # The clock backstop, same state, same answer — which is the point.
     _run(loop._async_send_nudges(released=False))
     assert assistant.sent == []
-    # A load nobody ever claimed is free even hedged, exactly as the coordinator
-    # treats it when it hands that one straight to the line.
+    # Unclaimed is free even hedged, matching how the coordinator treats it.
     coordinator.claimed_by = const.UNCLAIMED
     _fire_washer_free(
         loop, hass, {"handed_off": False, "hedged": True, "claimant_id": None}
@@ -517,15 +468,13 @@ def test_the_hedged_backstop_does_not_assert_the_drum_is_empty() -> None:
 
 
 def test_the_person_who_just_emptied_the_machine_is_not_told_to_use_it() -> None:
-    # The washer coming free is very often the nudged person's own load, and the
-    # history that would say so is written only for a load somebody tapped Claim
-    # on. The coordinator knows whose it was, so it is asked.
+    # The coordinator knows whose load just finished, so it's asked directly
+    # rather than relying on load history.
     loop, hass, assistant = _loop()
     _run(loop.async_setup())
     _fire_washer_free(
         loop, hass, {"handed_off": False, "hedged": False, "claimant_id": 1}
     )
-    # Alex just emptied it and hears nothing; Bo, who didn't touch it, does.
     assert [uid for uid, _text in assistant.sent] == ["2"]
 
 
@@ -533,10 +482,8 @@ def test_the_person_who_just_emptied_the_machine_is_not_told_to_use_it() -> None
 
 
 def test_a_nudge_that_cannot_leave_inside_its_slot_is_dropped() -> None:
-    # async_dm_user starts with wait_until_ready(), so a send attempted while
-    # the gateway is down parks there until it reconnects — and would then
-    # deliver "the washer's free right now" hours later, about a slot that ended
-    # at midnight, while everybody behind this person waited too.
+    # A send stuck waiting for the gateway must time out rather than deliver
+    # hours late and block the rest of the queue.
     assistant = FakeAssistant()
     assistant.dm_delay = 5
     loop, hass, assistant = _loop(assistant=assistant)
@@ -546,8 +493,7 @@ def test_a_nudge_that_cannot_leave_inside_its_slot_is_dropped() -> None:
     finally:
         reminders._SEND_TIMEOUT = 30
     assert assistant.sent == []
-    # ...and the budget stays spent, because over budget is dropped not queued
-    # and undeliverable is the same thing.
+    # The budget stays spent: undeliverable is treated the same as dropped.
     assert assistant.budgets["1"]["last_nudge_ts"] is not None
 
 
@@ -576,15 +522,8 @@ def _button(cls, assistant):
 
 
 def test_a_reply_acts_on_the_slot_the_dm_was_about() -> None:
-    # A DM sits in an inbox indefinitely, so "whatever slot is running when they
-    # finally look" is routinely a different slot. Acting on that books a cell
-    # nobody chose — taken on the whole household's grid — while the slot they
-    # were actually messaged about stays free.
-    #
-    # The heads-up makes the old timestamp reading ambiguous as well as stale:
-    # sent at 19:30, PM (16:00-20:00) is running *and* Eve opens within the
-    # hour, and a timestamp cannot say which. So the cell is recorded when the
-    # DM is sent, and that is what the reply reads.
+    # A timestamp alone is ambiguous near slot boundaries, so the cell is
+    # recorded when the DM is sent, and the reply reads that instead.
     assistant = FakeAssistant(moment=THU)
     _run(assistant.async_note_nudge_cell("1", THU_EVE, 7001))
     on_it = _button(reminders._NudgeOnItButton, assistant)
@@ -593,43 +532,33 @@ def test_a_reply_acts_on_the_slot_the_dm_was_about() -> None:
     note = _run(on_it.act(tapped_in_time))
     assert assistant.booked_calls == [("1", THU_EVE, None)]
     assert "marked the slot taken" in note
-    # Read from the timestamp instead, 19:30 is the PM slot — the wrong cell,
-    # and the reason the note exists at all.
+    # By timestamp alone, 19:30 reads as PM: the wrong cell.
     assert plan.slot_for_hour(19) == "pm"
 
-    # The same DM, opened the next morning. Nothing is written, and the reply
-    # does not claim anything was.
+    # Opened the next morning: nothing is written, and the reply says so.
     assistant.booked_calls.clear()
     assistant.moment = datetime.datetime(2026, 8, 7, 8, 15, tzinfo=TZ)
     note = _run(on_it.act(tapped_in_time))
     assert assistant.booked_calls == []
     assert "left the week grid alone" in note
 
-    # ⏭ Push is the dangerous one: acting on the wrong cell manufactures a
-    # booking for a slot nobody chose, which then produces its own message.
+    # Push is the dangerous one: acting on the wrong cell would book a slot
+    # nobody chose.
     push = _button(reminders._NudgePushButton, assistant)
     note = _run(push.act(tapped_in_time))
     assert assistant.booked_calls == [] and assistant.pushes == []
 
 
 def test_a_reply_to_an_unrecognised_dm_touches_nothing() -> None:
-    # REGRESSION (v0.26.0 heads-up + restart): the fallback used to be "read the
-    # hour the DM was sent". Once the heads-up moved to fire `nudge_lead` before
-    # the slot *opens*, that reading became systematically one slot early — the
-    # 19:00 DM about Wednesday Eve reads as Wednesday PM — so a restart between
-    # the send and the tap did not lose the answer, it silently swapped it for
-    # the wrong one. 🆓 then said "that slot wasn't yours" and left Wednesday Eve
-    # blocking the grid all evening, and 👍 booked a cell nobody chose.
-    #
-    # The note is persisted now, so a restart keeps it; a DM we genuinely cannot
-    # identify writes nothing at all and says so.
+    # An unidentifiable DM (e.g. its note was lost across a restart) must
+    # write nothing, not guess a slot from the send hour.
     assistant = FakeAssistant(moment=datetime.datetime(2026, 8, 5, 19, 5, tzinfo=TZ))
     assert assistant.nudge_cell("1", 4242) is None
     sent = datetime.datetime(2026, 8, 5, 19, 0, tzinfo=TZ)
     stale = FakeInteraction(
         "1", created_at=sent.astimezone(datetime.timezone.utc), message_id=4242
     )
-    assert plan.slot_for_hour(19) == "pm"  # what the old reading would have said
+    assert plan.slot_for_hour(19) == "pm"  # what a send-hour guess would say (wrongly)
     for cls in (
         reminders._NudgeOnItButton,
         reminders._NudgeFreeButton,
@@ -642,14 +571,8 @@ def test_a_reply_to_an_unrecognised_dm_touches_nothing() -> None:
 
 
 def test_an_older_dms_buttons_never_act_on_a_newer_dms_cell() -> None:
-    # REGRESSION (v0.26.0): the cell was remembered per *person*, overwritten by
-    # every nudge and tied to no message, while NudgeView is persistent and its
-    # buttons never expire. Ann is booked Monday Eve and Wednesday Eve; she
-    # ignores Monday's heads-up, gets Wednesday's, then scrolls back and taps 🆓
-    # on **Monday's** DM. That used to release Wednesday's booking — a slot she
-    # still wanted, given away on a reply that names no slot, so she could not
-    # even tell. The day cap is 1 DM/person/day, so heads-ups on consecutive
-    # days is the ordinary case rather than a corner.
+    # The remembered cell is keyed by message id, not just person, so tapping
+    # an older DM's button can't act on a newer DM's slot.
     wednesday = datetime.datetime(2026, 8, 5, 19, 5, tzinfo=TZ)
     assistant = FakeAssistant(moment=wednesday)
     monday_dm, wednesday_dm = 5001, 5002
@@ -659,8 +582,7 @@ def test_an_older_dms_buttons_never_act_on_a_newer_dms_cell() -> None:
     note = _run(_run_tap(free, message_id=monday_dm))
     assert assistant.freed == []
     assert "left the week grid alone" in note
-    # ...and Wednesday's own DM still works, so this is the tap being identified
-    # rather than the buttons being switched off.
+    # Wednesday's own DM still works: the tap is identified, not just blocked.
     note = _run(_run_tap(free, message_id=wednesday_dm))
     assert assistant.freed == [("1", "2-eve", None)]
     assert "Released" in note
@@ -679,8 +601,6 @@ def _run_tap(button, *, message_id):
 
 
 def test_free_it_up_gives_the_slot_back_and_only_that_slot() -> None:
-    # The reply that serves the house rather than the person: a reservation
-    # about to lapse unused is exactly the capacity the grid exists to reclaim.
     assistant = FakeAssistant(moment=THU)
     _run(assistant.async_note_nudge_cell("1", THU_EVE, 7002))
     free = _button(reminders._NudgeFreeButton, assistant)
@@ -689,7 +609,6 @@ def test_free_it_up_gives_the_slot_back_and_only_that_slot() -> None:
     note = _run(free.act(tapped))
     assert assistant.freed == [("1", THU_EVE, None)]
     assert "Released" in note and "back next week" in note
-    # Once its slot has gone there is nothing useful left to write.
     assistant.freed.clear()
     assistant.moment = datetime.datetime(2026, 8, 7, 8, 15, tzinfo=TZ)
     note = _run(free.act(tapped))
@@ -698,10 +617,8 @@ def test_free_it_up_gives_the_slot_back_and_only_that_slot() -> None:
 
 
 def test_the_two_message_kinds_offer_different_replies() -> None:
-    # Nothing to free and nothing to push about a slot nobody booked, so the
-    # opportunity carries just "yes" and "leave me alone this week". One view
-    # class, subsets of one button set — two classes sharing 👍 On it would mean
-    # the second add_view registration quietly won for both.
+    # The opportunity has nothing to free or push (no booking exists), so its
+    # view is a subset of the slot view's buttons, from one view class.
     assistant = FakeAssistant(moment=THU)
 
     def ids(view):
@@ -720,9 +637,8 @@ def test_the_two_message_kinds_offer_different_replies() -> None:
 
 
 def test_a_sunday_push_books_the_week_it_actually_lands_in() -> None:
-    # "Tomorrow" on a Sunday is a Monday in the *next* ISO week. Booking it
-    # under the current one writes the Monday that is six days past: the nudge
-    # does not move, and a cell nobody booked shows as taken on the shared grid.
+    # Tomorrow on a Sunday is Monday of the NEXT ISO week; booking under the
+    # current week would write a Monday six days in the past.
     sunday = datetime.datetime(2026, 8, 2, 20, 30, tzinfo=TZ)
     assistant = FakeAssistant(moment=sunday)
     _run(assistant.async_note_nudge_cell("1", "6-eve", 8001))
@@ -740,8 +656,7 @@ def test_a_sunday_push_books_the_week_it_actually_lands_in() -> None:
     assert assistant.booked_calls == [("1", "0-eve", "2026-W32")]
     assert plan.iso_week_key(sunday) == "2026-W31"  # NOT the week it was booked in
     assert "Moved" in note
-    # Every other day of the week the target week is simply this week, so the
-    # Sunday case is not a special path anybody has to remember.
+    # Every other day, the target week is simply the current one.
     monday = datetime.datetime(2026, 8, 3, 20, 30, tzinfo=TZ)
     assistant.moment = monday
     assistant.booked_calls.clear()

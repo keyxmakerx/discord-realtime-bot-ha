@@ -49,31 +49,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Most Message objects to keep hot. The bot holds at most a couple of live
-# messages (the load card, and later a board), so this only exists to stop the
-# cache growing without bound across many loads.
+# Cap on cached Message objects, so the cache can't grow unbounded across
+# many loads (the bot only ever holds a couple live at once).
 _MESSAGE_CACHE_MAX = 8
 
-# How long any send may wait for the gateway to be usable before giving up.
-#
-# ``wait_until_ready()`` waits on ``discord.Client._ready``, an ``asyncio.Event``
-# that ``login()`` creates *before* the login HTTP call that can fail. So when
-# the gateway task dies — a rotated or bad token, no network at boot, a Discord
-# 5xx during login — that event is left unset with nothing alive to set it, and
-# ``async_run_bot`` has already swallowed the exception and returned. Every send
-# then blocks **forever**, and the coordinator awaits these inside its session
-# lock: one wash at 09:00 would take the lock, set stage to washing, park here,
-# and never come back. No card, no completion, and ``reset_session`` — the
-# documented escape hatch — takes the same lock, so the recovery path is wedged
-# too. ``close()`` makes it strictly worse by *clearing* ``_ready`` again, so a
-# task parked here at unload can never be woken at all.
-#
-# Thirty seconds, the same number :data:`reminders._SEND_TIMEOUT` picked for the
-# same hazard one layer up: comfortably longer than an ordinary reconnect, and
-# short enough that a session transition cannot hold the lock across a real
-# outage. Timing out **raises**, so each caller's existing ``except`` runs —
-# ``_async_start_session`` puts the stage back to idle and resets the detector,
-# which is exactly the recovery a failed post already had.
+# How long a send may wait for the gateway before giving up. If the login
+# task dies (bad token, no network, a Discord 5xx) the ready event never
+# gets set and wait_until_ready() blocks forever — and callers hold the
+# session lock while awaiting this, so a hang here wedges the whole
+# integration, including the reset_session recovery path. Matches
+# reminders._SEND_TIMEOUT.
 _READY_TIMEOUT = 30
 
 
@@ -93,11 +78,8 @@ async def _dm_notice_followup(
 ) -> None:
     """Piggyback the "I couldn't DM you" explainer on a card tap; never raises.
 
-    Design doc §10.5 rule 3 says *any* button, not just 🤖: somebody who has
-    already turned DMs on has no reason to open the panel again, so that is
-    precisely the person whose reminders would go quiet forever with nothing
-    telling them why. Runs after the callback's own response so it is a
-    followup rather than a competing second response.
+    Fires on every button, not just 🤖, so someone with DMs already on for
+    reminders learns why. Runs as a followup, after the callback's response.
     """
     try:
         await coordinator.assistant.async_followup_dm_notice(interaction)
@@ -108,15 +90,10 @@ async def _dm_notice_followup(
 async def _ephemeral_followup(
     interaction: discord.Interaction, text: str | None
 ) -> None:
-    """Say something privately to the tapper *after* the card's own edit.
+    """Say something privately to the tapper, after the card's own edit.
 
-    Discord allows exactly **one response** per interaction, and a card button
-    spends it on ``edit_message`` — correctly, because the shared card is what
-    the whole house reads. A ``followup`` is a legal second message on that
-    same token, so the person who tapped gets a word addressed to them without
-    the card losing its update. Same shape as :func:`_dm_notice_followup`,
-    errors included: a confirmation must never be the reason a real tap fails,
-    and ``None`` means nothing is owed and no Discord call is made at all.
+    A card button spends its one Discord response on `edit_message`, so
+    this sends a followup instead. Never raises. `None` means nothing is owed.
     """
     if not text:
         return
@@ -131,21 +108,11 @@ async def _is_live_card(
 ) -> bool:
     """Whether this tap came from the card the bot is currently tracking.
 
-    Persistent views are registered by ``custom_id``, not per message, so
-    **every card the bot has ever posted stays live**: discord.py routes a tap
-    on a three-week-old message into these callbacks exactly as it routes one
-    on today's. Without this check, tapping 🧺 on an old card claims the
-    *current* load for somebody who was looking at a finished one, and the
-    ``edit_message`` that follows rewrites that historical card with today's
-    embed — two wrong things at once, neither of them visible to the tapper.
-
-    The one deliberate exception is 🤖, whose whole point is that it works from
-    an old card (see :class:`_AssistantButton`); it opens a personal panel and
-    touches no load.
-
-    A card the bot cannot identify — ``message_id`` unset, or an interaction
-    carrying no message — counts as stale. Refusing a tap costs one ephemeral
-    line; acting on the wrong load costs a load.
+    Persistent views register by `custom_id`, not per message, so a tap on
+    any card ever posted reaches this callback, not just the latest one.
+    Without this check, an old-card tap would claim/edit the current load
+    using a stale message. 🤖 is exempt (opens a personal panel, touches no
+    load), and a card with no known message id also counts as stale.
     """
     message = getattr(interaction, "message", None)
     current = coordinator.message_id
@@ -224,9 +191,9 @@ class _UnclaimButton(discord.ui.Button):
 class _QuietButton(discord.ui.Button):
     """Toggle 'quiet' for the claimed load.
 
-    When quiet is on, completion names the claimant in plain text instead of
-    @mentioning them — visible, but no push (for when they're asleep). The label
-    /emoji reflect the current state so one tap flips it back.
+    When on, completion names the claimant in plain text instead of
+    @mentioning them (visible, no push). Label/emoji reflect the current
+    state.
     """
 
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
@@ -260,12 +227,9 @@ class _QuietButton(discord.ui.Button):
 
 
 class _NextUpButton(discord.ui.Button):
-    """Join (or leave) the "I'm next" line.
+    """Join, or leave, the "I'm next" line (same button both ways).
 
-    Tapping it while already in the line removes you — the same button both
-    ways, because a second "leave the line" button would be a fifth control on
-    a card that already has enough. The line is FIFO and the tap is what earns
-    the handoff ping once the washer is actually free.
+    FIFO; a tap here is what earns the handoff ping once the washer frees up.
     """
 
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
@@ -285,12 +249,11 @@ class _NextUpButton(discord.ui.Button):
             if not await _is_live_card(self.coordinator, interaction):
                 return
             result = await self.coordinator.handle_next_toggle(who, user_id)
-            # Read the place now, not after the edit: `edit_message` is a round
-            # trip, and anybody else's tap inside that window would move the
-            # line under us and misreport where this person actually stands.
+            # Read the place before the edit round-trip — another tap in that
+            # window could move the line under us and misreport it.
             place = queue_position(self.coordinator.queue, user_id)
-            # Exactly one response per path — Discord rejects a second one, and
-            # a swallowed tap shows the user "interaction failed".
+            # Exactly one response per path; a second one shows the user
+            # "interaction failed".
             if result == TOGGLE_FULL:
                 await interaction.response.send_message(
                     f"The line's full ({QUEUE_CAP} people waiting) — try again "
@@ -302,18 +265,13 @@ class _NextUpButton(discord.ui.Button):
                     "This load is no longer active.", ephemeral=True
                 )
             else:
-                # Added or removed: the card's "Next up" line changed, so the
-                # whole house sees the queue move without anyone announcing it.
+                # Card edit shows the queue move to everyone.
                 await interaction.response.edit_message(
                     embed=self.coordinator.build_embed(),
                     view=view_for(self.coordinator),
                 )
-                # ...and then, privately, what it did *for them*. The shared
-                # card alone leaves joining and leaving indistinguishable to
-                # the one person who needs to know which just happened — and
-                # invisible entirely on a phone scrolled past the card. A
-                # followup, not a response: the edit above already spent the
-                # single response this interaction gets.
+                # Followup: the edit above already used this interaction's
+                # one response.
                 await _ephemeral_followup(interaction, tap_notice(result, place))
             await _dm_notice_followup(self.coordinator, interaction)
         except Exception:  # noqa: BLE001
@@ -324,9 +282,8 @@ class _NextUpButton(discord.ui.Button):
 class _EmptiedButton(discord.ui.Button):
     """The claimant confirming they've actually cleared the drum.
 
-    A finished washer is not an empty washer — the claimant's clothes are still
-    in it — so this tap, not completion, is what hands the machine over and
-    releases the ping to whoever is next. It disappears once tapped.
+    Completion alone doesn't free the machine — this tap does, and it's
+    what releases the ping to whoever's next. Disappears once tapped.
     """
 
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
@@ -361,15 +318,9 @@ class _EmptiedButton(discord.ui.Button):
 class _AssistantButton(discord.ui.Button):
     """Open the private 🤖 panel (settings, or the first-time explainer).
 
-    Emoji only and no label: it is the least important control on the card and
-    shouldn't compete with the ones that do laundry. It is added **last** so it
-    renders rightmost — Discord lays buttons out in add order and has no
-    right-align, so position is the only lever there is.
-
-    Unlike every other button here it does **not** need a live load: a tap on a
-    week-old card still opens the panel, which matters because someone
-    scrolling back through the channel is exactly the person who has never used
-    it before.
+    Added last so it renders rightmost — Discord has no right-align, only
+    add order. Unlike the other buttons, it needs no live load: it opens
+    even from an old card.
     """
 
     def __init__(self, coordinator: "LaundryCoordinator") -> None:
@@ -392,30 +343,19 @@ class _AssistantButton(discord.ui.Button):
 class ClaimView(discord.ui.View):
     """Persistent view holding the card's Claim / queue / assistant buttons.
 
-    Persistent views need ``timeout=None`` and fixed ``custom_id``s so the
-    buttons keep working after an HA/bot restart (re-registered via
-    ``client.add_view`` in :meth:`LaundryDiscordClient.on_ready`).
+    Needs `timeout=None` and a fixed `custom_id` per button so they keep
+    working after a restart (re-registered in `on_ready`).
 
-    ``show`` controls which buttons are presented on a given message:
-      - ``"claim"``   — a finished, unclaimed load (Claim only)
-      - ``"unclaim"`` — a claimed load (Unclaim + the 🌙 Quiet toggle)
-      - ``"both"``    — registration template so every custom_id stays live
-        after a restart regardless of the message's current state.
+    `show` picks the buttons for a message's current state:
+      - `"claim"`   — a finished, unclaimed load
+      - `"unclaim"` — a claimed load (+ the Quiet toggle)
+      - `"both"`    — registration template: every custom_id present
+        regardless of state
 
-    ``with_next`` / ``with_emptied`` / ``with_assistant`` add the queue and
-    assistant buttons, and the ``"both"`` template forces them on: a
-    ``custom_id`` that was never handed to ``add_view`` silently stops
-    dispatching after a restart, which looks exactly like a dead button and is
-    a bug class this integration has already been bitten by. The template
-    includes 🤖 even when the option hides it, so flipping the option on
-    doesn't leave a dead button until the next restart.
-
-    Rows are explicit — claim/unclaim/quiet on row 0, next/emptied/🤖 on row 1
-    (3 of the 5 a row allows) — rather than left to Discord's auto-flow, so the
-    card people have learned doesn't reshuffle when a button comes or goes.
-
-    Prefer :func:`view_for` over calling this directly: it is the one place
-    that maps coordinator state onto a button set.
+    `with_next` / `with_emptied` / `with_assistant` add the queue/assistant
+    buttons, forced on by the `"both"` template — registered even when
+    hidden, since an unregistered custom_id silently stops dispatching
+    after a restart. Prefer `view_for` over instantiating this directly.
     """
 
     def __init__(
@@ -446,18 +386,11 @@ class ClaimView(discord.ui.View):
 def view_for(coordinator: "LaundryCoordinator") -> ClaimView:
     """Build the button set that matches the coordinator's current state.
 
-    Every callback re-attaches a view when it edits the card, so this lives in
-    one place: if two call sites disagreed, a button would appear or vanish
-    depending on which one last touched the message.
+    Kept in one place so every callback that re-attaches a view agrees on it.
 
-    - 🔜 **I'm next** rides along for the whole life of a load (washing, drying
-      and done-waiting) — people queue up mid-cycle, not just at the end.
-    - ✅ **Emptied it** only makes sense on a *claimed*, finished load that
-      hasn't been cleared yet: nobody else can confirm it, and once it's been
-      tapped there is nothing left to confirm.
-    - 🤖 **Assistant** rides along on every card unless the option hides it. It
-      is inert until tapped — no pings, no channel lines, nothing stored — and
-      it is the only place a newcomer finds out what the rest of the row does.
+    - I'm next: shown for the whole life of a load (washing/drying/done).
+    - Emptied it: only on a claimed, finished load not yet cleared.
+    - Assistant: on every card unless the option hides it; inert until tapped.
     """
     claimed = (
         coordinator.claimed_by != UNCLAIMED and coordinator.claimed_by_id is not None
@@ -488,36 +421,18 @@ class LaundryDiscordClient(discord.Client):
         """Register the persistent views and let the coordinator restore."""
         if not self._view_registered:
             try:
+                # All registered unconditionally, whatever the relevant option
+                # says: each may already be live in a channel message or a DM,
+                # and a custom_id not handed to add_view silently stops
+                # dispatching after a restart. Built with no arguments, the
+                # template form that carries every custom_id a render can use.
                 self.add_view(ClaimView(self.coordinator))
-                # The panel's own buttons dispatch through the same registry,
-                # even though the message carrying them is ephemeral — without
-                # this, every panel opened before a restart goes dead.
                 self.add_view(AssistantView(self.coordinator.assistant))
-                # Likewise the grid's day select and slot toggles, and the 🔮
-                # panel's three answers. Both are built with no arguments,
-                # which is the template form that carries every custom_id —
-                # including the ones a given render leaves out.
                 self.add_view(GridView(self.coordinator.assistant))
                 self.add_view(GuessView(self.coordinator.assistant))
-                # And the 🔔 sub-panel's four toggles, quiet-hours select and
-                # back. Built with no person, which is the template form. It
-                # matters most of all here: a toggle that never registered
-                # still *looks* like it saved — the label only changes on the
-                # re-render a dispatched tap would have caused, so the panel
-                # goes on saying "on" about a message somebody switched off.
                 self.add_view(NotifyView(self.coordinator.assistant))
-                # The reminder DMs' replies. Registered whatever the reminder
-                # option currently says: a DM already sitting in somebody's
-                # inbox has to keep working, and "🔕 Stop asking" is the last
-                # button that should ever answer "interaction failed".
                 self.add_view(PlanDMView(self.coordinator.assistant))
                 self.add_view(NudgeView(self.coordinator.assistant))
-                # The trade broker's panel and its request DM. Registered
-                # whatever the trades option currently says, for the same
-                # reason as the reminder DMs: an ask already sitting in
-                # somebody's inbox has to keep working, and "🚫 Don't ask me
-                # again" is the last button here that should ever answer
-                # "interaction failed".
                 self.add_view(TradeAskView(self.coordinator.assistant))
                 self.add_view(TradeRequestView(self.coordinator.assistant))
                 self._view_registered = True
@@ -546,10 +461,7 @@ class DiscordBot:
         self._channel_id = int(channel_id)
         intents = discord.Intents.default()  # buttons need no privileged intents
         self._client = LaundryDiscordClient(coordinator, intents=intents)
-        # Message objects keyed by ID, insertion-ordered so the oldest can be
-        # evicted. It used to be a single slot, which meant every alternation
-        # between two long-lived messages (the load card and, later, a pinned
-        # board) cost a refetch — and a refetch is a round trip on the ETA tick.
+        # Keyed by ID, insertion-ordered so the oldest can be evicted.
         self._messages: dict[int, discord.Message] = {}
 
     async def async_start(self) -> None:
@@ -566,20 +478,16 @@ class DiscordBot:
         return self._client.is_ready()
 
     async def _wait_ready(self) -> None:
-        """Wait for a usable gateway, or raise. **Never waits forever.**
+        """Wait for a usable gateway, or raise. Never waits forever.
 
-        The one place ``wait_until_ready()`` is allowed to be called, so the
-        bound in :data:`_READY_TIMEOUT` cannot be forgotten by a send added
-        later. Re-raised as ``TimeoutError`` rather than swallowed: a caller
-        that thinks it posted a card when it did not is worse off than one whose
-        ``except`` branch runs.
+        The only place `wait_until_ready()` is called, so `_READY_TIMEOUT`
+        can't be forgotten. Raises `TimeoutError` rather than swallowing it.
         """
         try:
             async with asyncio.timeout(_READY_TIMEOUT):
                 await self._client.wait_until_ready()
         except TimeoutError:
-            # Only the timeout. A CancelledError from outside is HA shutting
-            # down (or an unload cancelling this task) and has to keep going.
+            # Not CancelledError: HA shutdown/unload cancellation must propagate.
             _LOGGER.debug("Discord gateway not ready within %ss", _READY_TIMEOUT)
             raise
 
@@ -605,8 +513,7 @@ class DiscordBot:
         try:
             message = await channel.fetch_message(message_id)
         except Exception:  # noqa: BLE001 - re-raised; the caller logs it
-            # Never leave a stale entry for a message we couldn't fetch — one
-            # deleted message must not wedge every later call for that ID.
+            # Drop the entry; a deleted message must not wedge every later fetch.
             self._messages.pop(message_id, None)
             raise
         self._remember(message)
@@ -645,27 +552,25 @@ class DiscordBot:
         *,
         view: discord.ui.View | None = MISSING,
     ) -> None:
-        """Edit an existing message in place. Edits never send a push.
+        """Edit an existing message in place. Never sends a push.
 
-        ``view`` defaults to ``MISSING`` so an existing view is left untouched;
-        pass ``None`` to remove it or a view instance to set it.
+        `view=MISSING` (default) leaves the existing view untouched; pass
+        `None` to remove it or a view instance to set it.
         """
         message = await self._ensure_message(message_id)
         try:
             await message.edit(embed=embed, view=view)
         except Exception:  # noqa: BLE001 - re-raised; the caller logs it
-            # A cached Message whose real message was deleted fails every edit
-            # forever; drop it so the next call refetches (and fails loudly on
-            # the fetch instead of silently on a phantom object).
+            # A deleted message would fail every edit forever; drop it so the
+            # next call refetches instead.
             self._messages.pop(message_id, None)
             raise
 
     async def async_send_ping(self, content: str) -> None:
-        """Send a small standalone message that actually notifies a user.
+        """Send a standalone message that actually pushes a notification.
 
-        Used for the completion ping to whoever claimed the load, since editing
-        an embed never triggers a push notification. Only user mentions are
-        allowed (no @everyone / role pings).
+        Editing an embed never pushes, hence a separate message for the
+        completion ping. Only user mentions are allowed (no @everyone/role).
         """
         await self._wait_ready()
         channel = await self._get_channel()
@@ -681,18 +586,12 @@ class DiscordBot:
     ) -> discord.Message:
         """Send one direct message to a known user ID. Returns the message.
 
-        The message comes back because a reminder DM has to stay identifiable:
-        its buttons are a persistent view and outlive both the slot and the
-        process, so what the DM was *about* is recorded against its id.
-
-        Deliberately lets exceptions out: the assistant has to tell
-        ``discord.Forbidden`` (error 50007 — "this user has DMs from server
-        members turned off", which Discord never reveals to *them*) apart from
-        a transient failure, because only the first one is worth remembering.
-
-        DMing a bare user ID needs no privileged intent. ``get_user`` is tried
-        first so a cached user costs no HTTP round trip; ``fetch_user`` covers
-        somebody the gateway hasn't sent us yet.
+        Returned so a reminder DM stays identifiable, since its buttons are
+        a persistent view that outlives this call. Exceptions propagate
+        deliberately — callers need to distinguish `discord.Forbidden` (DMs
+        closed) from a transient failure. `get_user` is tried first (no
+        HTTP round trip); `fetch_user` covers a user the gateway hasn't
+        sent us yet.
         """
         await self._wait_ready()
         uid = int(user_id)
@@ -702,14 +601,11 @@ class DiscordBot:
         return await user.send(content=content, view=view)
 
     async def async_announce_done(self, content: str) -> None:
-        """Post a fresh, push-silent 'done' nudge as plain text (no embed).
+        """Post a push-silent 'done' nudge as plain text (no embed).
 
-        Used when an unclaimed load finishes: the original card is edited in place
-        (keeping the embed + Claim button) but stays buried in the channel
-        history, so we drop a short text line at the bottom where people will
-        actually see it. Plain text — not a second embed — so it doesn't look
-        like a duplicate of the card. ``silent=True`` keeps it visible without a
-        push, and mentions are disabled so nobody is pinged.
+        The original card stays buried in channel history; this drops a
+        visible line at the bottom instead, as plain text so it doesn't
+        read as a duplicate. No mentions, so nobody is pinged.
         """
         await self._wait_ready()
         channel = await self._get_channel()
