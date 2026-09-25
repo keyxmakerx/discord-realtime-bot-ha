@@ -16,15 +16,15 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_AVAILABILITY_GRACE,
     CONF_BOT_TOKEN,
     CONF_CHANNEL_ID,
-    CONF_ETA_ENTITY,
-    CONF_ETA_INTERVAL,
-    CONF_AVAILABILITY_GRACE,
     CONF_CONFIRM_DELAY,
     CONF_ENERGY_ENTITY,
     CONF_ENERGY_IDLE,
     CONF_ENERGY_LOAD_JUMP,
+    CONF_ETA_ENTITY,
+    CONF_ETA_INTERVAL,
     CONF_HANDOFF_FALLBACK,
     CONF_JOB_STATE_ENTITY,
     CONF_LEARN_HABITS,
@@ -42,14 +42,14 @@ from .const import (
     CONF_WRINKLE_ENTITY,
     DEFAULT_AVAILABILITY_GRACE,
     DEFAULT_CONFIRM_DELAY,
-    DEFAULT_ETA_ENTITY,
-    DEFAULT_ETA_INTERVAL,
-    DEFAULT_JOB_STATE_ENTITY,
-    DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_ENERGY_IDLE,
     DEFAULT_ENERGY_LOAD_JUMP,
+    DEFAULT_ETA_ENTITY,
+    DEFAULT_ETA_INTERVAL,
     DEFAULT_HANDOFF_FALLBACK,
+    DEFAULT_JOB_STATE_ENTITY,
     DEFAULT_LEARN_HABITS,
+    DEFAULT_MACHINE_STATE_ENTITY,
     DEFAULT_NUDGE_LEAD,
     DEFAULT_PING_CLAIMANT_ON_COMPLETE,
     DEFAULT_PLAN_DM_TIME,
@@ -80,127 +80,65 @@ from .const import (
 from .plan import DAY_NAMES
 
 
-def _eta_interval_selector() -> selector.NumberSelector:
+def _number(
+    minimum: float, maximum: float, step: float, unit: str
+) -> selector.NumberSelector:
     return selector.NumberSelector(
         selector.NumberSelectorConfig(
-            min=MIN_ETA_INTERVAL,
-            max=MAX_ETA_INTERVAL,
-            step=5,
-            unit_of_measurement="seconds",
+            min=minimum,
+            max=maximum,
+            step=step,
+            unit_of_measurement=unit,
             mode=selector.NumberSelectorMode.BOX,
         )
     )
 
 
+def _sensor(domain: str = "sensor") -> selector.EntitySelector:
+    return selector.EntitySelector(selector.EntitySelectorConfig(domain=domain))
+
+
+def _eta_interval() -> selector.NumberSelector:
+    return _number(MIN_ETA_INTERVAL, MAX_ETA_INTERVAL, 5, "seconds")
+
+
 def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
-    """Schema for the options (and the option portion of initial setup)."""
+    """Schema for the options flow, defaulting to the current values."""
+
+    def required(key: str, default: Any) -> vol.Required:
+        return vol.Required(key, default=defaults.get(key, default))
+
     return vol.Schema(
         {
-            vol.Required(
-                CONF_ETA_INTERVAL,
-                default=defaults.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL),
-            ): _eta_interval_selector(),
-            vol.Required(
-                CONF_CONFIRM_DELAY,
-                default=defaults.get(CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_CONFIRM_DELAY,
-                    max=MAX_CONFIRM_DELAY,
-                    step=5,
-                    unit_of_measurement="seconds",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL): _eta_interval(),
+            required(CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY): _number(
+                MIN_CONFIRM_DELAY, MAX_CONFIRM_DELAY, 5, "seconds"
             ),
-            vol.Required(
-                CONF_ENERGY_IDLE,
-                default=defaults.get(CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_ENERGY_IDLE,
-                    max=MAX_ENERGY_IDLE,
-                    step=5,
-                    unit_of_measurement="minutes",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE): _number(
+                MIN_ENERGY_IDLE, MAX_ENERGY_IDLE, 5, "minutes"
             ),
-            vol.Required(
-                CONF_ENERGY_LOAD_JUMP,
-                default=defaults.get(
-                    CONF_ENERGY_LOAD_JUMP, DEFAULT_ENERGY_LOAD_JUMP
-                ),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_ENERGY_LOAD_JUMP,
-                    max=MAX_ENERGY_LOAD_JUMP,
-                    step=0.1,
-                    unit_of_measurement="kWh",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_ENERGY_LOAD_JUMP, DEFAULT_ENERGY_LOAD_JUMP): _number(
+                MIN_ENERGY_LOAD_JUMP, MAX_ENERGY_LOAD_JUMP, 0.1, "kWh"
             ),
-            vol.Required(
-                CONF_PING_CLAIMANT_ON_COMPLETE,
-                default=defaults.get(
-                    CONF_PING_CLAIMANT_ON_COMPLETE,
-                    DEFAULT_PING_CLAIMANT_ON_COMPLETE,
-                ),
+            required(
+                CONF_PING_CLAIMANT_ON_COMPLETE, DEFAULT_PING_CLAIMANT_ON_COMPLETE
             ): selector.BooleanSelector(),
-            vol.Required(
-                CONF_AVAILABILITY_GRACE,
-                default=defaults.get(
-                    CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE
-                ),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_AVAILABILITY_GRACE,
-                    max=MAX_AVAILABILITY_GRACE,
-                    step=1,
-                    unit_of_measurement="minutes",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE): _number(
+                MIN_AVAILABILITY_GRACE, MAX_AVAILABILITY_GRACE, 1, "minutes"
             ),
-            vol.Required(
-                CONF_HANDOFF_FALLBACK,
-                default=defaults.get(
-                    CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK
-                ),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_HANDOFF_FALLBACK,
-                    max=MAX_HANDOFF_FALLBACK,
-                    step=5,
-                    unit_of_measurement="minutes",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK): _number(
+                MIN_HANDOFF_FALLBACK, MAX_HANDOFF_FALLBACK, 5, "minutes"
             ),
-            vol.Required(
-                CONF_QUEUE_EXPIRY,
-                default=defaults.get(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_QUEUE_EXPIRY,
-                    max=MAX_QUEUE_EXPIRY,
-                    step=1,
-                    unit_of_measurement="hours",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY): _number(
+                MIN_QUEUE_EXPIRY, MAX_QUEUE_EXPIRY, 1, "hours"
             ),
-            vol.Required(
-                CONF_SHOW_ASSISTANT,
-                default=defaults.get(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT),
-            ): selector.BooleanSelector(),
-            vol.Required(
-                CONF_LEARN_HABITS,
-                default=defaults.get(CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS),
-            ): selector.BooleanSelector(),
-            # The one switch that lets the bot start a conversation. Off by
-            # default, and the three settings under it do nothing at all while
-            # it is off — they are here so somebody who turns it on isn't then
-            # hunting for when it will fire.
-            vol.Required(
-                CONF_REMIND_DMS,
-                default=defaults.get(CONF_REMIND_DMS, DEFAULT_REMIND_DMS),
-            ): selector.BooleanSelector(),
+            required(CONF_SHOW_ASSISTANT, DEFAULT_SHOW_ASSISTANT): (
+                selector.BooleanSelector()
+            ),
+            required(CONF_LEARN_HABITS, DEFAULT_LEARN_HABITS): (
+                selector.BooleanSelector()
+            ),
+            required(CONF_REMIND_DMS, DEFAULT_REMIND_DMS): selector.BooleanSelector(),
             vol.Required(
                 CONF_PLAN_DM_WEEKDAY,
                 default=str(
@@ -215,31 +153,13 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
-            vol.Required(
-                CONF_PLAN_DM_TIME,
-                default=defaults.get(CONF_PLAN_DM_TIME, DEFAULT_PLAN_DM_TIME),
-            ): selector.TimeSelector(),
-            vol.Required(
-                CONF_NUDGE_LEAD,
-                default=defaults.get(CONF_NUDGE_LEAD, DEFAULT_NUDGE_LEAD),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=MIN_NUDGE_LEAD,
-                    max=MAX_NUDGE_LEAD,
-                    step=5,
-                    unit_of_measurement="minutes",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
+            required(CONF_PLAN_DM_TIME, DEFAULT_PLAN_DM_TIME): (
+                selector.TimeSelector()
             ),
-            # The other switch that lets the bot start a conversation — this
-            # one on another housemate's behalf. Independent of the reminder
-            # DMs above: a house can want swaps without wanting the bot to
-            # guess anybody's days, and the two contact people for entirely
-            # different reasons. Off by default, like everything that can DM.
-            vol.Required(
-                CONF_TRADES,
-                default=defaults.get(CONF_TRADES, DEFAULT_TRADES),
-            ): selector.BooleanSelector(),
+            required(CONF_NUDGE_LEAD, DEFAULT_NUDGE_LEAD): _number(
+                MIN_NUDGE_LEAD, MAX_NUDGE_LEAD, 5, "minutes"
+            ),
+            required(CONF_TRADES, DEFAULT_TRADES): selector.BooleanSelector(),
         }
     )
 
@@ -252,7 +172,7 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect connection + entity config, then the options."""
+        """Collect the bot token, channel and washer entities."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -268,10 +188,9 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_RUNNING_ENTITY: user_input[CONF_RUNNING_ENTITY],
                     CONF_JOB_STATE_ENTITY: user_input[CONF_JOB_STATE_ENTITY],
                     CONF_ETA_ENTITY: user_input[CONF_ETA_ENTITY],
-                    CONF_MACHINE_STATE_ENTITY: user_input.get(
-                        CONF_MACHINE_STATE_ENTITY
-                    )
-                    or "",
+                    CONF_MACHINE_STATE_ENTITY: (
+                        user_input.get(CONF_MACHINE_STATE_ENTITY) or ""
+                    ),
                     CONF_ENERGY_ENTITY: user_input.get(CONF_ENERGY_ENTITY) or "",
                     CONF_WATER_ENTITY: user_input.get(CONF_WATER_ENTITY) or "",
                     CONF_WRINKLE_ENTITY: user_input.get(CONF_WRINKLE_ENTITY) or "",
@@ -287,65 +206,35 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         defaults = user_input or {}
+
+        def required(key: str, default: Any) -> vol.Required:
+            return vol.Required(key, default=defaults.get(key, default))
+
         schema = vol.Schema(
             {
-                vol.Required(
-                    CONF_BOT_TOKEN, default=defaults.get(CONF_BOT_TOKEN, "")
-                ): selector.TextSelector(
+                required(CONF_BOT_TOKEN, ""): selector.TextSelector(
                     selector.TextSelectorConfig(
                         type=selector.TextSelectorType.PASSWORD
                     )
                 ),
-                vol.Required(
-                    CONF_CHANNEL_ID, default=defaults.get(CONF_CHANNEL_ID, "")
-                ): selector.TextSelector(),
-                vol.Required(
-                    CONF_RUNNING_ENTITY,
-                    default=defaults.get(CONF_RUNNING_ENTITY, DEFAULT_RUNNING_ENTITY),
-                ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="binary_sensor")
+                required(CONF_CHANNEL_ID, ""): selector.TextSelector(),
+                required(CONF_RUNNING_ENTITY, DEFAULT_RUNNING_ENTITY): _sensor(
+                    "binary_sensor"
                 ),
-                vol.Required(
-                    CONF_JOB_STATE_ENTITY,
-                    default=defaults.get(
-                        CONF_JOB_STATE_ENTITY, DEFAULT_JOB_STATE_ENTITY
-                    ),
-                ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
-                ),
-                vol.Required(
-                    CONF_ETA_ENTITY,
-                    default=defaults.get(CONF_ETA_ENTITY, DEFAULT_ETA_ENTITY),
-                ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
-                ),
+                required(CONF_JOB_STATE_ENTITY, DEFAULT_JOB_STATE_ENTITY): _sensor(),
+                required(CONF_ETA_ENTITY, DEFAULT_ETA_ENTITY): _sensor(),
                 vol.Optional(
                     CONF_MACHINE_STATE_ENTITY,
                     default=defaults.get(
                         CONF_MACHINE_STATE_ENTITY, DEFAULT_MACHINE_STATE_ENTITY
                     ),
-                ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
-                ),
-                vol.Optional(CONF_ENERGY_ENTITY): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
-                ),
-                vol.Optional(CONF_WATER_ENTITY): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
-                ),
-                vol.Optional(CONF_WRINKLE_ENTITY): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="binary_sensor")
-                ),
-                vol.Required(
-                    CONF_ETA_INTERVAL,
-                    default=defaults.get(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL),
-                ): _eta_interval_selector(),
-                vol.Required(
-                    CONF_PING_CLAIMANT_ON_COMPLETE,
-                    default=defaults.get(
-                        CONF_PING_CLAIMANT_ON_COMPLETE,
-                        DEFAULT_PING_CLAIMANT_ON_COMPLETE,
-                    ),
+                ): _sensor(),
+                vol.Optional(CONF_ENERGY_ENTITY): _sensor(),
+                vol.Optional(CONF_WATER_ENTITY): _sensor(),
+                vol.Optional(CONF_WRINKLE_ENTITY): _sensor("binary_sensor"),
+                required(CONF_ETA_INTERVAL, DEFAULT_ETA_INTERVAL): _eta_interval(),
+                required(
+                    CONF_PING_CLAIMANT_ON_COMPLETE, DEFAULT_PING_CLAIMANT_ON_COMPLETE
                 ): selector.BooleanSelector(),
             }
         )
@@ -357,39 +246,34 @@ class LaundryDiscordConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Create the options flow."""
         return LaundryDiscordOptionsFlow()
 
 
 class LaundryDiscordOptionsFlow(OptionsFlow):
-    """Handle the options flow (ETA interval, completion ping)."""
+    """Handle the options flow (timings and house-wide features)."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        """Show and store the options."""
         if user_input is not None:
             return self.async_create_entry(
                 data={
                     CONF_ETA_INTERVAL: int(user_input[CONF_ETA_INTERVAL]),
                     CONF_CONFIRM_DELAY: int(user_input[CONF_CONFIRM_DELAY]),
                     CONF_ENERGY_IDLE: int(user_input[CONF_ENERGY_IDLE]),
-                    CONF_ENERGY_LOAD_JUMP: float(
-                        user_input[CONF_ENERGY_LOAD_JUMP]
-                    ),
+                    CONF_ENERGY_LOAD_JUMP: float(user_input[CONF_ENERGY_LOAD_JUMP]),
                     CONF_PING_CLAIMANT_ON_COMPLETE: user_input[
                         CONF_PING_CLAIMANT_ON_COMPLETE
                     ],
-                    CONF_AVAILABILITY_GRACE: int(
-                        user_input[CONF_AVAILABILITY_GRACE]
-                    ),
-                    CONF_HANDOFF_FALLBACK: int(
-                        user_input[CONF_HANDOFF_FALLBACK]
-                    ),
+                    CONF_AVAILABILITY_GRACE: int(user_input[CONF_AVAILABILITY_GRACE]),
+                    CONF_HANDOFF_FALLBACK: int(user_input[CONF_HANDOFF_FALLBACK]),
                     CONF_QUEUE_EXPIRY: int(user_input[CONF_QUEUE_EXPIRY]),
                     CONF_SHOW_ASSISTANT: user_input[CONF_SHOW_ASSISTANT],
                     CONF_LEARN_HABITS: user_input[CONF_LEARN_HABITS],
                     CONF_REMIND_DMS: user_input[CONF_REMIND_DMS],
-                    # The select hands back a string; stored as the int the
-                    # weekday actually is, so nothing downstream has to parse it.
+                    # The select returns a string; store the weekday as an int.
                     CONF_PLAN_DM_WEEKDAY: int(user_input[CONF_PLAN_DM_WEEKDAY]),
                     CONF_PLAN_DM_TIME: str(user_input[CONF_PLAN_DM_TIME]),
                     CONF_NUDGE_LEAD: int(user_input[CONF_NUDGE_LEAD]),

@@ -1,35 +1,27 @@
 """Buttons for the Laundry Discord Bot integration.
 
-The service calls, as entities. They exist so the things somebody actually
-needs mid-incident — "is it stuck", "unstick it", "pick up the load you
-missed", "does Discord still work" — are one tap on a dashboard rather than
-Developer Tools, YAML mode and a remembered action name. Nothing here is new
-behaviour; each button is the service it names.
-
-``reset_session`` is deliberately **not** given a confirmation dialog: HA's
-button platform has no such thing, and the action it runs is already the safe
-one (it announces nothing and pings nobody). The dangerous button would be one
-that posts.
+Each button runs the action of the same name, so the manual escape hatches are
+one tap on a dashboard.
 """
 
 from __future__ import annotations
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from .coordinator import LaundryConfigEntry
 from .entity import LaundryEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: LaundryConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up the laundry buttons."""
+    coordinator = entry.runtime_data
     async_add_entities(
         [
             LaundryTestPostButton(coordinator, entry),
@@ -41,10 +33,9 @@ async def async_setup_entry(
 
 
 class LaundryTestPostButton(LaundryEntity, ButtonEntity):
-    """Post a sample card, to prove the whole Discord path still works."""
+    """Post a sample card to prove the Discord path works."""
 
-    _attr_name = "Laundry Test Post"
-    _attr_icon = "mdi:message-text-outline"
+    _attr_translation_key = "test_post"
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator, entry) -> None:
@@ -56,10 +47,9 @@ class LaundryTestPostButton(LaundryEntity, ButtonEntity):
 
 
 class LaundryResetSessionButton(LaundryEntity, ButtonEntity):
-    """Force-close a wedged session. Announces nothing, pings nobody."""
+    """Force-close a stuck session. Announces nothing, pings nobody."""
 
-    _attr_name = "Laundry Reset Session"
-    _attr_icon = "mdi:restart-alert"
+    _attr_translation_key = "reset_session"
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator, entry) -> None:
@@ -71,19 +61,9 @@ class LaundryResetSessionButton(LaundryEntity, ButtonEntity):
 
 
 class LaundryTrackLoadButton(LaundryEntity, ButtonEntity):
-    """Pick up a load that is running now but that the bot never noticed.
+    """Start tracking a load the bot missed. Posts a real card."""
 
-    The counterpart to Reset Session, and the one this dashboard was missing.
-    Detection fails in both directions on this machine, but only the invented
-    load had a button; a *missed* load left nothing to press and no path back
-    except waiting for the next one.
-
-    It posts a real card, so unlike Reset Session this button is visible to the
-    house — which is the point of pressing it.
-    """
-
-    _attr_name = "Laundry Track Load"
-    _attr_icon = "mdi:washing-machine-alert"
+    _attr_translation_key = "track_load"
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator, entry) -> None:
@@ -95,15 +75,9 @@ class LaundryTrackLoadButton(LaundryEntity, ButtonEntity):
 
 
 class LaundryDiagnosticsButton(LaundryEntity, ButtonEntity):
-    """Re-run the health checks now, rather than waiting for the 5-minute tick.
+    """Re-run the health checks now instead of waiting for the 5-minute tick."""
 
-    The findings land on ``sensor.laundry_health``; this only refreshes them.
-    Useful because the one finding that asks you to "run it again in a few
-    minutes" is otherwise a five-minute wait.
-    """
-
-    _attr_name = "Laundry Run Diagnostics"
-    _attr_icon = "mdi:stethoscope"
+    _attr_translation_key = "run_diagnostics"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator, entry) -> None:

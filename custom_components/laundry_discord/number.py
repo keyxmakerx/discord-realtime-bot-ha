@@ -1,25 +1,15 @@
-"""The bot's timing knobs, as adjustable entities.
+"""The bot's timing options as number entities.
 
-Everything here was already configurable through the options flow; this makes
-the same values readable and settable from a dashboard, which matters because
-the ones worth touching are the ones you want to touch *while something is
-going wrong* — and the options flow is four clicks and a modal away from the
-card telling you something is wrong.
-
-**Changing one reloads the integration.** Writing to ``entry.options`` fires the
-update listener, exactly as the options flow does, and the reload is what makes
-the new value reach the detector (which is built with its thresholds) rather
-than only the config dict. That means a brief Discord reconnect per change, so
-these are for tuning, not for automating against.
+Writing a value updates the config entry options, which reloads the
+integration (a brief Discord reconnect) exactly like the options flow does.
 """
 
 from __future__ import annotations
 
-from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
+from homeassistant.components.number import NumberDeviceClass, NumberEntity, NumberMode
+from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
     CONF_AVAILABILITY_GRACE,
@@ -34,53 +24,66 @@ from .const import (
     DEFAULT_ENERGY_LOAD_JUMP,
     DEFAULT_HANDOFF_FALLBACK,
     DEFAULT_QUEUE_EXPIRY,
-    DOMAIN,
+    MAX_AVAILABILITY_GRACE,
+    MAX_CONFIRM_DELAY,
+    MAX_ENERGY_IDLE,
+    MAX_ENERGY_LOAD_JUMP,
+    MAX_HANDOFF_FALLBACK,
+    MAX_QUEUE_EXPIRY,
+    MIN_AVAILABILITY_GRACE,
+    MIN_CONFIRM_DELAY,
+    MIN_ENERGY_IDLE,
+    MIN_ENERGY_LOAD_JUMP,
+    MIN_HANDOFF_FALLBACK,
+    MIN_QUEUE_EXPIRY,
 )
+from .coordinator import LaundryConfigEntry
 from .entity import LaundryEntity
 
-# key, default, name, icon, min, max, step, unit, whole numbers only
+# Option key (also the translation key), default, min, max, step, unit, device
+# class, whole numbers only. The limits match the options flow.
 _NUMBERS = (
     (
         CONF_ENERGY_IDLE, DEFAULT_ENERGY_IDLE,
-        "Laundry Flat Meter Timeout", "mdi:timer-sand",
-        5, 240, 5, "min", True,
+        MIN_ENERGY_IDLE, MAX_ENERGY_IDLE, 5,
+        UnitOfTime.MINUTES, NumberDeviceClass.DURATION, True,
     ),
     (
         CONF_CONFIRM_DELAY, DEFAULT_CONFIRM_DELAY,
-        "Laundry Confirm Delay", "mdi:timer-outline",
-        5, 300, 5, "s", True,
+        MIN_CONFIRM_DELAY, MAX_CONFIRM_DELAY, 5,
+        UnitOfTime.SECONDS, NumberDeviceClass.DURATION, True,
     ),
     (
         CONF_ENERGY_LOAD_JUMP, DEFAULT_ENERGY_LOAD_JUMP,
-        "Laundry Load Jump Threshold", "mdi:flash",
-        0.05, 2.0, 0.05, "kWh", False,
+        MIN_ENERGY_LOAD_JUMP, MAX_ENERGY_LOAD_JUMP, 0.1,
+        UnitOfEnergy.KILO_WATT_HOUR, NumberDeviceClass.ENERGY, False,
     ),
     (
         CONF_HANDOFF_FALLBACK, DEFAULT_HANDOFF_FALLBACK,
-        "Laundry Handoff Fallback", "mdi:account-clock",
-        5, 120, 5, "min", True,
+        MIN_HANDOFF_FALLBACK, MAX_HANDOFF_FALLBACK, 5,
+        UnitOfTime.MINUTES, NumberDeviceClass.DURATION, True,
     ),
     (
         CONF_QUEUE_EXPIRY, DEFAULT_QUEUE_EXPIRY,
-        "Laundry Queue Expiry", "mdi:account-multiple-remove",
-        1, 48, 1, "h", True,
+        MIN_QUEUE_EXPIRY, MAX_QUEUE_EXPIRY, 1,
+        UnitOfTime.HOURS, NumberDeviceClass.DURATION, True,
     ),
     (
         CONF_AVAILABILITY_GRACE, DEFAULT_AVAILABILITY_GRACE,
-        "Laundry Availability Grace", "mdi:cloud-question",
-        1, 60, 1, "min", True,
+        MIN_AVAILABILITY_GRACE, MAX_AVAILABILITY_GRACE, 1,
+        UnitOfTime.MINUTES, NumberDeviceClass.DURATION, True,
     ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: LaundryConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up the option numbers."""
     async_add_entities(
-        LaundryOptionNumber(coordinator, entry, *row) for row in _NUMBERS
+        LaundryOptionNumber(entry.runtime_data, entry, *row) for row in _NUMBERS
     )
 
 
@@ -91,26 +94,23 @@ class LaundryOptionNumber(LaundryEntity, NumberEntity):
     _attr_mode = NumberMode.BOX
 
     def __init__(
-        self, coordinator, entry, key, default, name, icon,
-        minimum, maximum, step, unit, whole,
+        self, coordinator, entry, key, default,
+        minimum, maximum, step, unit, device_class, whole,
     ) -> None:
         super().__init__(coordinator, entry)
         self._key = key
         self._default = default
         self._whole = whole
-        self._attr_name = name
-        self._attr_icon = icon
+        self._attr_translation_key = key
         self._attr_native_min_value = minimum
         self._attr_native_max_value = maximum
         self._attr_native_step = step
         self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
         self._attr_unique_id = f"{entry.entry_id}_number_{key}"
 
     @property
     def native_value(self) -> float:
-        # entry.data is the original setup; options override it. Same merge the
-        # coordinator does, read live so the value survives a reload without
-        # this entity needing its own copy of the config.
         merged = {**self._entry.data, **self._entry.options}
         try:
             return float(merged.get(self._key, self._default))

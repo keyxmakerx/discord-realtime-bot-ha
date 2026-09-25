@@ -1,0 +1,92 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "waiting": {
+        "default": "mdi:basket-unfill"
+      }
+    },
+    "button": {
+      "test_post": {
+        "default": "mdi:message-text-outline"
+      },
+      "reset_session": {
+        "default": "mdi:restart-alert"
+      },
+      "track_load": {
+        "default": "mdi:washing-machine-alert"
+      },
+      "run_diagnostics": {
+        "default": "mdi:stethoscope"
+      }
+    },
+    "number": {
+      "energy_idle": {
+        "default": "mdi:timer-sand"
+      },
+      "confirm_delay": {
+        "default": "mdi:timer-outline"
+      },
+      "energy_load_jump": {
+        "default": "mdi:flash"
+      },
+      "handoff_fallback": {
+        "default": "mdi:account-clock"
+      },
+      "queue_expiry": {
+        "default": "mdi:account-multiple-remove"
+      },
+      "availability_grace": {
+        "default": "mdi:cloud-question"
+      }
+    },
+    "sensor": {
+      "claimed_by": {
+        "default": "mdi:account-check"
+      },
+      "stage": {
+        "default": "mdi:washing-machine"
+      },
+      "connection_health": {
+        "default": "mdi:wifi-alert"
+      },
+      "health": {
+        "default": "mdi:heart-pulse",
+        "state": {
+          "warning": "mdi:alert",
+          "problem": "mdi:heart-broken"
+        }
+      }
+    },
+    "switch": {
+      "ping_claimant_on_complete": {
+        "default": "mdi:bell-ring"
+      },
+      "show_assistant": {
+        "default": "mdi:robot"
+      },
+      "learn_habits": {
+        "default": "mdi:brain"
+      },
+      "remind_dms": {
+        "default": "mdi:email-outline"
+      },
+      "trades": {
+        "default": "mdi:swap-horizontal"
+      }
+    }
+  },
+  "services": {
+    "test_post": {
+      "service": "mdi:message-text-outline"
+    },
+    "reset_session": {
+      "service": "mdi:restart-alert"
+    },
+    "track_load": {
+      "service": "mdi:washing-machine-alert"
+    },
+    "diagnostics": {
+      "service": "mdi:stethoscope"
+    }
+  }
+}

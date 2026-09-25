@@ -9,8 +9,11 @@
   "integration_type": "service",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/keyxmakerx/discord-realtime-bot-ha/issues",
+  "loggers": [
+    "discord"
+  ],
   "requirements": [
     "discord.py==2.7.1"
   ],
-  "version": "0.33.0"
+  "version": "0.34.0"
 }

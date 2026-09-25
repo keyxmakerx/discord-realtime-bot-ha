@@ -660,7 +660,7 @@ class LaundryCoordinator:
         # busy after the fifth. This is the one call every one of them already
         # makes, so it cannot be the one somebody forgets.
         self._publish_running()
-        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
+        async_dispatcher_send(self.hass, f"{SIGNAL_UPDATE}_{self.entry.entry_id}")
 
     # ---------------------------------------------------------- state handlers
     def _machine_state(self) -> str | None:
@@ -2548,3 +2548,6 @@ class LaundryCoordinator:
                 unit = self._entity_unit(self.water_entity) or "L"
                 parts.append(f"💧 {used:.0f} {unit}")
         return " · ".join(parts) if parts else None
+
+
+type LaundryConfigEntry = ConfigEntry[LaundryCoordinator]

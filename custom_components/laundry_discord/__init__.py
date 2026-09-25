@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
 
 from . import diagnose as diagnose_mod
@@ -17,174 +25,132 @@ from .const import (
     SERVICE_TEST_POST,
     SERVICE_TRACK_LOAD,
 )
-from .coordinator import LaundryCoordinator
+from .coordinator import LaundryConfigEntry, LaundryCoordinator
 from .reminders import LaundryReminders
 
 _LOGGER = logging.getLogger(__name__)
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the integration's actions."""
+    _async_register_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: LaundryConfigEntry) -> bool:
     """Set up Laundry Discord Bot from a config entry."""
     coordinator = LaundryCoordinator(hass, entry)
     await coordinator.async_setup()
+    entry.runtime_data = coordinator
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-
-    # The reminder DMs (design doc §10) — the only part of this integration that
-    # contacts somebody unprompted, and the only one that is off by default.
-    # Set up here rather than inside the coordinator so the dependency stays one
-    # way: the reminder loop reads the session state and subscribes to a signal,
-    # and the state machine knows nothing about it. async_setup() returns
-    # immediately when the option is off, having registered nothing.
+    # The reminder DMs. Registers nothing while the option is off.
     reminders = LaundryReminders(hass, entry, coordinator)
     await reminders.async_setup()
     entry.async_on_unload(reminders.shutdown)
 
-    # Run the gateway as a background task tied to this entry; it is cancelled
-    # automatically on unload. async_run_bot swallows errors so HA stays up.
+    # The gateway runs as a background task tied to the entry; async_run_bot
+    # swallows errors so a bot failure can't take HA down.
     entry.async_create_background_task(
         hass, coordinator.async_run_bot(), f"{DOMAIN}_bot"
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    _async_register_services(hass)
-
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: LaundryConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    coordinator: LaundryCoordinator | None = hass.data.get(DOMAIN, {}).get(
-        entry.entry_id
-    )
-    if coordinator is not None:
-        await coordinator.async_shutdown()
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-        if not hass.data[DOMAIN]:
-            hass.data.pop(DOMAIN, None)
-            for service in (
-                SERVICE_TEST_POST,
-                SERVICE_RESET_SESSION,
-                SERVICE_DIAGNOSTICS,
-                SERVICE_TRACK_LOAD,
-            ):
-                if hass.services.has_service(DOMAIN, service):
-                    hass.services.async_remove(DOMAIN, service)
-
+    await entry.runtime_data.async_shutdown()
     return unload_ok
 
 
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when options change."""
+async def _async_update_listener(
+    hass: HomeAssistant, entry: LaundryConfigEntry
+) -> None:
+    """Reload when options change (options flow, number or switch entities)."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _loaded_entries(hass: HomeAssistant) -> list[LaundryConfigEntry]:
+    """Every loaded entry, or a user-facing error if there are none."""
+    entries = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if not entries:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_loaded"
+        )
+    return entries
+
+
 def _async_register_services(hass: HomeAssistant) -> None:
-    """Register the debug + escape-hatch services (once each)."""
+    """Register the debug and escape-hatch actions. Each runs on every entry."""
 
     async def _handle_test_post(call: ServiceCall) -> None:
-        coordinators = list(hass.data.get(DOMAIN, {}).values())
-        if not coordinators:
-            _LOGGER.warning("test_post called but no Laundry Discord entry is loaded")
-            return
-        for coordinator in coordinators:
-            await coordinator.async_test_post()
+        for entry in _loaded_entries(hass):
+            await entry.runtime_data.async_test_post()
 
     async def _handle_reset_session(call: ServiceCall) -> None:
-        # No complaint when nothing is loaded: this is the button somebody
-        # reaches for when they already believe something is wrong, and it is
-        # idempotent — calling it against an idle session is a no-op by
-        # construction rather than an error to explain.
-        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
-            await coordinator.async_reset_session()
+        for entry in _loaded_entries(hass):
+            await entry.runtime_data.async_reset_session()
 
     async def _handle_track_load(call: ServiceCall) -> None:
-        # Silent when nothing is loaded, and silent when a session is already
-        # being tracked, for the same reason reset_session is: this is pressed
-        # by somebody who has already decided the bot is wrong about the
-        # washer, and the coordinator's own guard is the honest place for that
-        # judgement. It deliberately does not override an existing session —
-        # reset_session first if the bot is tracking the wrong load.
-        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
-            await coordinator.async_track_current_load()
+        # Does nothing if a load is already tracked; reset_session first.
+        for entry in _loaded_entries(hass):
+            await entry.runtime_data.async_track_current_load()
 
-    async def _handle_diagnostics(call: ServiceCall) -> dict:
-        """Answer "is it stuck, is it lying" without reading a storage file.
+    async def _handle_diagnostics(call: ServiceCall) -> ServiceResponse:
+        """Return the health findings as response data.
 
-        Returns **response data** rather than logging, because the log is
-        exactly where this was unreachable: every line in this integration is
-        debug, so a household at the default level sees nothing from it even
-        while it misbehaves six times in a morning. Response data shows up in
-        Developer Tools the moment the action is run, needs no logger config
-        and no restart, and can be read by an automation that wants to alert on
-        a wedge.
-
-        Never raises. Somebody runs this *because* something is already wrong,
-        and an action that fails with a traceback at that moment is worse than
-        useless — so a coordinator that cannot answer is reported as an entry
-        in the result rather than aborting the whole call.
+        A coordinator that can't be read is reported as an entry rather than
+        failing the call: this runs when something is already wrong.
         """
         now = dt_util.utcnow().timestamp()
-        entries = []
-        for entry_id, coordinator in list(hass.data.get(DOMAIN, {}).items()):
+        results = []
+        for entry in _loaded_entries(hass):
             try:
-                snap = coordinator.diagnostic_snapshot()
+                snap = entry.runtime_data.diagnostic_snapshot()
                 findings = diagnose_mod.check(
                     snap["session"],
                     now,
                     watched=snap["watched"],
                     max_session_minutes=snap["config"]["max_session_minutes"],
                 )
-                entries.append({
-                    "entry_id": entry_id,
+                results.append({
+                    "entry_id": entry.entry_id,
                     "summary": diagnose_mod.summarise(findings),
                     "findings": findings,
                     "state": snap,
                 })
-            except Exception as err:  # noqa: BLE001 - see the docstring
-                _LOGGER.exception("Diagnostics failed for entry %s", entry_id)
-                entries.append({
-                    "entry_id": entry_id,
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception("Diagnostics failed for entry %s", entry.entry_id)
+                results.append({
+                    "entry_id": entry.entry_id,
                     "summary": f"could not be read: {type(err).__name__}",
                     "findings": [],
                     "state": {},
                 })
-        if not entries:
-            return {"summary": "no Laundry Discord entry is loaded", "entries": []}
         return {
-            "summary": entries[0]["summary"] if len(entries) == 1 else (
-                diagnose_mod.summarise_entries(entries)
+            "summary": results[0]["summary"] if len(results) == 1 else (
+                diagnose_mod.summarise_entries(results)
             ),
-            "entries": entries,
+            "entries": results,
         }
 
-    # Checked per service rather than once: an upgrade that adds a service
-    # registers it into a running HA where the old one already exists, and an
-    # early return on the first would leave the new one missing until a restart.
-    if not hass.services.has_service(DOMAIN, SERVICE_TEST_POST):
-        hass.services.async_register(DOMAIN, SERVICE_TEST_POST, _handle_test_post)
-    if not hass.services.has_service(DOMAIN, SERVICE_RESET_SESSION):
-        hass.services.async_register(
-            DOMAIN, SERVICE_RESET_SESSION, _handle_reset_session
-        )
-    if not hass.services.has_service(DOMAIN, SERVICE_TRACK_LOAD):
-        hass.services.async_register(DOMAIN, SERVICE_TRACK_LOAD, _handle_track_load)
-    if not hass.services.has_service(DOMAIN, SERVICE_DIAGNOSTICS):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DIAGNOSTICS,
-            _handle_diagnostics,
-            # OPTIONAL, not ONLY. ONLY reads as the natural choice for an
-            # action whose entire product is its answer — and it makes a bare
-            # `hass.services.async_call` from a script or automation hard-fail
-            # with a ValueError on the running HA. Somebody wiring "run
-            # diagnostics nightly" without capturing the response should get a
-            # no-op, not an error in the log of the very tool meant to keep
-            # the log clean. Developer Tools shows the response either way.
-            supports_response=SupportsResponse.OPTIONAL,
-        )
+    hass.services.async_register(DOMAIN, SERVICE_TEST_POST, _handle_test_post)
+    hass.services.async_register(DOMAIN, SERVICE_RESET_SESSION, _handle_reset_session)
+    hass.services.async_register(DOMAIN, SERVICE_TRACK_LOAD, _handle_track_load)
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DIAGNOSTICS,
+        _handle_diagnostics,
+        # OPTIONAL rather than ONLY, so a script can call it without capturing
+        # the response.
+        supports_response=SupportsResponse.OPTIONAL,
+    )
