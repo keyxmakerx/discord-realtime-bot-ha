@@ -64,8 +64,9 @@ Cloud-connected washers report late, freeze, and replay old values when they
 reconnect, so the bot combines signals by how far each can be trusted:
 
 - **Start:** the washer's job state entering an early phase (`weight_sensing`,
-  `wash`) and holding for the confirm delay. A phase that arrives straight after
-  a reconnect only counts once the energy meter agrees.
+  `wash`) and holding for the confirm delay. The washer drops offline when it's
+  switched off, so a phase that arrives as it comes back needs a fresh finish
+  time from the washer (or the energy meter) to confirm it isn't a replay.
 - **Finish:** job state `finish`, or the washer's own completion estimate having
   passed with the energy meter flat for a short settle. Only an estimate
   published during the current cycle counts.

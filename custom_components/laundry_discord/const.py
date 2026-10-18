@@ -49,6 +49,9 @@ MACHINE_STOP = "stop"
 
 # Phases that mean a load is already well underway (a mid-cycle catch-up).
 MIDCYCLE_PHASES = {"rinse", "spin", "drying", "finish"}
+# A finish time this far ahead, newly published, proves a cycle just started:
+# enough to trust an early phase that came back with the washer.
+FRESH_ETA_LEAD_S = 600
 
 # --- Tunables: default / min / max ---
 # Seconds between ETA/progress edits of the live card.

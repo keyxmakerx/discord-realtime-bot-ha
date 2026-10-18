@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
@@ -25,6 +25,7 @@ from custom_components.laundry_discord import const  # noqa: E402
 from custom_components.laundry_discord import discord_bot as bot_mod  # noqa: E402
 from custom_components.laundry_discord import diagnose  # noqa: E402
 from custom_components.laundry_discord.detect import EnergyDetector  # noqa: E402
+from homeassistant.util import dt as dt_util  # noqa: E402
 
 
 def _run(coro):
@@ -201,6 +202,10 @@ def _coordinator(**state):
     c._handoff_unsub = None
     c._empty_unsub = None
     c.empty_reminded = False
+    c._catchup_armed = False
+    c._start_held = False
+    c._eta_prev = None
+    c._fresh_eta_ts = None
     c.__dict__.update(state)
     # Stubbed: a Store write, dispatcher send, and Discord embed - not what
     # these tests check.
@@ -719,6 +724,112 @@ _ENTITY_CFG = {
     const.CONF_JOB_STATE_ENTITY: const.DEFAULT_JOB_STATE_ENTITY,
     const.CONF_ETA_ENTITY: const.DEFAULT_ETA_ENTITY,
 }
+
+
+def _wired(stage=const.STAGE_DONE_WAITING, kwh=15.2):
+    """A coordinator whose real detector is fed by stubbed sensor reads.
+
+    Returns it with the meter and phase it reads, and the sessions it opened.
+    """
+    c = _coordinator(stage=stage)
+    c._cfg = dict(_ENTITY_CFG)
+    c._flap_times = []
+    c._job_from_flap = False
+    c._flap_recovery_ts = None
+    c._schedule_job_confirm = lambda: None
+    c._detector.start_jump = const.DEFAULT_ENERGY_LOAD_JUMP
+    c._detector.idle_energy = c._detector.last_energy = kwh
+    meter = {"kwh": kwh}
+    phase = {"job": "none"}
+    c._job_phase = lambda: phase["job"]
+    c._entity_float = lambda _entity: meter["kwh"]
+    c._track_offline = lambda: None
+    c._eta_status = lambda: (False, False)
+    c._wrinkle_active = lambda: False
+    c._machine_state = lambda: None
+    c._meter_reported_this_session = lambda: True
+    opened: list = []
+
+    def _task(coro):
+        if coro.__name__ == "_async_start_session":
+            opened.append(phase["job"])
+        coro.close()
+
+    c._create_task = _task
+    return c, meter, phase, opened
+
+
+def _settle(c, phase, old, new) -> None:
+    phase["job"] = new
+    c._on_job_state(_Ev(old, new))
+    c._async_job_confirmed()
+
+
+def test_a_meter_rise_after_a_mid_cycle_phase_starts_the_missed_load() -> None:
+    # 2026-10-18: the wash came back with the washer, so it couldn't fast-start;
+    # rinse settled at 08:21 with the meter still at the last load's reading,
+    # and the meter's 0.1 kWh step at 08:30 was ignored until the next phase.
+    c, meter, phase, opened = _wired()
+    _settle(c, phase, "wash", "rinse")
+    assert opened == [] and c._catchup_armed
+    meter["kwh"] = 15.3
+    c._on_energy(_Ev("15.2", "15.3"))
+    assert opened == ["rinse"]
+    assert not c._catchup_armed, "starting a session disarms it"
+
+
+def test_a_phase_left_over_from_a_tracked_load_cannot_start_another() -> None:
+    # A load can finish with job_state stuck mid-cycle (the cloud lags); a late
+    # meter batch afterwards must not read as a new load.
+    c, meter, phase, opened = _wired(stage=const.STAGE_WASHING)
+    _settle(c, phase, "rinse", "spin")
+    assert not c._catchup_armed, "never armed while a load is tracked"
+    c.stage = const.STAGE_DONE_WAITING
+    meter["kwh"] = 15.3
+    c._on_energy(_Ev("15.2", "15.3"))
+    assert opened == []
+    # Idle with no mid-cycle phase at all: a 0.1 kWh step is still nothing.
+    c, meter, phase, opened = _wired()
+    _settle(c, phase, "rinse", "none")
+    meter["kwh"] = 15.3
+    c._on_energy(_Ev("15.2", "15.3"))
+    assert opened == [] and not c._catchup_armed
+
+
+def test_a_fresh_finish_time_confirms_a_phase_that_came_back_with_the_washer() -> None:
+    old = "2026-10-17T15:00:00+00:00"  # the last load's finish time
+    soon = (dt_util.utcnow() + timedelta(minutes=5)).isoformat()
+    future = (dt_util.utcnow() + timedelta(hours=3)).isoformat()
+
+    c, _meter, phase, opened = _wired()
+    c._eta_prev = old
+    _settle(c, phase, "unavailable", "wash")
+    assert opened == [] and c._start_held, "a reconnect's phase alone is held"
+    c._on_eta(_Ev("unavailable", old))  # the reconnect re-publishing it
+    c._on_eta(_Ev(old, soon))  # new, but too close to be a cycle starting
+    assert opened == []
+    c._on_eta(_Ev(soon, future))
+    assert opened == ["wash"] and not c._start_held
+
+    # The finish time can land first, in the same reconnect.
+    c, _meter, phase, opened = _wired()
+    c._eta_prev = old
+    phase["job"] = "wash"
+    c._on_job_state(_Ev("unavailable", "wash"))
+    c._on_eta(_Ev(old, future))
+    c._async_job_confirmed()
+    assert opened == ["wash"]
+
+    # One published before the washer went away proves nothing about now.
+    c, _meter, phase, opened = _wired()
+    c._fresh_eta_ts = dt_util.utcnow().timestamp() - 3600
+    _settle(c, phase, "unavailable", "wash")
+    assert opened == [] and c._start_held
+
+    # And with the cloud up throughout, the phase alone still fast-starts.
+    c, _meter, phase, opened = _wired()
+    _settle(c, phase, "none", "wash")
+    assert opened == ["wash"] and not c._start_held
 
 
 class _FakeInteraction:
