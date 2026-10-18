@@ -616,6 +616,27 @@ def test_the_diagnostic_snapshot_is_reachable_and_serialisable() -> None:
     assert isinstance(findings, list)
 
 
+def test_a_health_recheck_reaches_the_sensor() -> None:
+    # The re-check button recomputed health but never told the sensor, so the
+    # card kept "not checked yet" until the next 5-minute tick.
+    c = _coordinator()
+    c._cfg = dict(_ENTITY_CFG)
+    c._flap_times = []
+    pushed = []
+    c._notify_entities = lambda: pushed.append(c.health["summary"])
+    assert c.health["summary"] == "not checked yet"
+    c.refresh_health()
+    assert pushed and pushed[-1] != "not checked yet"
+    # A failing check still pushes its placeholder, not silence.
+    c.diagnostic_snapshot = lambda: 1 / 0
+    logging.disable(logging.CRITICAL)
+    try:
+        c.refresh_health()
+    finally:
+        logging.disable(logging.NOTSET)
+    assert pushed[-1] == "the health check itself failed — see the log"
+
+
 def test_attribute_churn_cannot_hand_a_replayed_phase_the_fast_start() -> None:
     # HA fires state_changed for attribute-only updates too; those must not
     # overwrite _job_from_flap and re-arm the debounce for a replayed phase.
