@@ -66,6 +66,7 @@ from .const import (
     MAX_SESSION_MINUTES,
     OFFLINE_COMPLETE_GRACE_MINUTES,
     OFFLINE_NOTICE_MINUTES,
+    FRESH_ETA_LEAD_S,
     MIDCYCLE_PHASES,
     PROGRESS_PHASES,
     UNAVAILABLE_STATES,
@@ -180,6 +181,15 @@ class LaundryCoordinator:
         # When the last unavailable recovery happened. Kept separately from the flag
         # above, which an intermediate value or attribute churn can launder or stomp.
         self._flap_recovery_ts = None
+        # A mid-cycle phase settled while no load was tracked, so a later meter
+        # rise can still start the catch-up. Cleared when a session starts, so a
+        # phase left over from a tracked load can never arm it.
+        self._catchup_armed = False
+        # An early phase came back with the washer (it reconnects when switched
+        # on), so its fast start waits for a fresh finish time or the meter.
+        self._start_held = False
+        self._eta_prev: str | None = None  # last real ETA value; a replay repeats it
+        self._fresh_eta_ts: float | None = None  # when a new future ETA was published
         # Stop-confirm timer, separate from the job_state one: both can be in flight
         # together at load end, and neither may disarm the other.
         self._stop_confirm_unsub = None
@@ -392,6 +402,14 @@ class LaundryCoordinator:
         self._unsubs.append(
             async_track_state_change_event(
                 self.hass, [self.energy_entity], self._on_energy
+            )
+        )
+        eta = self.hass.states.get(self.eta_entity)
+        if eta is not None and eta.state not in UNAVAILABLE_STATES | {""}:
+            self._eta_prev = eta.state
+        self._unsubs.append(
+            async_track_state_change_event(
+                self.hass, [self.eta_entity], self._on_eta
             )
         )
         # 5-minute heartbeat; see _async_health_tick.
@@ -854,7 +872,7 @@ class LaundryCoordinator:
             and phase not in MIDCYCLE_PHASES
         )
         is_catchup = (
-            allow_catchup
+            (allow_catchup or self._catchup_armed)
             and phase in MIDCYCLE_PHASES
             and phase != JOB_STATE_FINISH
         )
@@ -887,6 +905,7 @@ class LaundryCoordinator:
         """A load began. Decide normal vs self-clean and open a session."""
         if self.stage in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
             return  # already tracking (shouldn't happen; detector is deduped)
+        self._catchup_armed = self._start_held = False
         # A real phase: normal load. No phase but running with job stuck at
         # 'none': self-clean. Otherwise: an offline catch-up load.
         if phase in REAL_PHASES:
@@ -913,6 +932,35 @@ class LaundryCoordinator:
         if event.data.get("new_state") is None:
             return
         self._feed_detector()
+
+    @callback
+    def _on_eta(self, event: Event) -> None:
+        """Note a fresh finish time; it confirms a start held after a reconnect.
+
+        Fresh means a new value at least `FRESH_ETA_LEAD_S` ahead. A reconnect
+        re-publishes the value from before the gap, and a replayed load's ETA
+        is that old value too, so neither counts.
+        """
+        new = event.data.get("new_state")
+        if new is None or new.state in UNAVAILABLE_STATES | {""}:
+            return
+        prev, self._eta_prev = self._eta_prev, new.state
+        if prev is None or new.state == prev:
+            return
+        target = dt_util.parse_datetime(new.state)
+        if target is None:
+            return
+        if target.tzinfo is None:
+            target = dt_util.as_utc(target)
+        now = dt_util.utcnow()
+        if (target - now).total_seconds() < FRESH_ETA_LEAD_S:
+            return
+        self._fresh_eta_ts = now.timestamp()
+        if self._start_held and self.stage not in (
+            STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN
+        ):
+            _LOGGER.debug("Detector: a fresh finish time confirms the held start")
+            self._feed_detector(allow_early=True, allow_catchup=True)
 
     @callback
     def _on_running(self, event: Event) -> None:
@@ -1040,10 +1088,30 @@ class LaundryCoordinator:
         if job is None:
             return  # not settled to a real value yet
 
-        # allow_early is suppressed for a flap-arrived value: debouncing proves
-        # settled, not new. allow_catchup stays on regardless, since it requires
-        # the meter to have moved since idle.
-        self._feed_detector(allow_early=not from_flap, allow_catchup=True)
+        # allow_early is suppressed for a flap-arrived value (debouncing proves
+        # settled, not new) unless a fresh finish time was published since the
+        # reconnect. allow_catchup stays on regardless, since it requires the
+        # meter to have moved since idle.
+        early = job in REAL_PHASES and job not in MIDCYCLE_PHASES
+        fresh_eta = (
+            early
+            and self._fresh_eta_ts is not None
+            and self._flap_recovery_ts is not None
+            # Both can come back in the same reconnect, in either order.
+            and self._fresh_eta_ts >= self._flap_recovery_ts - 60
+        )
+        if self.stage not in (STAGE_WASHING, STAGE_DRYING, STAGE_SELF_CLEAN):
+            self._catchup_armed = (
+                job in MIDCYCLE_PHASES and job != JOB_STATE_FINISH
+            )
+            self._start_held = from_flap and early and not fresh_eta
+            if self._start_held:
+                _LOGGER.debug(
+                    "Detector: '%s' arrived as the washer came back online; "
+                    "holding the start for a fresh finish time or the meter",
+                    job,
+                )
+        self._feed_detector(allow_early=not from_flap or fresh_eta, allow_catchup=True)
 
         if job == JOB_STATE_FINISH:
             self._last_real_phase = JOB_STATE_FINISH
@@ -1898,6 +1966,7 @@ class LaundryCoordinator:
         await self._async_start_session(offline=True)
         if self.stage not in (STAGE_WASHING, STAGE_DRYING):
             return False  # the post failed and rolled itself back
+        self._catchup_armed = self._start_held = False
         # Order matters: `_async_start_session` can fail and restore stage to idle.
         # Seeding the detector first would leave it ACTIVE against an idle session,
         # refusing every real load after (the wedge `diagnose` reports).

@@ -18,6 +18,16 @@ none`, an energy step and a fresh `completion_time` in one batch at ~15:40 local
 for a cycle that ended at 14:29. `job_state` left a real phase, not
 `unavailable`, so the cloud was still holding a live phase 70 minutes late.
 
+**Events can also arrive in real time (2026-10-18).** A debug log of a morning
+load showed every SmartThings event reaching Home Assistant 0.06–0.19 s after
+the washer sent it, with progress every 10–30 s. Home Assistant marks every
+washer entity `unavailable` while the washer is offline, which includes whenever
+it's switched off, so each load's first phase arrives from `unavailable`, which
+looks the same as a replay. The washer publishes a new `completion_time` about
+two minutes after coming online, and that is what now confirms the start. The
+meter took 24 minutes to move; the bot had also only re-checked its mid-cycle
+catch-up when the phase changed, so that load went untracked past 08:50.
+
 **Energy resolution is coarse.** A full load is about 0.7 kWh and the meter
 reports in 0.1 kWh steps, so the default offline-load threshold (0.3 kWh) needs
 one sample carrying ~40% of a load.
