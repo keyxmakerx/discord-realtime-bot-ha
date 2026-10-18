@@ -412,6 +412,12 @@ class LaundryCoordinator:
                 self.hass, [self.eta_entity], self._on_eta
             )
         )
+        # First health check a minute in, so the card isn't blank until the
+        # first tick after every restart or settings change; the delay lets the
+        # washer's own entities load first.
+        self._unsubs.append(
+            async_call_later(self.hass, 60, self._async_first_health_check)
+        )
         # 5-minute heartbeat; see _async_health_tick.
         self._unsubs.append(
             async_track_time_interval(
@@ -420,13 +426,16 @@ class LaundryCoordinator:
         )
 
     @callback
+    def _async_first_health_check(self, _now) -> None:
+        self.refresh_health()
+
+    @callback
     def _async_health_tick(self, now) -> None:
         # Catches an offline load's energy jump while idle, drives time-based
         # completion with no state events, and keeps the health sensor fresh.
         self._feed_detector()
         self._check_time_completion()
-        self.refresh_health()
-        self._notify_entities()
+        self.refresh_health()  # also pushes every entity
 
     async def async_run_bot(self) -> None:
         """Background task body: run the gateway, never crash HA on failure."""
@@ -717,6 +726,7 @@ class LaundryCoordinator:
                 "summary": "the health check itself failed — see the log",
                 "findings": [],
             }
+        self._notify_entities()
 
     @property
     def health(self) -> dict:

@@ -145,7 +145,7 @@ reloads the integration and briefly reconnects the bot):
 | `sensor.laundry_stage` | `Idle`, `Washing`, `Drying`, `Done — waiting`, `Done — claimed` or `Self-clean`. Attributes `queue_count`, `queue`, `next_up` (the names are kept out of recorder history). |
 | `sensor.laundry_claimed_by` | The claimant, or `Unclaimed`. |
 | `binary_sensor.laundry_waiting` | On while a finished load is unclaimed. |
-| `sensor.laundry_health` | Worst diagnostics finding: `ok`, `note`, `warning` or `problem`, with the summary and findings as attributes. Refreshed every 5 minutes. |
+| `sensor.laundry_health` | Worst diagnostics finding: `ok`, `note`, `warning` or `problem`, with the summary and findings as attributes. Checked a minute after start-up, then every 5 minutes; the **Run diagnostics** button checks now. |
 | `sensor.laundry_connection_health` | Washer cloud drops in the last 24 h. |
 | `button.laundry_test_post`, `button.laundry_reset_session`, `button.laundry_track_load`, `button.laundry_run_diagnostics` | The actions below, one tap each. |
 | `number.laundry_*`, `switch.laundry_*` | The timing options and house-wide features. Changing one reloads the integration. |
