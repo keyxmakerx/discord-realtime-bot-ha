@@ -11,14 +11,14 @@ jobs:
     name: hassfest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: home-assistant/actions/hassfest@master
 
   hacs:
     name: HACS
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: hacs/action@main
         with:
           category: integration
@@ -29,12 +29,16 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          # Match the Python the latest Home Assistant requires; on an older one
+          # pip silently falls back to an ancient release that won't install.
+          python-version: "3.14"
       - name: Install dependencies
-        run: pip install homeassistant "discord.py==2.7.1"
+        # The floor is the integration's minimum (hacs.json), so a resolver
+        # fallback fails here instead of testing an unsupported version.
+        run: pip install "homeassistant>=2025.3" "discord.py==2.7.1"
       # Each test file is a standalone script.
       - name: Run tests
         run: |
