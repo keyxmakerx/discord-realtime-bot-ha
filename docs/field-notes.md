@@ -80,3 +80,13 @@ was well because every check asked whether a *tracked* load was real. Fixed in
 v0.33.0 with the `untracked_load_running` / `early_phase_while_idle` findings and
 the `track_load` action. Detection still can't start a load with a stuck meter:
 [#39](https://github.com/keyxmakerx/discord-realtime-bot-ha/issues/39).
+
+**The SmartThings connection stopped silently, then a reconnect read as a load
+(2026-10-30/31).** Around 21:50 Home Assistant stopped receiving SmartThings
+events with no error and nothing unavailable; the washer entities froze, so a new
+load at about 22:40 was invisible until the integration was reloaded at 22:48.
+That load's meter reported nothing for six hours. At 07:04:01 the washer came
+back online and every entity landed in the same second, the meter bringing the
+night's 3.3 kWh in one step; the jump was judged before "stopped" arrived and
+opened a card for a washer that was off. Fixed in v0.36.2: a reading that arrives
+with a reconnect waits `confirm_delay`, and `running` off also vetoes the jump.

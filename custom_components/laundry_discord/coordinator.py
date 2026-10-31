@@ -190,6 +190,7 @@ class LaundryCoordinator:
         self._start_held = False
         self._eta_prev: str | None = None  # last real ETA value; a replay repeats it
         self._fresh_eta_ts: float | None = None  # when a new future ETA was published
+        self._energy_settle_unsub = None  # a reconnect's meter reading, held to settle
         # Stop-confirm timer, separate from the job_state one: both can be in flight
         # together at load end, and neither may disarm the other.
         self._stop_confirm_unsub = None
@@ -460,6 +461,9 @@ class LaundryCoordinator:
         if self._job_confirm_unsub is not None:
             self._job_confirm_unsub()
             self._job_confirm_unsub = None
+        if self._energy_settle_unsub is not None:
+            self._energy_settle_unsub()
+            self._energy_settle_unsub = None
         self._cancel_stop_confirm()
         if self._selfclean_unsub is not None:
             self._selfclean_unsub()
@@ -899,7 +903,11 @@ class LaundryCoordinator:
             wrinkle_active=self._wrinkle_active(),
             has_eta=has_eta,
             eta_passed=eta_passed,
-            machine_idle=self._machine_state() == MACHINE_STOP,
+            # Either one saying idle vetoes an energy-jump start.
+            machine_idle=(
+                self._machine_state() == MACHINE_STOP
+                or self._running_state() is False
+            ),
             meter_reporting=self._meter_reported_this_session(),
         )
         if ev == EV_STARTED:
@@ -941,6 +949,28 @@ class LaundryCoordinator:
         """Energy is the primary signal — feed every reading to the detector."""
         if event.data.get("new_state") is None:
             return
+        old = event.data.get("old_state")
+        if self.confirm_delay > 0 and cancel_mod.is_flap(
+            old.state if old is not None else None
+        ):
+            # A reconnect delivers every entity at once, in no fixed order, and
+            # the meter often brings a whole load's batch. Judged at once, the
+            # jump can beat the "stopped" that should veto it.
+            self._schedule_energy_settle()
+            return
+        self._feed_detector()
+
+    @callback
+    def _schedule_energy_settle(self) -> None:
+        if self._energy_settle_unsub is not None:
+            self._energy_settle_unsub()
+        self._energy_settle_unsub = async_call_later(
+            self.hass, self.confirm_delay, self._async_energy_settled
+        )
+
+    @callback
+    def _async_energy_settled(self, _now=None) -> None:
+        self._energy_settle_unsub = None
         self._feed_detector()
 
     @callback
