@@ -71,7 +71,7 @@ reconnect, so the bot combines signals by how far each can be trusted:
   passed with the energy meter flat for a short settle. Only an estimate
   published during the current cycle counts.
 - **Fallbacks:** a single energy jump with no phase reported is a load that ran
-  while the washer was offline; a flat meter ends a load only when there is no
+  while the washer was offline, unless the washer says it's stopped; a flat meter ends a load only when there is no
   estimate; a 12-hour cap closes anything left.
 - **Stops:** a confirmed `stop` (or the running sensor turning off) mid-load ends
   it as stopped early.
@@ -183,6 +183,10 @@ editor**, paste the file, and adjust the entity ids if yours have a prefix.
   is dropping. If it says to re-run in a few minutes, do — the end of every load
   briefly looks inconsistent.
 - **Stuck card:** `reset_session`. **Missed load:** `track_load`.
+- **The washer's readings stop changing while the SmartThings app shows it
+  running:** Home Assistant's SmartThings connection can stop without an error.
+  Reload the SmartThings integration (Settings → Devices & services →
+  SmartThings → ⋮ → Reload).
 - **A DM never arrives:** the person has DMs from server members turned off. The
   bot falls back to a channel mention for pings and explains the fix the next
   time they open 🤖.

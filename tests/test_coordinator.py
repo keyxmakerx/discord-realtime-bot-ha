@@ -206,6 +206,7 @@ def _coordinator(**state):
     c._start_held = False
     c._eta_prev = None
     c._fresh_eta_ts = None
+    c._energy_settle_unsub = None
     c.__dict__.update(state)
     # Stubbed: a Store write, dispatcher send, and Discord embed - not what
     # these tests check.
@@ -718,6 +719,7 @@ def test_the_accel_split_separates_the_two_bets() -> None:
     c._eta_status = lambda: (False, False)
     c._wrinkle_active = lambda: False
     c._machine_state = lambda: None
+    c._running_state = lambda: None
     c._entity_float = lambda _x: 11.6
 
     c._job_phase = lambda: "wash"  # early phase
@@ -851,6 +853,62 @@ def test_a_fresh_finish_time_confirms_a_phase_that_came_back_with_the_washer() -
     c, _meter, phase, opened = _wired()
     _settle(c, phase, "none", "wash")
     assert opened == ["wash"] and not c._start_held
+
+
+def _reconnect_rig(kwh=3.6):
+    """`_wired` plus readable machine_state/running, and every task it opens."""
+    TIMERS.armed.clear()
+    c, meter, phase, _opened = _wired(kwh=kwh)
+    washer = {"machine": None, "running": None}
+    c._machine_state = lambda: washer["machine"]
+    c._running_state = lambda: washer["running"]
+    started: list = []
+
+    def _task(coro):
+        if coro.__name__.startswith("_async_start"):
+            started.append(coro.__name__)
+        coro.close()
+
+    c._create_task = _task
+    return c, meter, phase, washer, started
+
+
+def test_a_reconnect_cannot_turn_a_batched_meter_into_a_load() -> None:
+    # 2026-10-31 07:04:01: the washer came back online and every entity landed
+    # in the same second; the meter brought the night's 3.3 kWh in one step,
+    # ahead of "stopped", and the jump opened a card for a washer that was off.
+    c, meter, phase, washer, started = _reconnect_rig()
+    meter["kwh"] = 6.9
+    c._on_energy(_Ev("unavailable", "6.9"))
+    assert started == [], "a reconnect's reading waits for the rest to land"
+    assert [delay for delay, _ in TIMERS.armed] == [30]
+    washer.update(machine="stop", running=False)
+    phase["job"] = "none"
+    TIMERS.armed[0][1]()
+    assert started == []
+
+    # The same burst while the washer is still running is a real offline load.
+    c, meter, phase, washer, started = _reconnect_rig()
+    meter["kwh"] = 6.9
+    c._on_energy(_Ev("unavailable", "6.9"))
+    washer.update(machine="run", running=True)
+    phase["job"] = None  # job_state still dark
+    TIMERS.armed[0][1]()
+    assert started == ["_async_start_session"]
+
+
+def test_running_off_alone_vetoes_an_energy_jump() -> None:
+    c, meter, _phase, washer, started = _reconnect_rig()
+    washer["running"] = False  # machine_state unreadable
+    meter["kwh"] = 6.9
+    c._on_energy(_Ev("3.6", "6.9"))  # a live reading: judged at once
+    assert started == []
+    # A self-clean (job stuck at none, drum running) still starts on its jump.
+    c, meter, _phase, washer, started = _reconnect_rig()
+    washer.update(machine="run", running=True)
+    meter["kwh"] = 6.9
+    c._on_energy(_Ev("3.6", "6.9"))
+    assert started == ["_async_start_selfclean"]
 
 
 class _FakeInteraction:
